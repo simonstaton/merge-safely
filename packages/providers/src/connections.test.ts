@@ -533,3 +533,14 @@ describe("connections file I/O (hardening)", () => {
     expect(resolveSecretPath("/abs/k.txt", "/base")).toBe("/abs/k.txt");
   });
 });
+
+describe("local providers keep their own id", () => {
+  it("lmstudio is not renamed to openai-compatible and gets its default base URL", () => {
+    const r = parseConnectionsInput({ lm: { provider: "lmstudio" } }, {});
+    expect(r.errors).toEqual([]);
+    expect(r.connections[0]?.provider).toBe("lmstudio");
+    expect(r.connections[0]?.kind).toBe("openai-compatible");
+    const secret = r.connections[0]?.secret;
+    expect(secret?.kind === "openai-compatible" && secret.baseUrl).toBe("http://localhost:1234/v1");
+  });
+});

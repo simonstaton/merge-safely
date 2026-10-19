@@ -17,12 +17,18 @@ export const OPENAI_COMPATIBLE_GATEWAYS: Readonly<Record<string, string | undefi
   together: "https://api.together.xyz/v1",
   fireworks: "https://api.fireworks.ai/inference/v1",
   groq: "https://api.groq.com/openai/v1",
-  lmstudio: "http://localhost:1234/v1",
   vllm: undefined,
 };
 
-/** Ollama keeps its own provider id (a dedicated preset registers it) but speaks the OpenAI API. */
-export const OLLAMA_DEFAULT_BASE_URL = "http://localhost:11434/v1";
+/** Local servers keep their own provider id (dedicated presets register them, marking models zero-cost) but speak the OpenAI API. */
+export const LOCAL_PROVIDERS: Readonly<Record<string, string>> = {
+  ollama: "http://localhost:11434/v1",
+  lmstudio: "http://localhost:1234/v1",
+};
+export const OLLAMA_DEFAULT_BASE_URL = LOCAL_PROVIDERS.ollama as string;
+export function isLocalProvider(provider: string): boolean {
+  return Object.hasOwn(LOCAL_PROVIDERS, provider);
+}
 
 const PROVIDER_KINDS: Readonly<Record<string, readonly ConnectionKind[]>> = {
   anthropic: ["api-key", "oauth", "subscription", "anthropic-compatible"],
@@ -31,6 +37,7 @@ const PROVIDER_KINDS: Readonly<Record<string, readonly ConnectionKind[]>> = {
   "openai-compatible": ["openai-compatible"],
   gemini: ["api-key", "oauth"],
   ollama: ["openai-compatible"],
+  lmstudio: ["openai-compatible"],
   bedrock: ["cloud"],
   vertex: ["cloud"],
   "azure-openai": ["cloud"],
@@ -64,7 +71,7 @@ export function normaliseProvider(
       defaultBaseUrl: OPENAI_COMPATIBLE_GATEWAYS[provider],
     };
   }
-  if (provider === "ollama") return { provider, label, defaultBaseUrl: OLLAMA_DEFAULT_BASE_URL };
+  if (isLocalProvider(provider)) return { provider, label, defaultBaseUrl: LOCAL_PROVIDERS[provider] };
   return { provider, label, defaultBaseUrl: undefined };
 }
 
@@ -115,7 +122,7 @@ export function inferConnectionKind(c: InlineConnection): ConnectionKind | { err
   } else if (
     c.baseUrl !== undefined ||
     isGateway(c.provider) ||
-    c.provider === "ollama" ||
+    isLocalProvider(c.provider) ||
     c.provider === "openai-compatible" ||
     c.provider === "anthropic-compatible"
   ) {
