@@ -104,7 +104,7 @@ export function geminiProvider(opts: GeminiProviderOptions = {}): ModelProvider 
             supportsStrict: false,
             makeTransport: (init) => {
               if (!client) throw new Error(setupError ?? "client unavailable");
-              return new GeminiTransport(client, model.name, init, runnerOpts.logger);
+              return new GeminiTransport(client, model, init, runnerOpts.logger);
             },
           });
           return loop.run(seat, input, ws, signal);

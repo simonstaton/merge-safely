@@ -1,25 +1,33 @@
+import type { ModelInfo } from "@merge-safely/core";
 import { describe, expect, it } from "vitest";
 import { RunGuard } from "./guard.js";
-import { addUsage, priceUsage } from "./pricing.js";
 import { redact, secretStrings, systemErrorCode } from "./redact.js";
-import { AbortedError, backoffDelay, DEFAULT_RETRY, parseRetryAfter, sleep, withRetry } from "./retry.js";
+import {
+  AbortedError,
+  backoffDelay,
+  DEFAULT_RETRY,
+  parseRetryAfter,
+  RetryBeyondDeadlineError,
+  sleep,
+  withRetry,
+} from "./retry.js";
 import { isStrictCompatible, sanitizeSchema } from "./schema.js";
+import { addUsage } from "./usage.js";
 
-describe("pricing", () => {
-  it("prices uncached, cached and output tokens", () => {
-    const usd = priceUsage(
-      { in: 1_000_000, out: 1_000_000, cachedIn: 1_000_000 },
-      { pricing: { inPerMTok: 2, outPerMTok: 8, cachedInPerMTok: 0.5 } },
-    );
-    expect(usd).toBeCloseTo(10.5);
-  });
-  it("falls back to input rate for cached tokens and handles zero-cost and unknown", () => {
-    expect(
-      priceUsage({ in: 0, out: 0, cachedIn: 1_000_000 }, { pricing: { inPerMTok: 3, outPerMTok: 1 } }),
-    ).toBeCloseTo(3);
-    expect(priceUsage({ in: 5, out: 5 }, { zeroCost: true })).toBe(0);
-    expect(priceUsage({ in: 5, out: 5 }, {})).toBeUndefined();
-  });
+function model(over: Partial<ModelInfo> = {}): ModelInfo {
+  return {
+    provider: "openai",
+    name: "m",
+    supportsTools: true,
+    supportsStructuredOutput: true,
+    contextTokens: 1000,
+    maxOutputTokens: 100,
+    tier: "mid",
+    ...over,
+  };
+}
+
+describe("usage", () => {
   it("adds usage", () => {
     expect(addUsage({ in: 1, out: 2 }, { in: 3, out: 4, cachedIn: 5 })).toEqual({ in: 4, out: 6, cachedIn: 5 });
     expect(addUsage({ in: 1, out: 2 }, { in: 1, out: 1 })).toEqual({ in: 2, out: 3 });
@@ -63,6 +71,25 @@ describe("retry helpers", () => {
     expect(v).toBe(7);
     expect(n).toBe(3);
   });
+  it("withRetry fails at once when the retry would land after the deadline", async () => {
+    let n = 0;
+    const t0 = Date.now();
+    const p = withRetry(
+      async () => {
+        n++;
+        throw new Error("429");
+      },
+      {
+        classify: () => ({ kind: "rate-limit", retryable: true, retryAfterMs: 30_000, message: "rate limited (429)" }),
+        signal: new AbortController().signal,
+        deadlineAt: Date.now() + 1_000,
+      },
+    );
+    await expect(p).rejects.toBeInstanceOf(RetryBeyondDeadlineError);
+    await expect(p).rejects.toThrow(/rate limited beyond the seat deadline/);
+    expect(n).toBe(1);
+    expect(Date.now() - t0).toBeLessThan(500);
+  });
 });
 
 describe("redaction", () => {
@@ -88,6 +115,9 @@ describe("redaction", () => {
   });
   it("finds system error codes in cause chains", () => {
     expect(systemErrorCode({ cause: { cause: { code: "ECONNREFUSED" } } })).toBe("ECONNREFUSED");
+    expect(systemErrorCode({ cause: { code: "EAI_AGAIN" } })).toBe("EAI_AGAIN");
+    expect(systemErrorCode({ cause: { code: "UND_ERR_SOCKET" } })).toBe("UND_ERR_SOCKET");
+    expect(systemErrorCode({ code: "insufficient_quota" })).toBeUndefined();
     expect(systemErrorCode(new Error("x"))).toBeUndefined();
   });
 });
@@ -122,25 +152,37 @@ describe("schema helpers", () => {
 });
 
 describe("RunGuard", () => {
-  it("tracks spend against maxUsd", () => {
+  it("tracks spend against maxUsd with the model's pricing", () => {
     const g = new RunGuard(
       { maxTurns: 2, deadlineMs: 10_000, maxUsd: 1 },
-      { name: "m", pricing: { inPerMTok: 1, outPerMTok: 1 } },
+      model({ pricing: { inPerMTok: 1, outPerMTok: 1 } }),
     );
     expect(g.addUsage({ in: 600_000, out: 0 })).toBeCloseTo(0.6);
     expect(g.overBudget()).toBe(false);
+    expect(g.estimated).toBe(false);
     g.addUsage({ in: 0, out: 600_000 });
     expect(g.overBudget()).toBe(true);
     g.dispose();
   });
+  it("prices unknown models at the registry's pessimistic rate, and zero-cost at zero", () => {
+    const g = new RunGuard({ maxTurns: 2, deadlineMs: 10_000, maxUsd: 1 }, model());
+    expect(g.estimated).toBe(true);
+    expect(g.addUsage({ in: 1_000_000, out: 0 })).toBeGreaterThanOrEqual(5);
+    expect(g.overBudget()).toBe(true);
+    const z = new RunGuard({ maxTurns: 2, deadlineMs: 10_000, maxUsd: 1 }, model({ zeroCost: true }));
+    expect(z.addUsage({ in: 1_000_000, out: 1_000_000 })).toBe(0);
+    g.dispose();
+    z.dispose();
+  });
   it("aborts on deadline and external signal", async () => {
-    const g = new RunGuard({ maxTurns: 2, deadlineMs: 5 }, { name: "m" });
+    const g = new RunGuard({ maxTurns: 2, deadlineMs: 5 }, model());
+    expect(g.deadlineAt).toBeLessThanOrEqual(Date.now() + 5);
     await new Promise((r) => setTimeout(r, 20));
     expect(g.signal.aborted).toBe(true);
     expect(g.stopReason).toBe("timeout");
     const ac = new AbortController();
     ac.abort();
-    const g2 = new RunGuard({ maxTurns: 2, deadlineMs: 10_000 }, { name: "m" }, ac.signal);
+    const g2 = new RunGuard({ maxTurns: 2, deadlineMs: 10_000 }, model(), ac.signal);
     expect(g2.stopReason).toBe("aborted");
     g.dispose();
     g2.dispose();

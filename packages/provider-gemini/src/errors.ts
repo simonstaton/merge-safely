@@ -1,3 +1,4 @@
+import { ApiError } from "@google/genai";
 import { errorMessage, NETWORK_CODES, redact, systemErrorCode } from "./common/redact.js";
 import type { ErrorClassifier, ErrorInfo } from "./common/retry.js";
 
@@ -14,9 +15,9 @@ export function retryDelayFromMessage(message: string): number | undefined {
 /** Map a `@google/genai` ApiError (or fetch failure) to a safe, provider-neutral ErrorInfo. */
 export function classifyGeminiError(secrets: string[]): ErrorClassifier {
   return (err: unknown): ErrorInfo => {
-    const rec = err && typeof err === "object" ? (err as Record<string, unknown>) : {};
-    if (rec.name === "AbortError") return { kind: "abort", retryable: false, message: "aborted" };
-    const status = typeof rec.status === "number" ? rec.status : undefined;
+    if (err instanceof Error && err.name === "AbortError")
+      return { kind: "abort", retryable: false, message: "aborted" };
+    const status = err instanceof ApiError && typeof err.status === "number" ? err.status : undefined;
     const raw = redact(errorMessage(err), secrets);
     const msg = short(raw);
     if (status !== undefined) {
@@ -38,7 +39,7 @@ export function classifyGeminiError(secrets: string[]): ErrorClassifier {
           retryAfterMs: retryDelayFromMessage(raw),
           message: `rate limited (429): ${msg}`,
         };
-      if (status === 408 || status >= 500)
+      if (status === 408 || status === 409 || status === 425 || status >= 500)
         return {
           kind: "server",
           retryable: true,
@@ -49,7 +50,7 @@ export function classifyGeminiError(secrets: string[]): ErrorClassifier {
       return { kind: "bad-request", retryable: false, status, message: `request rejected (${status}): ${msg}` };
     }
     const sys = systemErrorCode(err);
-    if ((sys && NETWORK_CODES.has(sys)) || (err instanceof TypeError && /fetch failed/i.test(raw))) {
+    if ((sys && NETWORK_CODES.has(sys)) || (err instanceof TypeError && /fetch failed|terminated/i.test(raw))) {
       return { kind: "network", retryable: true, message: `network error${sys ? ` (${sys})` : ""}: ${msg}` };
     }
     return { kind: "other", retryable: false, message: msg };

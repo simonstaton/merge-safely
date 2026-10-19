@@ -61,11 +61,14 @@ export class ChatTransport implements Transport {
       fnCalls.push({ ...tc, id: tc.id || `call_${++this.callSeq}` });
     }
     const text = msg?.content ?? "";
-    this.messages.push({
-      role: "assistant",
-      content: msg?.content ?? null,
-      ...(fnCalls.length > 0 ? { tool_calls: fnCalls } : {}),
-    });
+    // Never replay an assistant turn with neither content nor tool_calls: OpenAI and most gateways
+    // reject it, which would turn the loop's nudge into a 400. An empty reply is followed by the
+    // nudge as a user message only.
+    if (fnCalls.length > 0) {
+      this.messages.push({ role: "assistant", content: msg?.content ?? null, tool_calls: fnCalls });
+    } else if (text) {
+      this.messages.push({ role: "assistant", content: text });
+    }
     const calls: NormalizedCall[] = fnCalls.map((c) => ({
       id: c.id,
       name: c.function.name,

@@ -1,15 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { fakeClient } from "../test/fake-client.js";
-import { API_KEY, apiError, apiKeyConn, compatConn } from "../test/helpers.js";
+import { API_KEY, apiError, apiKeyConn, compatConn, connError } from "../test/helpers.js";
 import { clientConfig, KEYLESS_PLACEHOLDER, OPENAI_BASE_URL } from "./client.js";
-import { openaiProvider, wireApiFor } from "./provider.js";
-
-function netError(code: string): Error {
-  const e = new Error("Connection error.");
-  e.name = "APIConnectionError";
-  (e as Error & { cause: unknown }).cause = Object.assign(new TypeError("fetch failed"), { cause: { code } });
-  return e;
-}
+import { openaiCompatibleProvider, openaiProvider, strictAllowed, wireApiFor } from "./provider.js";
 
 const withModels = (impl: () => Promise<{ data: Array<{ id: string }> }>) =>
   openaiProvider({ clientFactory: () => fakeClient({ models: impl }) });
@@ -31,7 +24,7 @@ describe("openaiProvider", () => {
     expect(v.models?.find((m) => m.name === "gpt-5")).toMatchObject({
       tier: "frontier",
       supportsTools: true,
-      source: "runtime",
+      source: "2026-10",
     });
     expect(v.models?.find((m) => m.name === "gpt-5")?.pricing).toBeDefined();
     expect(typeof v.latencyMs).toBe("number");
@@ -48,7 +41,7 @@ describe("openaiProvider", () => {
 
   it("validate: ENOTFOUND / ECONNREFUSED are unreachable", async () => {
     for (const code of ["ENOTFOUND", "ECONNREFUSED"]) {
-      const v = await withModels(() => Promise.reject(netError(code))).validate(compatConn());
+      const v = await withModels(() => Promise.reject(connError(code))).validate(compatConn());
       expect(v.ok).toBe(false);
       expect(v.message).toMatch(/unreachable at localhost:11434/);
       expect(v.message).toContain(code);
@@ -83,12 +76,14 @@ describe("openaiProvider", () => {
     expect(v.message).toMatch(/not supported/);
   });
 
-  it("models: compatible endpoints keep every id and have no first-party pricing", async () => {
+  it("models: compatible endpoints keep every id; registry family pricing or pessimistic fallback", async () => {
     const p = withModels(async () => ({ data: [{ id: "llama3.1:8b" }, { id: "openai/gpt-5" }] }));
     const models = await p.models(compatConn());
     expect(models.map((m) => m.name)).toEqual(["llama3.1:8b", "openai/gpt-5"]);
-    expect(models.every((m) => m.pricing === undefined)).toBe(true);
-    expect(models[0]?.provider).toBe("openai-compatible");
+    expect(models.every((m) => m.provider === "openai-compatible")).toBe(true);
+    expect(models[1]?.pricing?.inPerMTok).toBe(1.25);
+    expect(models[0]?.source).toMatch(/pessimistic/);
+    expect(models[0]?.zeroCost).toBeUndefined();
   });
 
   it("models: compatible list failure returns []", async () => {
@@ -100,6 +95,24 @@ describe("openaiProvider", () => {
     await expect(withModels(() => Promise.reject(apiError(401, API_KEY))).models(apiKeyConn())).rejects.not.toThrow(
       API_KEY,
     );
+  });
+});
+
+describe("openaiCompatibleProvider", () => {
+  it("registers under openai-compatible with chat by default", async () => {
+    const client = fakeClient({ models: async () => ({ data: [{ id: "qwen2.5-coder" }] }) });
+    const p = openaiCompatibleProvider({ clientFactory: () => client });
+    expect(p.id).toBe("openai-compatible");
+    expect(p.connectionKinds).toEqual(["openai-compatible"]);
+    const v = await p.validate(compatConn());
+    expect(v.ok).toBe(true);
+    expect(v.models?.[0]?.provider).toBe("openai-compatible");
+  });
+
+  it("only allows strict schemas for gateways that opt in", () => {
+    expect(strictAllowed(apiKeyConn())).toBe(true);
+    expect(strictAllowed(compatConn())).toBe(false);
+    expect(strictAllowed(compatConn({ options: { strict: true } }))).toBe(true);
   });
 });
 
@@ -125,5 +138,6 @@ describe("wireApiFor / clientConfig", () => {
       clientConfig({ ...apiKeyConn(), kind: "oauth", secret: { kind: "oauth", accessToken: "tok-abc" } }).apiKey,
     ).toBe("tok-abc");
     expect(() => clientConfig({ ...apiKeyConn(), secret: { kind: "subscription" } })).toThrow(/not supported/);
+    expect(() => clientConfig(apiKeyConn({ secret: { kind: "api-key", apiKey: "" } }))).toThrow(/empty/);
   });
 });

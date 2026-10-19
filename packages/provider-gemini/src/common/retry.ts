@@ -110,6 +110,21 @@ export class RetriesExhaustedError extends Error {
   }
 }
 
+/** The next retry (usually a server Retry-After) would land after the seat deadline, so stop now. */
+export class RetryBeyondDeadlineError extends Error {
+  constructor(
+    readonly info: ErrorInfo,
+    readonly delayMs: number,
+    readonly remainingMs: number,
+  ) {
+    super(
+      `${info.message}; rate limited beyond the seat deadline (retry requested in ${Math.ceil(delayMs / 1000)}s, ` +
+        `${Math.max(0, Math.floor(remainingMs / 1000))}s left)`,
+    );
+    this.name = "RetryBeyondDeadlineError";
+  }
+}
+
 export class NonRetryableError extends Error {
   constructor(readonly info: ErrorInfo) {
     super(info.message);
@@ -119,11 +134,20 @@ export class NonRetryableError extends Error {
 
 /**
  * Run `fn`, retrying 429/5xx/network failures up to `maxRetries` times. Throws AbortedError when the
- * signal fires, NonRetryableError for permanent failures and RetriesExhaustedError when retries run out.
+ * signal fires, NonRetryableError for permanent failures, RetriesExhaustedError when retries run out and
+ * RetryBeyondDeadlineError when the next attempt could only start after `deadlineAt`.
  */
 export async function withRetry<T>(
   fn: () => Promise<T>,
-  opts: { classify: ErrorClassifier; signal: AbortSignal; retry?: RetryOptions; logger?: Logger; label?: string },
+  opts: {
+    classify: ErrorClassifier;
+    signal: AbortSignal;
+    retry?: RetryOptions;
+    logger?: Logger;
+    label?: string;
+    /** Epoch ms of the caller's deadline; a retry that would land after it fails immediately instead. */
+    deadlineAt?: number;
+  },
 ): Promise<T> {
   const o = { ...DEFAULT_RETRY, ...opts.retry };
   for (let attempt = 0; ; attempt++) {
@@ -138,6 +162,10 @@ export async function withRetry<T>(
       if (!info.retryable) throw new NonRetryableError(info);
       if (attempt >= o.maxRetries) throw new RetriesExhaustedError(info, attempt + 1);
       const delay = backoffDelay(attempt, info, o);
+      if (opts.deadlineAt !== undefined) {
+        const remaining = opts.deadlineAt - Date.now();
+        if (delay >= remaining) throw new RetryBeyondDeadlineError(info, delay, remaining);
+      }
       opts.logger?.warn(`${opts.label ?? "model call"} failed, retrying`, {
         kind: info.kind,
         status: info.status,

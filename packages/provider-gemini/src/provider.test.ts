@@ -65,7 +65,7 @@ describe("geminiProvider", () => {
 describe("gemini helpers", () => {
   it("tiers", () => {
     expect(guessTier("gemini-2.5-pro")).toBe("frontier");
-    expect(guessTier("gemini-3-pro-preview")).toBe("frontier");
+    expect(guessTier("gemini-3.1-pro")).toBe("frontier");
     expect(guessTier("gemini-3.1-pro")).toBe("frontier");
     expect(guessTier("gemini-2.5-flash")).toBe("mid");
     expect(guessTier("gemini-2.5-flash-lite")).toBe("small");
@@ -76,17 +76,27 @@ describe("gemini helpers", () => {
     expect(isAgenticModel({ name: "models/gemini-2.5-pro" })).toBe(true);
     expect(isAgenticModel({ name: "models/gemma-3-27b-it", supportedActions: ["generateContent"] })).toBe(false);
     expect(isAgenticModel({ name: "models/gemini-2.5-pro", supportedActions: ["countTokens"] })).toBe(false);
-    expect(toModelInfo({ name: "models/gemini-9-ultra" }, apiKeyConn()).pricing).toBeUndefined();
+    const unknown = toModelInfo({ name: "models/gemini-9-ultra" }, apiKeyConn());
+    expect(unknown.source).toMatch(/pessimistic/);
+    expect(unknown.pricing?.inPerMTok).toBeGreaterThanOrEqual(4);
+    const pro = toModelInfo({ name: "models/gemini-2.5-pro", outputTokenLimit: 1234 }, apiKeyConn());
+    expect(pro.pricing).toEqual({ inPerMTok: 2.5, outPerMTok: 15, cachedInPerMTok: 0.25 });
+    expect(pro.maxOutputTokens).toBe(1234);
+    expect(pro.effortLevels).toEqual(["low", "medium", "high"]);
   });
   it("retryDelay parsing", () => {
     expect(retryDelayFromMessage('"retryDelay": "17s"')).toBe(17_000);
     expect(retryDelayFromMessage("retryDelay: none")).toBeUndefined();
   });
-  it("thinking config", () => {
-    expect(thinkingConfigFor("gemini-3-pro-preview", "high")).toEqual({ thinkingLevel: "HIGH" });
-    expect(thinkingConfigFor("gemini-2.5-pro", "minimal")).toEqual({ thinkingBudget: 128 });
-    expect(thinkingConfigFor("gemini-2.5-flash", "minimal")).toEqual({ thinkingBudget: 0 });
-    expect(thinkingConfigFor("gemini-2.0-flash", "high")).toBeUndefined();
-    expect(thinkingConfigFor("gemini-2.5-pro", undefined)).toBeUndefined();
+  it("thinking config only for advertised levels", () => {
+    expect(thinkingConfigFor({ name: "gemini-3.1-pro" }, "high")).toEqual({ thinkingLevel: "HIGH" });
+    expect(thinkingConfigFor({ name: "gemini-3.1-pro" }, "medium")).toBeUndefined();
+    expect(thinkingConfigFor({ name: "gemini-3-flash" }, "medium")).toEqual({ thinkingLevel: "MEDIUM" });
+    expect(thinkingConfigFor({ name: "gemini-2.5-pro" }, "minimal")).toBeUndefined();
+    expect(thinkingConfigFor({ name: "gemini-2.5-pro" }, "low")).toEqual({ thinkingBudget: 1_024 });
+    expect(thinkingConfigFor({ name: "gemini-2.5-flash" }, "minimal")).toEqual({ thinkingBudget: 0 });
+    expect(thinkingConfigFor({ name: "gemini-2.0-flash" }, "high")).toBeUndefined();
+    expect(thinkingConfigFor({ name: "gemini-2.5-pro", effortLevels: ["high"] }, "low")).toBeUndefined();
+    expect(thinkingConfigFor({ name: "gemini-2.5-pro" }, undefined)).toBeUndefined();
   });
 });

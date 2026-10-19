@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { apiKeyConn, compatConn } from "../test/helpers.js";
+import { apiKeyConn } from "../test/helpers.js";
 import { baseModelId, guessTier, isChatModelId, toModelInfo } from "./models.js";
 
 describe("models", () => {
@@ -29,11 +29,19 @@ describe("models", () => {
     expect(isChatModelId("dall-e-3")).toBe(false);
   });
 
-  it("prices known ids exactly and leaves unknown ones unpriced", () => {
+  it("prices from the registry, with pessimistic fallback for unknown ids", () => {
     expect(toModelInfo("gpt-5-2025-08-07", apiKeyConn()).pricing?.inPerMTok).toBe(1.25);
-    expect(toModelInfo("gpt-5-pro", apiKeyConn()).pricing).toBeUndefined();
-    expect(toModelInfo("gpt-5", compatConn()).pricing).toBeUndefined();
+    const pro = toModelInfo("gpt-5-pro", apiKeyConn());
+    expect(pro.source).toMatch(/pessimistic/);
+    expect(pro.pricing?.inPerMTok).toBeGreaterThanOrEqual(5);
     const unknown = toModelInfo("mystery", apiKeyConn());
     expect(unknown).toMatchObject({ tier: "mid", supportsTools: true, contextTokens: 128_000 });
+    expect(unknown.source).toMatch(/pessimistic/);
+  });
+
+  it("never prices gpt-4o-2024-05-13 below its own rate", () => {
+    const m = toModelInfo("gpt-4o-2024-05-13", apiKeyConn());
+    expect(m.pricing?.inPerMTok).toBeGreaterThanOrEqual(5);
+    expect(m.pricing?.outPerMTok).toBeGreaterThanOrEqual(15);
   });
 });

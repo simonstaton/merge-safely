@@ -26,6 +26,7 @@ import {
   type ErrorClassifier,
   NonRetryableError,
   RetriesExhaustedError,
+  RetryBeyondDeadlineError,
   type RetryOptions,
   withRetry,
 } from "./retry.js";
@@ -227,11 +228,12 @@ export class AgenticLoop {
 
   private budgetExceeded(guard: RunGuard): Outcome {
     const max = guard.budget.maxUsd ?? 0;
+    const est = guard.estimated ? " (estimated at the registry's pessimistic rate: model pricing unknown)" : "";
     return {
       kind: "fail",
       status: "budget-exceeded",
       error:
-        `Seat spend limit of $${max.toFixed(2)} reached ($${(guard.usd ?? 0).toFixed(4)} spent over ${guard.turns} turns) ` +
+        `Seat spend limit of $${max.toFixed(2)} reached ($${guard.usd.toFixed(4)} spent over ${guard.turns} turns${est}) ` +
         "before a review was submitted. This is a budget stop, not a crash. Recovery: raise the per-seat budget " +
         "(policy budget.perSeatUsd) or choose a cheaper model, then re-run the check.",
     };
@@ -272,17 +274,20 @@ export class AgenticLoop {
         this.logger?.warn("onUsage callback threw", { error: this.safe(errorMessage(err)) });
       }
 
-      const submit = turn.calls.find((c) => c.name === SUBMIT_TOOL);
-      let submitError: string | undefined;
-      if (submit) {
-        const args = this.decodeArgs(submit);
+      // Validate every submission in the turn and accept the first valid one.
+      const submitErrors = new Map<NormalizedCall, string>();
+      for (const call of turn.calls) {
+        if (call.name !== SUBMIT_TOOL) continue;
+        const args = this.decodeArgs(call);
         const v = args.ok ? this.validate(seat, args.value) : { kind: "invalid" as const, error: args.error };
         // A valid submission is honoured even if this final response pushed spend over the cap:
         // the tokens are already paid for and the cap is checked before every further request.
         if (v.kind === "ok") return v;
+        submitErrors.set(call, v.error);
+      }
+      if (submitErrors.size > 0) {
         invalid++;
-        lastInvalid = v.error;
-        submitError = v.error;
+        lastInvalid = submitErrors.values().next().value ?? "invalid submission";
         this.logger?.info("reviewer submitted invalid output", { attempt: invalid });
         if (invalid > MAX_INVALID_SUBMISSIONS) {
           return { kind: "fail", status: "schema-invalid", error: `output failed schema validation: ${lastInvalid}` };
@@ -301,7 +306,7 @@ export class AgenticLoop {
               name: call.name,
               isError: true,
               output:
-                `ERROR: submission rejected, it does not satisfy the schema: ${submitError ?? "duplicate submission"}. ` +
+                `ERROR: submission rejected, it does not satisfy the schema: ${submitErrors.get(call) ?? lastInvalid}. ` +
                 `Fix the listed problems and call ${SUBMIT_TOOL} again (${MAX_INVALID_SUBMISSIONS + 1 - invalid} attempts left).`,
             });
             continue;
@@ -344,6 +349,7 @@ export class AgenticLoop {
           retry: this.cfg.retry,
           logger: this.logger,
           label: "model call",
+          deadlineAt: guard.deadlineAt,
         });
       } catch (err: unknown) {
         const cause = err instanceof NonRetryableError ? err : undefined;
@@ -396,7 +402,9 @@ export class AgenticLoop {
       }
       return { kind: "fail", status: "error", error: "run aborted by caller" };
     }
-    if (err instanceof RetriesExhaustedError) return { kind: "fail", status: "error", error: err.message };
+    if (err instanceof RetriesExhaustedError || err instanceof RetryBeyondDeadlineError) {
+      return { kind: "fail", status: "error", error: err.message };
+    }
     if (err instanceof NonRetryableError) return { kind: "fail", status: "error", error: err.info.message };
     return { kind: "fail", status: "error", error: `runner error: ${this.safe(errorMessage(err))}` };
   }

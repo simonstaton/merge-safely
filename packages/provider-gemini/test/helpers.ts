@@ -1,3 +1,4 @@
+import { ApiError } from "@google/genai";
 import type {
   Connection,
   ModelInfo,
@@ -119,12 +120,9 @@ export function fakeTools(): { factory: ToolExecutorFactory; calls: ToolCall[] }
   return { factory, calls };
 }
 
-/** Error shaped like `@google/genai`'s ApiError. */
-export function apiError(status: number, message: string): Error {
-  const e = new Error(message) as Error & { status: number };
-  e.name = "ApiError";
-  e.status = status;
-  return e;
+/** A real `@google/genai` ApiError. */
+export function apiError(status: number, message: string): ApiError {
+  return new ApiError({ status, message });
 }
 
 /** A promise that only settles when the signal aborts (simulates a hung request). */

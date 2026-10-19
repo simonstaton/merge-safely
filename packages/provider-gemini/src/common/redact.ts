@@ -49,12 +49,12 @@ export function errorMessage(err: unknown): string {
   return "unknown error";
 }
 
-/** Walk an error's cause chain looking for a Node system error code (ENOTFOUND, ECONNREFUSED, ...). */
+/** Walk an error's cause chain looking for a Node or undici error code (ENOTFOUND, EAI_AGAIN, UND_ERR_SOCKET, ...). */
 export function systemErrorCode(err: unknown): string | undefined {
   let cur: unknown = err;
   for (let i = 0; i < 6 && cur && typeof cur === "object"; i++) {
     const code = (cur as { code?: unknown }).code;
-    if (typeof code === "string" && /^E[A-Z]+$/.test(code)) return code;
+    if (typeof code === "string" && /^(E[A-Z_]+|UND_ERR_[A-Z_]+)$/.test(code)) return code;
     cur = (cur as { cause?: unknown }).cause;
   }
   return undefined;
@@ -69,4 +69,10 @@ export const NETWORK_CODES = new Set([
   "EHOSTUNREACH",
   "ENETUNREACH",
   "EPIPE",
+  "ECONNABORTED",
+  "UND_ERR_SOCKET",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_BODY_TIMEOUT",
+  "UND_ERR_CLOSED",
 ]);

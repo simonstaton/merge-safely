@@ -11,8 +11,14 @@ export {
   type RequestOpts,
   type ResponsesResult,
 } from "./client.js";
-export { priceUsage } from "./common/pricing.js";
 export type { RetryOptions } from "./common/retry.js";
-export { classifyOpenAIError } from "./errors.js";
-export { baseModelId, guessTier, isChatModelId, KNOWN_OPENAI_MODELS, toModelInfo } from "./models.js";
-export { type OpenAIProviderOptions, type OpenAIWireApi, openaiProvider, wireApiFor } from "./provider.js";
+export { classifyOpenAIError, isRetryableStatus } from "./errors.js";
+export { baseModelId, guessTier, isChatModelId, toModelInfo, UNKNOWN_LIMITS } from "./models.js";
+export {
+  type OpenAIProviderOptions,
+  type OpenAIWireApi,
+  openaiCompatibleProvider,
+  openaiProvider,
+  strictAllowed,
+  wireApiFor,
+} from "./provider.js";

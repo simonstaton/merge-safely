@@ -145,6 +145,44 @@ describe("gemini runner", () => {
     expect(tools.calls).toHaveLength(0);
   });
 
+  it("honours a valid submission in the response that crossed the cap", async () => {
+    const client = fakeGenAI({ steps: [() => modelParts([call("submit_review", PASS)], usage(1_000_000, 0))] });
+    const run = await runner(client).r.run(
+      seat({ budget: { maxTurns: 5, deadlineMs: 10_000, maxUsd: 0.5 } }),
+      input(),
+      WS,
+    );
+    expect(run.status).toBe("ok");
+    expect(run.audit.costUsd).toBeCloseTo(1, 6);
+  });
+
+  it("omits thinking levels the model does not advertise", async () => {
+    const client = fakeGenAI({ steps: [() => modelParts([call("submit_review", PASS)])] });
+    const pro3 = { ...MODEL, name: "gemini-3.1-pro", effortLevels: ["low", "high"] };
+    const run = await runner(client, pro3).r.run(
+      seat({ model: { connectionId: "c", provider: "gemini", name: "gemini-3.1-pro", effort: "medium" } }),
+      input(),
+      WS,
+    );
+    expect(run.status).toBe("ok");
+    expect(client.requests[0]?.config).not.toHaveProperty("thinkingConfig");
+  });
+
+  it("stops with error when retryDelay is beyond the deadline", async () => {
+    const client = fakeGenAI({ steps: [() => Promise.reject(apiError(429, '{"retryDelay":"60s"}'))] });
+    const run = await runner(client).r.run(seat({ budget: { maxTurns: 5, deadlineMs: 5_000 } }), input(), WS);
+    expect(run.status).toBe("error");
+    expect(run.error).toMatch(/rate limited beyond the seat deadline/);
+  });
+
+  it("retries network failures (undici codes)", async () => {
+    const net = Object.assign(new TypeError("fetch failed"), { cause: { code: "UND_ERR_SOCKET" } });
+    const client = fakeGenAI({ steps: [() => Promise.reject(net), () => modelParts([call("submit_review", PASS)])] });
+    const run = await runner(client).r.run(seat(), input(), WS);
+    expect(run.status).toBe("ok");
+    expect(client.requests).toHaveLength(2);
+  });
+
   it("times out", async () => {
     const client = fakeGenAI({ steps: [(p) => hang(p.config?.abortSignal)] });
     const run = await runner(client).r.run(seat({ budget: { maxTurns: 5, deadlineMs: 40 } }), input(), WS);

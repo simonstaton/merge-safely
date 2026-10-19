@@ -1,5 +1,6 @@
 import type {
   Connection,
+  ConnectionKind,
   ModelInfo,
   ModelProvider,
   ModelRunner,
@@ -44,7 +45,29 @@ function hostOf(conn: Connection): string {
   }
 }
 
+/**
+ * Whether `submit_review` may be sent with `strict: true` (only when its schema fits the strict subset).
+ * First-party OpenAI supports it; gateways only when the connection opts in with `options.strict: true`,
+ * because many compatible servers reject the field.
+ */
+export function strictAllowed(conn: Connection): boolean {
+  return conn.secret.kind !== "openai-compatible" || conn.options?.strict === true;
+}
+
+/** OpenAI (api.openai.com via api-key or oauth, plus compatible endpoints) registered as provider "openai". */
 export function openaiProvider(opts: OpenAIProviderOptions = {}): ModelProvider {
+  return buildProvider("openai", ["api-key", "openai-compatible", "oauth"], opts);
+}
+
+/**
+ * The same implementation registered as provider "openai-compatible" (kind `openai-compatible` only), so
+ * lookups by `conn.provider` find it. Chat Completions unless the connection sets `options.api: "responses"`.
+ */
+export function openaiCompatibleProvider(opts: OpenAIProviderOptions = {}): ModelProvider {
+  return buildProvider("openai-compatible", ["openai-compatible"], opts);
+}
+
+function buildProvider(id: string, connectionKinds: ConnectionKind[], opts: OpenAIProviderOptions): ModelProvider {
   const factory = opts.clientFactory ?? defaultClientFactory;
 
   async function listModels(conn: Connection): Promise<ModelInfo[]> {
@@ -56,8 +79,8 @@ export function openaiProvider(opts: OpenAIProviderOptions = {}): ModelProvider 
   }
 
   return {
-    id: "openai",
-    connectionKinds: ["api-key", "openai-compatible", "oauth"],
+    id,
+    connectionKinds,
 
     async validate(conn: Connection): Promise<ValidationResult> {
       const t0 = Date.now();
@@ -115,8 +138,7 @@ export function openaiProvider(opts: OpenAIProviderOptions = {}): ModelProvider 
             classify: classifyOpenAIError(secrets),
             secrets,
             retry: opts.retry,
-            // Strict function schemas are an OpenAI feature; gateways get them only on request via options.api.
-            supportsStrict: true,
+            supportsStrict: strictAllowed(conn),
             makeTransport: (init) => {
               if (!client) throw new Error(setupError ?? "client unavailable");
               return api === "chat"

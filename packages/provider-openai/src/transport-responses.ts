@@ -21,8 +21,9 @@ export function isReasoningModel(name: string): boolean {
 }
 
 /**
- * OpenAI Responses API transport. Stateless: `store: false`, the full item list is resent each turn,
- * and reasoning items are carried as encrypted content so nothing about the PR is retained server side.
+ * OpenAI Responses API transport. Stateless: `store: false`, the full item list is resent each turn
+ * (model output replayed verbatim, then our function_call_output items), and reasoning items are
+ * carried as encrypted content so nothing about the PR is retained server side.
  */
 export class ResponsesTransport implements Transport {
   private readonly input: ResponseInputItem[];
@@ -64,20 +65,25 @@ export class ResponsesTransport implements Transport {
     );
     const calls: NormalizedCall[] = [];
     let text = "";
+    // Replay output items verbatim (ids, reasoning items, empty messages): with store:false an
+    // encrypted reasoning item must be followed by the item it produced.
+    const replay: ResponseInputItem[] = [];
     for (const item of res.output ?? []) {
       if (item.type === "function_call") {
         calls.push({ id: item.call_id, name: item.name, rawArgs: item.arguments ?? "" });
-        this.input.push({ type: "function_call", call_id: item.call_id, name: item.name, arguments: item.arguments });
+        replay.push(item);
       } else if (item.type === "message") {
-        const t = item.content
+        text += item.content
           .map((c) => (c.type === "output_text" ? c.text : c.type === "refusal" ? c.refusal : ""))
           .join("");
-        text += t;
-        if (t) this.input.push({ role: "assistant", content: t });
+        replay.push(item);
       } else if (item.type === "reasoning") {
-        this.input.push(item);
+        replay.push(item);
       }
     }
+    // A trailing reasoning item with nothing after it (e.g. an incomplete response) cannot be replayed.
+    while (replay.length > 0 && replay[replay.length - 1]?.type === "reasoning") replay.pop();
+    this.input.push(...replay);
     const u = res.usage;
     const cached = u?.input_tokens_details?.cached_tokens ?? 0;
     const usage = u

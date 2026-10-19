@@ -1,4 +1,6 @@
 import type { Connection } from "@merge-safely/core";
+import { APIConnectionTimeoutError } from "openai";
+import type { ResponseOutputItem } from "openai/resources/responses/responses";
 import { describe, expect, it, vi } from "vitest";
 import { chatCalls, chatText, fakeClient, rCall, responses, rMessage, rUsage } from "../test/fake-client.js";
 import {
@@ -7,6 +9,7 @@ import {
   apiKeyConn,
   BLOCK,
   compatConn,
+  connError,
   fakeTools,
   hang,
   input,
@@ -175,19 +178,22 @@ describe("responses transport", () => {
     expect(run.error).toMatch(/Turn limit of 3/);
   });
 
-  it("warns when maxUsd cannot be enforced for an unpriced model", async () => {
-    const client = fakeClient({ responses: [() => responses([rCall("submit_review", PASS)])] });
+  it("prices an unpriced model pessimistically so maxUsd still enforces, and warns", async () => {
+    const client = fakeClient({
+      responses: [() => responses([rCall("read_file", { path: "a" })], rUsage(1_000_000, 0))],
+    });
     const warn = vi.fn();
     const logger = { debug: vi.fn(), info: vi.fn(), warn, error: vi.fn() };
     const r = openaiProvider({ clientFactory: () => client }).createRunner(
       apiKeyConn(),
       { ...MODEL, pricing: undefined },
-      { logger },
+      { logger, tools: fakeTools().factory },
     );
     const run = await r.run(seat({ budget: { maxTurns: 5, deadlineMs: 10_000, maxUsd: 1 } }), input(), WS);
-    expect(run.status).toBe("ok");
-    expect(run.audit.costUsd).toBeUndefined();
-    expect(warn.mock.calls.some((c) => String(c[0]).includes("maxUsd cannot be enforced"))).toBe(true);
+    expect(run.status).toBe("budget-exceeded");
+    expect(run.audit.costUsd).toBeGreaterThan(1);
+    expect(run.error).toMatch(/pessimistic/);
+    expect(warn.mock.calls.some((c) => String(c[0]).includes("pessimistic fallback"))).toBe(true);
   });
 
   it("times out at the deadline", async () => {
@@ -293,6 +299,137 @@ describe("responses transport", () => {
     expect(run.status).toBe("ok");
     expect(tools.calls).toHaveLength(0);
     expect(JSON.stringify(client.responseBodies[1]?.input)).toContain("unknown tool");
+  });
+});
+
+describe("responses replay and retries", () => {
+  const reasoning = (id: string): ResponseOutputItem => ({
+    type: "reasoning",
+    id,
+    summary: [],
+    encrypted_content: `enc-${id}`,
+  });
+
+  it("replays output items verbatim (ids, reasoning, empty messages) then function_call_output", async () => {
+    const fc: ResponseOutputItem = {
+      type: "function_call",
+      id: "fc_1",
+      call_id: "call_1",
+      name: "read_file",
+      arguments: '{"path":"a"}',
+    };
+    const client = fakeClient({
+      responses: [
+        () => responses([reasoning("rs_1"), fc]),
+        () => responses([reasoning("rs_2"), rMessage("")]),
+        () => responses([rCall("submit_review", PASS)]),
+      ],
+    });
+    const run = await runner(client).r.run(seat(), input(), WS);
+    expect(run.status).toBe("ok");
+    const second = client.responseBodies[1]?.input as unknown[];
+    expect(second.slice(1)).toEqual([
+      reasoning("rs_1"),
+      fc,
+      { type: "function_call_output", call_id: "call_1", output: "contents of a" },
+    ]);
+    const third = client.responseBodies[2]?.input as unknown[];
+    // the empty message is replayed with its id so rs_2 keeps its following item; then the nudge
+    expect(third.slice(4, 6)).toEqual([reasoning("rs_2"), rMessage("")]);
+    expect(JSON.stringify(third[6])).toContain("submit_review");
+  });
+
+  it("drops a trailing reasoning item with nothing after it", async () => {
+    const client = fakeClient({
+      responses: [
+        () => ({
+          output: [reasoning("rs_1")],
+          status: "incomplete",
+          incomplete_details: { reason: "max_output_tokens" },
+          usage: rUsage(10, 10),
+        }),
+        () => responses([rCall("submit_review", PASS)]),
+      ],
+    });
+    const run = await runner(client).r.run(seat(), input(), WS);
+    expect(run.status).toBe("ok");
+    expect(JSON.stringify(client.responseBodies[1]?.input)).not.toContain("rs_1");
+  });
+
+  it("accepts the first valid submit_review among several in one turn", async () => {
+    const client = fakeClient({
+      responses: [
+        () => responses([rCall("submit_review", { verdict: "nope" }, "c1"), rCall("submit_review", BLOCK, "c2")]),
+      ],
+    });
+    const run = await runner(client).r.run(seat(), input(), WS);
+    expect(run.status).toBe("ok");
+    expect(run.output?.verdict).toBe("block");
+    expect(client.responseBodies).toHaveLength(1);
+  });
+
+  it("retries real SDK connection errors: timeout, ECONNRESET, EAI_AGAIN, UND_ERR_SOCKET", async () => {
+    const client = fakeClient({
+      responses: [
+        () => Promise.reject(new APIConnectionTimeoutError()),
+        () => Promise.reject(connError("ECONNRESET")),
+        () => Promise.reject(connError("EAI_AGAIN")),
+        () => Promise.reject(connError("UND_ERR_SOCKET")),
+        () => responses([rCall("submit_review", PASS)]),
+      ],
+    });
+    const run = await openaiProvider({
+      clientFactory: () => client,
+      retry: { baseDelayMs: 1, maxDelayMs: 2, maxRetries: 4 },
+    })
+      .createRunner(apiKeyConn(), MODEL, {})
+      .run(seat(), input(), WS);
+    expect(run.error).toBeUndefined();
+    expect(run.status).toBe("ok");
+    expect(client.responseBodies).toHaveLength(5);
+  });
+
+  it("retries 408/409/425 and 5xx statuses", async () => {
+    const client = fakeClient({
+      responses: [
+        () => Promise.reject(apiError(425, "too early")),
+        () => Promise.reject(apiError(409, "conflict")),
+        () => Promise.reject(apiError(502, "bad gateway")),
+        () => responses([rCall("submit_review", PASS)]),
+      ],
+    });
+    const run = await runner(client).r.run(seat(), input(), WS);
+    expect(run.status).toBe("ok");
+  });
+
+  it("stops with error when Retry-After is beyond the deadline instead of sleeping into a timeout", async () => {
+    const client = fakeClient({
+      responses: [() => Promise.reject(apiError(429, "Rate limit reached", { "retry-after": "60" }))],
+    });
+    const t0 = Date.now();
+    const run = await runner(client).r.run(seat({ budget: { maxTurns: 5, deadlineMs: 5_000 } }), input(), WS);
+    expect(run.status).toBe("error");
+    expect(run.error).toMatch(/rate limited beyond the seat deadline/);
+    expect(Date.now() - t0).toBeLessThan(2_000);
+  });
+
+  it("does not resend non-strict for unrelated 400s that mention parameters", async () => {
+    const strictSchema = {
+      type: "object",
+      additionalProperties: false,
+      required: ["verdict", "summary", "findings"],
+      properties: {
+        verdict: { type: "string" },
+        summary: { type: "string" },
+        findings: { type: "array", items: { type: "string" } },
+      },
+    };
+    const client = fakeClient({
+      responses: [() => Promise.reject(apiError(400, "Unsupported parameter: 'reasoning'"))],
+    });
+    const run = await runner(client).r.run(seat(), input({ outputSchema: strictSchema }), WS);
+    expect(run.status).toBe("error");
+    expect(client.responseBodies).toHaveLength(1);
   });
 });
 
@@ -415,10 +552,48 @@ describe("chat transport", () => {
         () => chatCalls([{ name: "submit_review", args: PASS }]),
       ],
     });
-    const run = await runner(client, compatConn()).r.run(seat(), input({ outputSchema: strictSchema }), WS);
+    const run = await runner(client, compatConn({ options: { strict: true } })).r.run(
+      seat(),
+      input({ outputSchema: strictSchema }),
+      WS,
+    );
     expect(run.status).toBe("ok");
     expect(JSON.stringify(client.chatBodies[0]?.tools)).toContain('"strict":true');
     expect(JSON.stringify(client.chatBodies[1]?.tools)).not.toContain("strict");
+  });
+
+  it("never sends strict to a gateway unless options.strict is set", async () => {
+    const strictSchema = {
+      type: "object",
+      additionalProperties: false,
+      required: ["verdict", "summary", "findings"],
+      properties: {
+        verdict: { type: "string" },
+        summary: { type: "string" },
+        findings: { type: "array", items: { type: "string" } },
+      },
+    };
+    const client = fakeClient({ chat: [() => chatCalls([{ name: "submit_review", args: PASS }])] });
+    await runner(client, compatConn()).r.run(seat(), input({ outputSchema: strictSchema }), WS);
+    expect(JSON.stringify(client.chatBodies[0]?.tools)).not.toContain("strict");
+  });
+
+  it("does not replay an empty assistant turn; the nudge goes as a user message only", async () => {
+    const client = fakeClient({
+      chat: [
+        () => ({
+          choices: [{ finish_reason: "length", message: { content: null } }],
+          usage: { prompt_tokens: 1, completion_tokens: 1 },
+        }),
+        () => chatCalls([{ name: "submit_review", args: PASS }]),
+      ],
+    });
+    const run = await runner(client, compatConn()).r.run(seat(), input(), WS);
+    expect(run.status).toBe("ok");
+    const msgs = client.chatBodies[1]?.messages ?? [];
+    expect(msgs).toHaveLength(3);
+    expect(msgs.some((m) => m.role === "assistant")).toBe(false);
+    expect(msgs[2]?.role).toBe("user");
   });
 
   it("synthesises ids for tool calls without one", async () => {

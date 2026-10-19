@@ -1,82 +1,21 @@
-import type { Connection, ModelInfo, ModelPricing, ModelTierClass } from "@merge-safely/core";
-
-interface Known {
-  contextTokens: number;
-  maxOutputTokens: number;
-  pricing: ModelPricing;
-  effortLevels?: string[];
-}
-
-const GPT5_EFFORT = ["minimal", "low", "medium", "high"];
-const O_EFFORT = ["low", "medium", "high"];
+import type { Connection, ModelInfo, ModelTierClass } from "@merge-safely/core";
+import { findModel, withPricing } from "@merge-safely/registry";
 
 /**
- * Small local table of first-party OpenAI models (USD per million tokens, standard tier).
- * Exact ids only: a prefix match would price e.g. gpt-5-pro at gpt-5 rates and under-enforce budgets.
- * Anything not listed gets `pricing: undefined` so the registry's pessimistic fallback applies.
+ * Model metadata comes from @merge-safely/registry (exact or safe date/version-suffix match). A model
+ * the registry does not know is priced with the registry's pessimistic fallback via `withPricing`.
  */
-export const KNOWN_OPENAI_MODELS: Readonly<Record<string, Known>> = {
-  "gpt-5": {
-    contextTokens: 400_000,
-    maxOutputTokens: 128_000,
-    pricing: { inPerMTok: 1.25, outPerMTok: 10, cachedInPerMTok: 0.125 },
-    effortLevels: GPT5_EFFORT,
-  },
-  "gpt-5-mini": {
-    contextTokens: 400_000,
-    maxOutputTokens: 128_000,
-    pricing: { inPerMTok: 0.25, outPerMTok: 2, cachedInPerMTok: 0.025 },
-    effortLevels: GPT5_EFFORT,
-  },
-  "gpt-5-nano": {
-    contextTokens: 400_000,
-    maxOutputTokens: 128_000,
-    pricing: { inPerMTok: 0.05, outPerMTok: 0.4, cachedInPerMTok: 0.005 },
-    effortLevels: GPT5_EFFORT,
-  },
-  "gpt-4.1": {
-    contextTokens: 1_047_576,
-    maxOutputTokens: 32_768,
-    pricing: { inPerMTok: 2, outPerMTok: 8, cachedInPerMTok: 0.5 },
-  },
-  "gpt-4.1-mini": {
-    contextTokens: 1_047_576,
-    maxOutputTokens: 32_768,
-    pricing: { inPerMTok: 0.4, outPerMTok: 1.6, cachedInPerMTok: 0.1 },
-  },
-  "gpt-4.1-nano": {
-    contextTokens: 1_047_576,
-    maxOutputTokens: 32_768,
-    pricing: { inPerMTok: 0.1, outPerMTok: 0.4, cachedInPerMTok: 0.025 },
-  },
-  "gpt-4o": {
-    contextTokens: 128_000,
-    maxOutputTokens: 16_384,
-    pricing: { inPerMTok: 2.5, outPerMTok: 10, cachedInPerMTok: 1.25 },
-  },
-  "gpt-4o-mini": {
-    contextTokens: 128_000,
-    maxOutputTokens: 16_384,
-    pricing: { inPerMTok: 0.15, outPerMTok: 0.6, cachedInPerMTok: 0.075 },
-  },
-  o3: {
-    contextTokens: 200_000,
-    maxOutputTokens: 100_000,
-    pricing: { inPerMTok: 2, outPerMTok: 8, cachedInPerMTok: 0.5 },
-    effortLevels: O_EFFORT,
-  },
-  "o4-mini": {
-    contextTokens: 200_000,
-    maxOutputTokens: 100_000,
-    pricing: { inPerMTok: 1.1, outPerMTok: 4.4, cachedInPerMTok: 0.275 },
-    effortLevels: O_EFFORT,
-  },
-};
 
-/** Conservative limits for models we know nothing about. */
+/** Conservative limits for models neither the registry nor the provider describes. */
 export const UNKNOWN_LIMITS = { contextTokens: 128_000, maxOutputTokens: 8_192 } as const;
 
-/** Strip a gateway vendor prefix ("openai/gpt-5") and a dated snapshot suffix ("-2025-08-07"). */
+/**
+ * Snapshots priced differently from the base id they normalise to. They never inherit the base
+ * entry's rate: `gpt-4o-2024-05-13` is $5/$15 per MTok, double `gpt-4o`.
+ */
+const SNAPSHOTS_PRICED_APART = new Set(["gpt-4o-2024-05-13"]);
+
+/** Strip a gateway vendor prefix ("openai/gpt-5") and a dated snapshot suffix ("-2025-08-07"). For tiers and filters only. */
 export function baseModelId(id: string): string {
   return id
     .replace(/^.*\//, "")
@@ -104,21 +43,16 @@ export function isChatModelId(id: string): boolean {
   return /^(gpt-|o\d|chatgpt-|codex)/.test(m) && !NON_CHAT.test(m);
 }
 
-export function toModelInfo(id: string, conn: Pick<Connection, "provider" | "kind">): ModelInfo {
-  const known = KNOWN_OPENAI_MODELS[baseModelId(id)];
-  // Pricing from the first-party table only applies to first-party connections; a gateway sets its own prices.
-  const firstParty = conn.kind !== "openai-compatible";
-  const info: ModelInfo = {
+export function toModelInfo(id: string, conn: Pick<Connection, "provider">): ModelInfo {
+  const pricedApart = SNAPSHOTS_PRICED_APART.has(id.replace(/^.*\//, "").toLowerCase());
+  const reg = pricedApart ? undefined : findModel(conn.provider, id);
+  if (reg) return { ...reg, provider: conn.provider, name: id };
+  return withPricing({
     provider: conn.provider,
     name: id,
     supportsTools: true,
-    supportsStructuredOutput: firstParty && known !== undefined,
-    contextTokens: known?.contextTokens ?? UNKNOWN_LIMITS.contextTokens,
-    maxOutputTokens: known?.maxOutputTokens ?? UNKNOWN_LIMITS.maxOutputTokens,
+    supportsStructuredOutput: false,
+    ...UNKNOWN_LIMITS,
     tier: guessTier(id),
-    source: "runtime",
-  };
-  if (known && firstParty) info.pricing = { ...known.pricing };
-  if (known?.effortLevels) info.effortLevels = [...known.effortLevels];
-  return info;
+  });
 }

@@ -9,6 +9,7 @@ import type {
   WorkspaceHandle,
 } from "@merge-safely/core";
 import { REVIEWER_OUTPUT_JSON_SCHEMA } from "@merge-safely/core";
+import { APIConnectionError, APIError } from "openai";
 
 export const API_KEY = "sk-test-SUPERSECRETKEY-1234567890abcdef";
 
@@ -130,14 +131,19 @@ export function fakeTools(): { factory: ToolExecutorFactory; calls: ToolCall[] }
   return { factory, calls };
 }
 
-/** Error shaped like the OpenAI SDK's APIError. */
-export function apiError(status: number, message: string, headers: Record<string, string> = {}, code?: string): Error {
-  const e = new Error(message) as Error & { status: number; headers: Headers; code?: string };
-  e.name = "APIError";
-  e.status = status;
-  e.headers = new Headers(headers);
-  if (code) e.code = code;
-  return e;
+/** A real OpenAI SDK APIError subclass (RateLimitError, BadRequestError, ...) for the given status. */
+export function apiError(
+  status: number,
+  message: string,
+  headers: Record<string, string> = {},
+  code?: string,
+): APIError {
+  return APIError.generate(status, { error: { message, ...(code ? { code } : {}) } }, message, new Headers(headers));
+}
+
+/** A real SDK connection error wrapping a Node/undici system error code. */
+export function connError(code: string): APIConnectionError {
+  return new APIConnectionError({ cause: Object.assign(new TypeError("fetch failed"), { cause: { code } }) });
 }
 
 /** A promise that only settles when the signal aborts (simulates a hung request). */

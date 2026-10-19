@@ -1,8 +1,8 @@
 import { type Content, type FunctionDeclaration, type Part, type ThinkingConfig, ThinkingLevel } from "@google/genai";
-import type { Logger } from "@merge-safely/core";
+import type { Logger, ModelInfo } from "@merge-safely/core";
 import type { GenAILike } from "./client.js";
 import type { NormalizedCall, ToolResultMessage, Transport, TransportInit, TurnResult } from "./common/loop.js";
-import { baseModelId } from "./models.js";
+import { baseModelId, geminiEffortLevels } from "./models.js";
 
 const BUDGETS: Record<string, number> = { minimal: 0, low: 1_024, medium: 8_192, high: 24_576 };
 const LEVELS: Record<string, ThinkingLevel> = {
@@ -14,24 +14,33 @@ const LEVELS: Record<string, ThinkingLevel> = {
 
 /**
  * Map a seat's effort to Gemini thinking config: thinkingLevel for 3.x, thinkingBudget for 2.5.
+ * Only levels the model advertises (`model.effortLevels`, else the local family table) are sent;
+ * anything else is omitted with a warning rather than risking an unrecoverable 400.
  * 2.5 Pro cannot disable thinking, so "minimal" becomes its 128-token floor.
  */
 export function thinkingConfigFor(
-  model: string,
+  model: Pick<ModelInfo, "name" | "effortLevels">,
   effort: string | undefined,
   logger?: Logger,
 ): ThinkingConfig | undefined {
   if (!effort) return undefined;
   const e = effort.toLowerCase();
-  const id = baseModelId(model);
-  if (/^gemini-[3-9]/.test(id)) {
-    const level = LEVELS[e];
-    if (level) return { thinkingLevel: level };
-  } else if (id.startsWith("gemini-2.5")) {
-    const budget = BUDGETS[e];
-    if (budget !== undefined) return { thinkingBudget: id.includes("pro") ? Math.max(128, budget) : budget };
+  const id = baseModelId(model.name);
+  const advertised = model.effortLevels ?? geminiEffortLevels(model.name);
+  if (advertised.includes(e)) {
+    if (/^gemini-[3-9]/.test(id)) {
+      const level = LEVELS[e];
+      if (level) return { thinkingLevel: level };
+    } else if (id.startsWith("gemini-2.5")) {
+      const budget = BUDGETS[e];
+      if (budget !== undefined) return { thinkingBudget: id.includes("pro") ? Math.max(128, budget) : budget };
+    }
   }
-  logger?.warn("effort not supported for this Gemini model; ignored", { model, effort });
+  logger?.warn("effort not advertised by this Gemini model; thinking config omitted", {
+    model: model.name,
+    effort,
+    advertised,
+  });
   return undefined;
 }
 
@@ -49,9 +58,11 @@ export class GeminiTransport implements Transport {
   private readonly synthetic = new Set<string>();
   private seq = 0;
 
+  private readonly model: string;
+
   constructor(
     private readonly client: GenAILike,
-    private readonly model: string,
+    model: Pick<ModelInfo, "name" | "effortLevels">,
     private readonly init: TransportInit,
     logger?: Logger,
   ) {
@@ -61,6 +72,7 @@ export class GeminiTransport implements Transport {
       description: t.description,
       parametersJsonSchema: t.parameters,
     }));
+    this.model = model.name;
     this.thinking = thinkingConfigFor(model, init.effort, logger);
   }
 

@@ -67,8 +67,11 @@ export function clientConfig(conn: Connection): ClientConfig {
   const s = conn.secret;
   switch (s.kind) {
     case "api-key":
+      // An empty key must not reach the SDK, which would then fall back to OPENAI_API_KEY.
+      if (!s.apiKey) throw new Error("connection has an empty API key");
       return { apiKey: s.apiKey, baseURL: OPENAI_BASE_URL };
     case "oauth":
+      if (!s.accessToken) throw new Error("connection has an empty access token");
       return { apiKey: s.accessToken, baseURL: OPENAI_BASE_URL };
     case "openai-compatible":
       return {
@@ -81,7 +84,14 @@ export function clientConfig(conn: Connection): ClientConfig {
   }
 }
 
-/** Real SDK client. SDK retries are disabled: the runner owns retries so it can honour budgets. */
+const SILENT_LOGGER = { error: () => undefined, warn: () => undefined, info: () => undefined, debug: () => undefined };
+
+/**
+ * Real SDK client. Every option the SDK would otherwise read from the environment is pinned:
+ * `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_ORG_ID`, `OPENAI_PROJECT_ID`, and `OPENAI_LOG`, whose
+ * debug output prints custom headers and full request bodies (the PR diff). SDK retries are disabled
+ * because the runner owns retries so it can honour budgets and deadlines.
+ */
 export function defaultClientFactory(conn: Connection): OpenAILike {
   const cfg = clientConfig(conn);
   const client = new OpenAI({
@@ -89,9 +99,10 @@ export function defaultClientFactory(conn: Connection): OpenAILike {
     baseURL: cfg.baseURL,
     defaultHeaders: cfg.defaultHeaders,
     maxRetries: 0,
-    // Never pick up org/project from the environment for a third-party base URL.
     organization: null,
     project: null,
+    logLevel: "off",
+    logger: SILENT_LOGGER,
   });
   return {
     models: {

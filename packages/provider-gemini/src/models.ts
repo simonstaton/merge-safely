@@ -1,51 +1,13 @@
-import type { Connection, ModelInfo, ModelPricing, ModelTierClass } from "@merge-safely/core";
+import type { Connection, ModelInfo, ModelTierClass } from "@merge-safely/core";
+import { findModel, withPricing } from "@merge-safely/registry";
 import type { GeminiModel } from "./client.js";
 
-interface Known {
-  contextTokens: number;
-  maxOutputTokens: number;
-  pricing: ModelPricing;
-  effortLevels: string[];
-}
-
 /**
- * Small local table (USD per million tokens). Pro models have a long-context surcharge above 200k
- * prompt tokens; the runner cannot know the prompt size up front, so the higher band is used. That
- * over-estimates typical reviews, which is the safe direction for budget enforcement (design 7.6).
- * Exact ids only; anything else is unpriced and falls back to the registry's pessimistic rate.
+ * Pricing and limits come from @merge-safely/registry (exact or safe date/version-suffix match); a model
+ * it does not know is priced at the registry's pessimistic fallback via `withPricing`. The API's own
+ * `inputTokenLimit` / `outputTokenLimit` take precedence for limits. Thinking levels are kept locally
+ * because the registry does not record them for Gemini.
  */
-export const KNOWN_GEMINI_MODELS: Readonly<Record<string, Known>> = {
-  "gemini-2.5-pro": {
-    contextTokens: 1_048_576,
-    maxOutputTokens: 65_536,
-    pricing: { inPerMTok: 2.5, outPerMTok: 15, cachedInPerMTok: 0.625 },
-    effortLevels: ["low", "medium", "high"],
-  },
-  "gemini-2.5-flash": {
-    contextTokens: 1_048_576,
-    maxOutputTokens: 65_536,
-    pricing: { inPerMTok: 0.3, outPerMTok: 2.5, cachedInPerMTok: 0.075 },
-    effortLevels: ["minimal", "low", "medium", "high"],
-  },
-  "gemini-2.5-flash-lite": {
-    contextTokens: 1_048_576,
-    maxOutputTokens: 65_536,
-    pricing: { inPerMTok: 0.1, outPerMTok: 0.4, cachedInPerMTok: 0.025 },
-    effortLevels: ["minimal", "low", "medium", "high"],
-  },
-  "gemini-2.0-flash": {
-    contextTokens: 1_048_576,
-    maxOutputTokens: 8_192,
-    pricing: { inPerMTok: 0.1, outPerMTok: 0.4, cachedInPerMTok: 0.025 },
-    effortLevels: [],
-  },
-  "gemini-3-pro-preview": {
-    contextTokens: 1_048_576,
-    maxOutputTokens: 65_536,
-    pricing: { inPerMTok: 4, outPerMTok: 18, cachedInPerMTok: 0.4 },
-    effortLevels: ["low", "high"],
-  },
-};
 
 export const UNKNOWN_LIMITS = { contextTokens: 128_000, maxOutputTokens: 8_192 } as const;
 
@@ -65,6 +27,20 @@ export function guessTier(name: string): ModelTierClass {
   return "mid";
 }
 
+/**
+ * Effort levels each Gemini family accepts. 3.x Pro takes thinkingLevel LOW/HIGH only; 3.x Flash also
+ * MINIMAL/MEDIUM; 2.5 maps effort to a thinkingBudget. Unknown families advertise none, so no thinking
+ * config is ever sent to them.
+ */
+export function geminiEffortLevels(name: string): string[] {
+  const id = baseModelId(name);
+  if (/^gemini-[3-9][\d.]*-pro/.test(id)) return ["low", "high"];
+  if (/^gemini-[3-9][\d.]*-flash/.test(id)) return ["minimal", "low", "medium", "high"];
+  if (id.startsWith("gemini-2.5-pro")) return ["low", "medium", "high"];
+  if (id.startsWith("gemini-2.5-flash")) return ["minimal", "low", "medium", "high"];
+  return [];
+}
+
 const NON_AGENTIC = /(embedding|tts|image|live|audio|veo|imagen|aqa|robotics|computer-use)/i;
 
 /** Keep text models that support generateContent (and therefore function calling). */
@@ -76,19 +52,24 @@ export function isAgenticModel(m: GeminiModel): boolean {
 
 export function toModelInfo(m: GeminiModel, conn: Pick<Connection, "provider">): ModelInfo {
   const name = (m.name ?? "").replace(/^models\//, "");
-  const known = KNOWN_GEMINI_MODELS[baseModelId(name)];
+  const reg = findModel(conn.provider, name);
+  const base: ModelInfo = reg
+    ? { ...reg, provider: conn.provider, name }
+    : withPricing({
+        provider: conn.provider,
+        name,
+        supportsTools: true,
+        supportsStructuredOutput: true,
+        ...UNKNOWN_LIMITS,
+        tier: guessTier(name),
+      });
   const info: ModelInfo = {
-    provider: conn.provider,
-    name,
-    supportsTools: true,
-    supportsStructuredOutput: true,
-    contextTokens: m.inputTokenLimit ?? known?.contextTokens ?? UNKNOWN_LIMITS.contextTokens,
-    maxOutputTokens: m.outputTokenLimit ?? known?.maxOutputTokens ?? UNKNOWN_LIMITS.maxOutputTokens,
-    tier: guessTier(name),
-    source: "runtime",
+    ...base,
+    contextTokens: m.inputTokenLimit ?? base.contextTokens,
+    maxOutputTokens: m.outputTokenLimit ?? base.maxOutputTokens,
   };
   if (m.displayName) info.displayName = m.displayName;
-  if (known) info.pricing = { ...known.pricing };
-  if (known && known.effortLevels.length > 0) info.effortLevels = [...known.effortLevels];
+  const levels = info.effortLevels ?? geminiEffortLevels(name);
+  if (levels.length > 0) info.effortLevels = levels;
   return info;
 }
