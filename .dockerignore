@@ -1,0 +1,11 @@
+# Docker build context for packages/app/Dockerfile (repo root). Secrets and host build output never enter it.
+**/node_modules
+**/dist
+**/*.tsbuildinfo
+**/coverage
+.git
+**/.env
+**/.env.*
+!**/.env.example
+**/*.pem
+**/*.key

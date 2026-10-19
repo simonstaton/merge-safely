@@ -1,0 +1,36 @@
+# Merge Safely self-hosted GitHub App.
+#   cp .env.example .env && $EDITOR .env      # fill in the App id, secrets and master key
+#   cp ~/Downloads/<app>.private-key.pem ./github-app.pem
+#   chmod 0644 github-app.pem   # or: sudo chown 1000 github-app.pem && chmod 0600 github-app.pem
+#                               # (the container runs as uid 1000 and must be able to read the key)
+#   docker compose up -d --build
+#   curl -fsS http://127.0.0.1:8080/healthz
+# Put a TLS-terminating reverse proxy in front. Only /webhooks/github needs to be reachable from GitHub.
+services:
+  merge-safely:
+    build:
+      context: ../..
+      dockerfile: packages/app/Dockerfile
+    image: merge-safely-app:local
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      MERGE_SAFELY_DATA_DIR: /data
+      GITHUB_APP_PRIVATE_KEY_FILE: /run/secrets/github-app.pem
+      PORT: "8080"
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      # Local disk only: SQLite WAL does not work over network filesystems.
+      - merge-safely-data:/data
+      - ./github-app.pem:/run/secrets/github-app.pem:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    # Running reviews get this long to finish on `docker compose stop`; the rest resume at next boot.
+    stop_grace_period: 30s
+
+volumes:
+  merge-safely-data:
