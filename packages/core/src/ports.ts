@@ -48,6 +48,11 @@ export interface WorkspaceHandle {
   cwd: string;
   headSha: string;
   baseSha?: string;
+  /**
+   * True when cwd is a working tree with uncommitted changes (e.g. `merge-safely run --local`).
+   * headSha is then "WORKTREE" and the result must not be treated as pinned to a commit.
+   */
+  dirty?: boolean;
   dispose(): Promise<void>;
 }
 
