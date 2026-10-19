@@ -1,7 +1,7 @@
 {
   "name": "@merge-safely/provider-compatible",
   "version": "0.1.0",
-  "description": "OpenAI-compatible and Anthropic-compatible base-URL runners",
+  "description": "OpenAI-compatible and Anthropic-compatible base-URL presets (OpenRouter, Groq, vLLM, Ollama, LM Studio, proxies)",
   "license": "Apache-2.0",
   "type": "module",
   "main": "./dist/index.js",
@@ -27,6 +27,7 @@
     "@merge-safely/providers": "0.1.0",
     "@merge-safely/tools": "0.1.0",
     "@merge-safely/provider-anthropic": "0.1.0",
-    "@merge-safely/provider-openai": "0.1.0"
+    "@merge-safely/provider-openai": "0.1.0",
+    "@merge-safely/provider-gemini": "0.1.0"
   }
 }
