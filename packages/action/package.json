@@ -1,17 +1,11 @@
 {
   "name": "@merge-safely/action",
   "version": "0.1.0",
-  "description": "GitHub Action wrapper",
+  "description": "GitHub Action: adversarial, risk-tiered AI review gate with a commit-pinned merge signal",
   "license": "Apache-2.0",
+  "private": true,
   "type": "module",
   "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
-  "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
-    }
-  },
   "files": [
     "dist"
   ],
@@ -19,11 +13,18 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "tsc -b"
+    "build": "tsc -b",
+    "bundle": "node scripts/bundle.mjs"
   },
   "dependencies": {
+    "@actions/core": "^1.11.0",
     "@merge-safely/cli": "0.1.0",
     "@merge-safely/core": "0.1.0",
-    "@actions/core": "^1.11.0"
+    "@merge-safely/github": "0.1.0",
+    "@merge-safely/providers": "0.1.0",
+    "yaml": "^2.6.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
   }
 }

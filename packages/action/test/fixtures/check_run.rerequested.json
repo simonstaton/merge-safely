@@ -1,0 +1,45 @@
+{
+  "action": "rerequested",
+  "check_run": {
+    "id": 900,
+    "name": "merge-safely/verdict",
+    "head_sha": "1111111111111111111111111111111111111111",
+    "status": "completed",
+    "conclusion": "failure",
+    "pull_requests": [
+      {
+        "number": 7,
+        "head": {
+          "ref": "feature",
+          "sha": "1111111111111111111111111111111111111111"
+        },
+        "base": {
+          "ref": "main",
+          "sha": "2222222222222222222222222222222222222222"
+        }
+      }
+    ],
+    "app": {
+      "id": 15368,
+      "slug": "github-actions"
+    }
+  },
+  "repository": {
+    "id": 1,
+    "name": "app",
+    "full_name": "acme/app",
+    "private": false,
+    "owner": {
+      "login": "acme",
+      "id": 10,
+      "type": "Organization"
+    },
+    "html_url": "https://github.com/acme/app",
+    "default_branch": "main"
+  },
+  "sender": {
+    "login": "dev",
+    "id": 12,
+    "type": "User"
+  }
+}

@@ -41,10 +41,17 @@ The `concurrency` block cancels a review when a newer commit arrives. The newer 
 
 | Input | Default | What it does |
 |---|---|---|
-| `connections` | required | YAML map of connection id to connection. Same fields as the connections file. See [connections.md](connections.md#the-actions-connections-input). |
-| `policy` | `.merge-safely.yml` | Path to the policy file in the repo. A missing file means all defaults. |
+| `connections` | required | YAML map of connection id to connection. Same fields as the connections file. See [connections.md](connections.md#the-actions-connections-input). Not used on `merge_group` runs. |
+| `policy` | `.merge-safely.yml` | Path to the policy file in the repo, read from the PR's **base** branch (never the PR head). A missing file means all defaults. |
 | `github-token` | `${{ github.token }}` | Token used to read the PR and write the check run and review. |
-| `fail-on-block` | `true` | Fail the job when the verdict is block. Set `false` if you only want the check run to carry the signal. |
+| `fail-on-block` | `true` | Fail the job when the verdict is block. Set `false` if you only want the check run to carry the signal. Pending, contested, error and budget-blocked always fail the job. |
+| `store` | `checkrun` | Where verdicts live. Only `checkrun` in v0.1. |
+| `slack-webhook` | none | Slack incoming-webhook URL for escalations, from a secret. |
+| `concurrency` | `2` | Reviewer seats run in parallel (1-16). |
+| `pr-number` | none | The PR to review on `workflow_dispatch`. |
+| `head-sha` | PR head | Review this commit instead of the PR head. |
+
+Outputs: `decision`, `tier`, `round`, `cost-usd`, `check-url`, `verdict-json`. The job summary carries the digest and the cost line. Full reference: [packages/action/README.md](../packages/action/README.md).
 
 ## Permissions
 
@@ -109,7 +116,11 @@ The Action validates each connection before seating. A bad or empty key fails th
 
 ## Fork PRs
 
-On `pull_request` events from forks, GitHub does not expose repository secrets, so the review cannot reach a model and will fail validation. Do not switch to `pull_request_target` without reading [security.md](security.md#fork-prs-and-pull_request_target).
+On `pull_request` events from forks, GitHub does not expose repository secrets and the token is read-only, so the Action stops early with an explanation instead of failing validation. To review fork PRs, switch to `pull_request_target`, but read [security.md](security.md#fork-prs-and-pull_request_target) first. On that event the Action reads the policy from the base branch and ignores `runner.allowedCommands` on fork PRs (it warns and runs with none), so the fork's code is read but never executed.
+
+## Merge queue
+
+Add `merge_group: { types: [checks_requested] }` to the triggers. On the queue commit the Action makes no model calls. It checks that each queued PR has a `pass` verdict on its current head and reports `merge-safely/verdict` on the queue commit to match. See [packages/action/README.md](../packages/action/README.md#merge-queue).
 
 ## Limits
 
