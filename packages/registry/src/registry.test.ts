@@ -95,6 +95,43 @@ describe("findModel", () => {
   });
 });
 
+describe("zero cost is local-only", () => {
+  it("a gateway serving an open model is not free", () => {
+    const m = findModel("openai-compatible", "meta-llama/llama3.3");
+    expect(m?.name).toBe("llama3.3");
+    expect(m?.zeroCost).toBeUndefined();
+    const priced = priceUsage(m, { in: 1_000_000, out: 0 });
+    expect(priced.estimated).toBe(true);
+    expect(priced.usd).toBeGreaterThan(0);
+    expect(withPricing(m as ModelInfo).pricing).toEqual(pessimisticPricing());
+  });
+
+  it("unknown models on openai-compatible get pessimistic pricing; local presets are free", () => {
+    const unknown: ModelInfo = {
+      provider: "openai-compatible",
+      name: "mystery",
+      supportsTools: true,
+      supportsStructuredOutput: false,
+      contextTokens: 8000,
+      maxOutputTokens: 2000,
+      tier: "mid",
+    };
+    expect(withPricing(unknown).zeroCost).toBeUndefined();
+    expect(priceUsage(withPricing(unknown), { in: 1, out: 1 }).usd).toBeGreaterThan(0);
+    expect(withPricing({ ...unknown, provider: "lmstudio" }).zeroCost).toBe(true);
+    expect(withPricing({ ...unknown, provider: "ollama", name: "big:120b-cloud" }).zeroCost).toBeUndefined();
+  });
+
+  it(":tag variants match only under the local provider, and -cloud tags are not free", () => {
+    expect(findModel("ollama", "llama3.3:70b")?.zeroCost).toBe(true);
+    expect(findModel("openai-compatible", "llama3.3:70b")).toBeUndefined();
+    const cloud = findModel("ollama", "gpt-oss:120b-cloud");
+    expect(cloud?.name).toBe("gpt-oss");
+    expect(cloud?.zeroCost).toBeUndefined();
+    expect(priceUsage(cloud, { in: 1_000_000, out: 0 }).estimated).toBe(true);
+  });
+});
+
 describe("pricing", () => {
   const pricing = { inPerMTok: 2, outPerMTok: 10, cachedInPerMTok: 0.2, cacheWritePerMTok: 2.5 };
 
@@ -128,6 +165,14 @@ describe("pricing", () => {
 
   it("ignores negative or missing token counts", () => {
     expect(priceUsage(pricing, { in: -5, out: 0 }).usd).toBe(0);
+  });
+
+  it("pessimistic cache rates are never below the max input rate", () => {
+    const p = pessimisticPricing();
+    const maxIn = Math.max(...MODELS.map((m) => m.pricing?.inPerMTok ?? 0));
+    expect(p.inPerMTok).toBe(maxIn);
+    expect(p.cachedInPerMTok).toBeGreaterThanOrEqual(maxIn);
+    expect(p.cacheWritePerMTok).toBeGreaterThanOrEqual(maxIn);
   });
 
   it("pessimistic fallback is >= every known rate", () => {
@@ -174,6 +219,20 @@ describe("ladder", () => {
     const gpt5 = findModel("openai", "gpt-5") as ModelInfo;
     expect(cheaperModel("openai", gpt5)?.provider).toBe("openai");
     expect(ladderFor("gemini").map((m) => m.tier)).toEqual(["frontier", "mid", "small"]);
+  });
+
+  it("stays inside the current model's family on alias providers", () => {
+    const opus = findModel("openai-compatible", "claude-opus-5-5") as ModelInfo;
+    expect(cheaperModel("openai-compatible", opus)?.name).toBe("claude-sonnet-5-5");
+    const gem = findModel("vertex", "gemini-3.1-pro") as ModelInfo;
+    expect(cheaperModel("vertex", gem)?.name).toBe("gemini-3.5-flash");
+    const bedrockOpus = findModel("bedrock", "us.anthropic.claude-opus-5-5") as ModelInfo;
+    const c = cheaperModel("bedrock", bedrockOpus);
+    expect(c?.name).toBe("claude-sonnet-5-5");
+    expect(c?.provider).toBe("bedrock");
+    // A model outside the provider's family has no cheaper option there.
+    const gpt = findModel("openai", "gpt-5") as ModelInfo;
+    expect(cheaperModel("bedrock", gpt)).toBeUndefined();
   });
 
   it("skips a missing tier", () => {

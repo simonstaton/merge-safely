@@ -4,7 +4,7 @@ import type { PolicyInput } from "../policy/schema.js";
 import type { Change, ConnectionRecord, ModelInfo, ModelTierClass, Tier } from "../types.js";
 import { SeatingError } from "./errors.js";
 import { matchGlob } from "./glob.js";
-import { describeSeating, planFallback, seat } from "./index.js";
+import { describeSeating, findInCatalog, normaliseModelId, planFallback, seat, sortByTier } from "./index.js";
 
 const info = (provider: string, name: string, tier: ModelTierClass, priced = true): ModelInfo => ({
   provider,
@@ -269,6 +269,89 @@ describe("seat: decorrelation", () => {
   });
 });
 
+describe("seat: judge strength", () => {
+  it("judges take the strongest tier across all connections, not a weaker minority connection", () => {
+    CATALOGS.ollama = [info("ollama", "gpt-oss", "mid", false)];
+    const r = run({}, 3, BACKEND, [ANTHROPIC, conn("ollama", "ollama")]);
+    const judges = r.seats.filter((s) => s.role === "judge");
+    expect(judges.every((j) => j.model.connectionId === "anthropic-main" && j.model.name === "claude-opus-5-5")).toBe(
+      true,
+    );
+    delete CATALOGS.ollama;
+  });
+
+  it("finds the frontier model even when the first connection has none", () => {
+    CATALOGS.ollama = [info("ollama", "gpt-oss", "mid", false)];
+    const r = run({}, 1, BACKEND, [conn("ollama", "ollama"), ANTHROPIC]);
+    expect(r.seats.find((s) => s.role === "judge")?.model.name).toBe("claude-opus-5-5");
+    const r2 = run({ models: { decorrelate: false } }, 1, BACKEND, [conn("ollama", "ollama"), ANTHROPIC]);
+    expect(r2.seats.find((s) => s.role === "judge")?.model.name).toBe("claude-opus-5-5");
+    delete CATALOGS.ollama;
+  });
+
+  it("warns when an explicit judge is weaker than the hunters", () => {
+    const r = run(
+      {
+        models: {
+          hunters: { connection: "anthropic-main", model: "claude-opus-5-5" },
+          judges: { connection: "anthropic-main", model: "claude-haiku-5-5" },
+        },
+      },
+      1,
+      BACKEND,
+    );
+    expect(r.warnings.some((w) => w.includes("weaker tier"))).toBe(true);
+  });
+
+  it("views catalogs sorted by tier, keeping preference order within a tier", () => {
+    CATALOGS.mixed = [
+      info("x", "small-a", "small"),
+      info("x", "mid-a", "mid"),
+      info("x", "big-a", "frontier"),
+      info("x", "big-b", "frontier"),
+    ];
+    expect(sortByTier(CATALOGS.mixed).map((m) => m.name)).toEqual(["big-a", "big-b", "mid-a", "small-a"]);
+    const r = run({}, 1, BACKEND, [conn("mixed", "x")]);
+    expect(r.seats.find((s) => s.role === "judge")?.model.name).toBe("big-a");
+    expect(r.seats.find((s) => s.role === "hunter")?.model.name).toBe("mid-a");
+    delete CATALOGS.mixed;
+  });
+});
+
+describe("model id normalisation", () => {
+  it("normalises decorations", () => {
+    expect(normaliseModelId("Claude-Opus-4-6[1m]")).toBe("claude-opus-4-6");
+    expect(normaliseModelId("us.anthropic.claude-opus-5-5")).toBe("claude-opus-5-5");
+    expect(normaliseModelId("models/gemini-2.5-pro")).toBe("gemini-2.5-pro");
+    expect(normaliseModelId("publishers/anthropic/models/claude-opus-5-5")).toBe("claude-opus-5-5");
+  });
+
+  it("findInCatalog matches decorated and dated ids; :tag only for local providers", () => {
+    const cat = [
+      info("anthropic", "claude-opus-4-6", "frontier"),
+      info("ollama", "llama3.1", "small", false),
+      info("openai", "gpt-5", "frontier"),
+    ];
+    expect(findInCatalog(cat, "claude-opus-4-6[1m]")?.name).toBe("claude-opus-4-6");
+    expect(findInCatalog(cat, "anthropic.claude-opus-4-6-20260101-v1:0")?.name).toBe("claude-opus-4-6");
+    expect(findInCatalog(cat, "llama3.1:8b")?.name).toBe("llama3.1");
+    expect(findInCatalog(cat, "gpt-5:custom")).toBeUndefined();
+    expect(findInCatalog(cat, "gpt-5-mini")).toBeUndefined();
+    expect(findInCatalog(cat, "my-alias", { normalise: (id) => (id === "my-alias" ? "gpt-5" : id) })?.name).toBe(
+      "gpt-5",
+    );
+  });
+
+  it("seating accepts a [1m] policy id against a plain catalog id", () => {
+    CATALOGS.a46 = [info("anthropic", "claude-opus-4-6", "frontier")];
+    const r = run({ models: { judges: { connection: "a46", model: "claude-opus-4-6[1m]" } } }, 1, BACKEND, [
+      conn("a46", "anthropic"),
+    ]);
+    expect(r.seats.find((s) => s.role === "judge")?.model.name).toBe("claude-opus-4-6[1m]");
+    delete CATALOGS.a46;
+  });
+});
+
 describe("planFallback", () => {
   const policy = loadPolicy({ models: { fallback: { connection: "openai-main", model: "gpt-5" } } });
   const s = run({}, 1, BACKEND).seats[0];
@@ -289,6 +372,17 @@ describe("planFallback", () => {
     expect(planFallback(s, bad, [ANTHROPIC, OPENAI], catalog)).toBeUndefined();
     const same = loadPolicy({ models: { fallback: { connection: "anthropic-main", model: s.model.name } } });
     expect(planFallback(s, same, [ANTHROPIC], catalog)).toBeUndefined();
+    // A decorated/dated spelling of the seat's own model is still the same model.
+    const dated = loadPolicy({
+      models: { fallback: { connection: "anthropic-main", model: `${s.model.name}-20260301` } },
+    });
+    expect(planFallback(s, dated, [ANTHROPIC], catalog)).toBeUndefined();
+  });
+
+  it("normalises the fallback id against the catalog", () => {
+    if (!s) throw new Error("no seat");
+    const p = loadPolicy({ models: { fallback: { connection: "openai-main", model: "openai.GPT-5" } } });
+    expect(planFallback(s, p, [ANTHROPIC, OPENAI], catalog)?.name).toBe("openai.GPT-5");
   });
 });
 

@@ -2,7 +2,11 @@
  * Edge-triggered budget alerts (design 7.6). Each (ceiling, threshold) pair fires once when the fraction crosses
  * the threshold upward and re-arms only after the fraction drops back below it, so a ceiling held at 101% does not
  * page every tick. State is plain JSON so the App can persist it between ticks and restarts.
+ *
+ * A threshold of 0 (or below) is ignored: it would fire on every ceiling at zero spend. Unset or disabled ceilings
+ * never alert; `observeResults` skips them, and their fraction is always 0.
  */
+import type { CeilingResult } from "./ceilings.js";
 
 export interface AlertEvent {
   /** Ceiling key, e.g. "per-change", "window", or a caller-chosen key such as "per-seat:hunter:security:1". */
@@ -23,7 +27,7 @@ export class AlertLatch {
   private readonly fired = new Map<string, Set<number>>();
 
   constructor(thresholds: number[] = [0.5, 0.8, 1.0]) {
-    this.thresholds = [...new Set(thresholds.filter((t) => Number.isFinite(t) && t >= 0))].sort((a, b) => a - b);
+    this.thresholds = [...new Set(thresholds.filter((t) => Number.isFinite(t) && t > 0))].sort((a, b) => a - b);
   }
 
   /** Feed the latest fraction for a ceiling; returns the alerts that fire on this observation, lowest first. */
@@ -46,6 +50,20 @@ export class AlertLatch {
       }
     }
     if (set.size === 0) this.fired.delete(ceiling);
+    return events;
+  }
+
+  /**
+   * Observe a whole evaluation. Ceilings with no enforced limit are skipped. Per-seat results are keyed
+   * `per-seat:<seatId>`; everything else by ceiling kind.
+   */
+  observeResults(results: CeilingResult[]): AlertEvent[] {
+    const events: AlertEvent[] = [];
+    for (const r of results) {
+      if (r.limitUsd === null) continue;
+      const key = r.ceiling === "per-seat" && r.seatId ? `per-seat:${r.seatId}` : r.ceiling;
+      events.push(...this.observe(key, r.fraction));
+    }
     return events;
   }
 

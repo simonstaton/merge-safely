@@ -5,13 +5,17 @@
  * TokenUsage convention: `in` is input tokens NOT served from cache; `cachedIn` (cache reads) and `cacheWrite` are
  * charged separately at their own rates. An adapter that reports inclusive input will over-charge, never under-charge.
  */
-import type { ModelInfo, ModelPricing, TokenUsage } from "@merge-safely/core";
+import { isCloudTag, isLocalProvider, type ModelInfo, type ModelPricing, type TokenUsage } from "@merge-safely/core";
 import { MODELS, REGISTRY_VERSION } from "./models.js";
 
 /** Cache writes cost this multiple of input when a model has no explicit cache-write rate. */
 const DEFAULT_CACHE_WRITE_MULTIPLIER = 1.25;
 
-/** Max of every known rate across the registry (or the given catalog). Zero-cost models are ignored. */
+/**
+ * Max of every known rate across the registry (or the given catalog). Zero-cost models are ignored.
+ * Cache-read and cache-write rates are never below the max input rate: an unknown model's caching behaviour is
+ * unknown, so cached tokens are charged at least as much as fresh input.
+ */
 export function pessimisticPricing(catalog: ModelInfo[] = MODELS): ModelPricing {
   const p: Required<ModelPricing> = { inPerMTok: 0, outPerMTok: 0, cachedInPerMTok: 0, cacheWritePerMTok: 0 };
   for (const m of catalog) {
@@ -24,16 +28,21 @@ export function pessimisticPricing(catalog: ModelInfo[] = MODELS): ModelPricing 
       m.pricing.cacheWritePerMTok ?? m.pricing.inPerMTok * DEFAULT_CACHE_WRITE_MULTIPLIER,
     );
   }
+  p.cachedInPerMTok = Math.max(p.cachedInPerMTok, p.inPerMTok);
+  p.cacheWritePerMTok = Math.max(p.cacheWritePerMTok, p.inPerMTok);
   return p;
 }
 
 /**
- * Fill missing pricing with the pessimistic fallback and stamp `source`. Ollama (local) models are treated as zero
- * cost. Models that already carry pricing or `zeroCost` are returned with only `source` defaulted.
+ * Fill missing pricing with the pessimistic fallback and stamp `source`. Unknown models are zero cost only under a
+ * local provider (`ollama`, `lmstudio`) and not on a `-cloud` tag; generic gateways (openai-compatible etc.) are
+ * always priced. Models that already carry pricing or `zeroCost` are returned with only `source` defaulted.
  */
 export function withPricing(model: ModelInfo): ModelInfo {
   if (model.pricing || model.zeroCost) return { ...model, source: model.source ?? REGISTRY_VERSION };
-  if (model.provider === "ollama") return { ...model, zeroCost: true, source: model.source ?? REGISTRY_VERSION };
+  if (isLocalProvider(model.provider) && !isCloudTag(model.name)) {
+    return { ...model, zeroCost: true, source: model.source ?? REGISTRY_VERSION };
+  }
   return { ...model, pricing: pessimisticPricing(), source: `${REGISTRY_VERSION}:pessimistic` };
 }
 

@@ -4,13 +4,20 @@
  * - Hunter lenses come from `panel.t{1,2,3}.hunters` (tier 0 that reaches review uses t1). Lenses listed in
  *   `panel.conditionalLenses` are seated only when a changed path (or a rename's previous path) matches their globs.
  * - Model selection order: `models.perLens[lens]` → `models.hunters` / `models.judges` → automatic.
- *   Automatic: judges take the first "frontier" model in the connection's catalog, hunters the first "mid" model
- *   (falling back to frontier). Catalog order is preference order; the registry lists recommended models first.
+ *   Each catalog is viewed sorted by tier (frontier, mid, small), keeping the catalog's own order inside a tier:
+ *   catalog order is a *preference* among equally strong models (the registry lists recommended models first).
+ *   Automatic hunters take the first "mid" model of the hunter connection (falling back to frontier, then small).
+ *   Automatic judges take the strongest tier available across ALL reachable connections; decorrelation only
+ *   chooses among connections offering that tier, so a judge is never weaker than the best model on offer
+ *   (and so never weaker than any hunter).
  * - With `models.decorrelate` and more than one reachable connection, hunter seats (other than per-lens overrides)
- *   alternate round-robin across connections, and automatically chosen judges go to a connection other than the one
- *   serving most hunters, where one exists.
+ *   alternate round-robin across connections, and automatic judges prefer an equally strong connection other than
+ *   the one serving most hunters.
  * - A policy that names a connection the installation lacks, or a model a connection cannot reach, throws a
  *   SeatingError with a fix hint. A connection whose catalog is empty (no models endpoint) is trusted with a warning.
+ *
+ * Ids are compared with `normaliseModelId` (case, `[1m]`, vendor prefixes, date suffixes); pass `normalise` to
+ * override (the registry re-exports the same function).
  *
  * Model knowledge is injected through `catalog` because core cannot depend on the registry.
  */
@@ -29,6 +36,7 @@ import type {
 } from "../types.js";
 import { SeatingError } from "./errors.js";
 import { matchesAny } from "./glob.js";
+import { matchModelId, modelIdMatches, normaliseModelId } from "./model-id.js";
 
 export interface SeatingInput {
   tier: Tier;
@@ -36,6 +44,8 @@ export interface SeatingInput {
   policy: Policy;
   connections: ConnectionRecord[];
   catalog: (connectionId: string) => ModelInfo[];
+  /** Id normaliser for policy/catalog comparison; defaults to `normaliseModelId`. */
+  normalise?: (id: string) => string;
 }
 
 export interface SeatingResult {
@@ -64,24 +74,23 @@ export function lensesFor(tierPolicy: PanelTierPolicy, change: Change, policy: P
   return out;
 }
 
-/** Find a model in a catalog: exact (case-insensitive), or the catalog name plus a date/version suffix. */
-export function findInCatalog(models: ModelInfo[], name: string): ModelInfo | undefined {
-  const id = name.toLowerCase();
-  const exact = models.find((m) => m.name.toLowerCase() === id);
-  if (exact) return exact;
-  let best: ModelInfo | undefined;
-  for (const m of models) {
-    const n = m.name.toLowerCase();
-    if (!id.startsWith(n) || id.length === n.length) continue;
-    const sep = id[n.length];
-    const rest = id.slice(n.length + 1);
-    const ok =
-      sep === ":" ||
-      ((sep === "-" || sep === "@") &&
-        rest.split("-").every((t) => /^(\d{2,8}|latest|preview|exp|v\d+(:\d+)?)$/.test(t)));
-    if (ok && (!best || n.length > best.name.length)) best = m;
-  }
-  return best;
+/** Find a model in a catalog by a (possibly decorated or date-suffixed) id. See model-id.ts. */
+export function findInCatalog(
+  models: ModelInfo[],
+  name: string,
+  opts: { normalise?: (id: string) => string } = {},
+): ModelInfo | undefined {
+  return matchModelId(models, name, opts);
+}
+
+const TIER_RANK: Record<ModelTierClass, number> = { frontier: 2, mid: 1, small: 0 };
+
+/** Stable sort: strongest tier first, catalog order (preference) within a tier. */
+export function sortByTier(models: readonly ModelInfo[]): ModelInfo[] {
+  return models
+    .map((m, i) => ({ m, i }))
+    .sort((a, b) => TIER_RANK[b.m.tier] - TIER_RANK[a.m.tier] || a.i - b.i)
+    .map((x) => x.m);
 }
 
 const AUTO_PREFERENCE: Record<SeatRole, ModelTierClass[]> = {
@@ -97,6 +106,7 @@ interface Resolved {
 export function seat(input: SeatingInput): SeatingResult {
   const { tier, change, policy, connections } = input;
   const warnings: string[] = [];
+  const normalise = input.normalise ?? normaliseModelId;
   const panelKey = tierPanelKey(tier.level);
   const tierPolicy = policy.panel[panelKey];
 
@@ -111,7 +121,7 @@ export function seat(input: SeatingInput): SeatingResult {
   const catalogOf = (id: string): ModelInfo[] => {
     let c = catalogCache.get(id);
     if (!c) {
-      c = input.catalog(id);
+      c = sortByTier(input.catalog(id));
       catalogCache.set(id, c);
     }
     return c;
@@ -162,7 +172,7 @@ export function seat(input: SeatingInput): SeatingResult {
       warnings.push(`Connection "${conn.id}" lists no models; trusting ${key}.model "${sel.model}" unverified.`);
       return { ref };
     }
-    const info = findInCatalog(models, sel.model);
+    const info = findInCatalog(models, sel.model, { normalise });
     if (!info) {
       const names = models.slice(0, 8).map((m) => m.name);
       throw new SeatingError(
@@ -192,6 +202,11 @@ export function seat(input: SeatingInput): SeatingResult {
       `Connection "${conn.id}" lists no models; using its default model "${conn.defaultModel}" unverified.`,
     );
     return { ref: { connectionId: conn.id, provider: conn.provider, name: conn.defaultModel as string } };
+  };
+
+  const tierOfRef = (ref: ModelRef): number => {
+    const m = findInCatalog(catalogOf(ref.connectionId), ref.name, { normalise });
+    return m ? TIER_RANK[m.tier] : -1;
   };
 
   const hunterBase: Resolved = policy.models.hunters
@@ -239,17 +254,30 @@ export function seat(input: SeatingInput): SeatingResult {
     let judgeModels: Resolved[];
     if (policy.models.judges) {
       judgeModels = [explicit(policy.models.judges, "models.judges")];
-    } else if (decorrelate) {
-      const counts = new Map<string, number>();
-      for (const s of seats) counts.set(s.model.connectionId, (counts.get(s.model.connectionId) ?? 0) + 1);
-      const majority = [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
-      const others = reachable.filter((c) => c.id !== majority);
-      const withFrontier = others.filter((c) => catalogOf(c.id).some((m) => m.tier === "frontier"));
-      const pool = withFrontier.length > 0 ? withFrontier : others;
-      const fallback = reachable.find((c) => c.id === majority) ?? (reachable[0] as ConnectionRecord);
-      judgeModels = (pool.length > 0 ? pool : [fallback]).map((c) => auto(c, "judge"));
     } else {
-      judgeModels = [auto(reachable[0] as ConnectionRecord, "judge")];
+      // Strongest tier on offer anywhere; only connections offering it are candidates.
+      const bestRank = (c: ConnectionRecord): number => {
+        const top = catalogOf(c.id)[0];
+        return top ? TIER_RANK[top.tier] : -1;
+      };
+      const best = Math.max(...reachable.map(bestRank));
+      const strongest = reachable.filter((c) => bestRank(c) === best);
+      let pool = strongest;
+      if (decorrelate) {
+        const counts = new Map<string, number>();
+        for (const s of seats) counts.set(s.model.connectionId, (counts.get(s.model.connectionId) ?? 0) + 1);
+        const majority = [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
+        const others = strongest.filter((c) => c.id !== majority);
+        if (others.length > 0) pool = others;
+      }
+      judgeModels = (decorrelate ? pool : pool.slice(0, 1)).map((c) => auto(c, "judge"));
+    }
+    const hunterTop = Math.max(-1, ...seats.map((s) => tierOfRef(s.model)));
+    for (const r of judgeModels) {
+      const t = tierOfRef(r.ref);
+      if (t >= 0 && t < hunterTop) {
+        warnings.push(`Judge model "${r.ref.name}" is a weaker tier than the strongest hunter model.`);
+      }
     }
     for (let i = 0; i < tierPolicy.judges; i++) {
       const id = `judge:${i + 1}`;
@@ -271,14 +299,21 @@ export function planFallback(
   policy: Policy,
   connections: ConnectionRecord[],
   catalog: (connectionId: string) => ModelInfo[],
+  opts: { normalise?: (id: string) => string } = {},
 ): ModelRef | undefined {
+  const normalise = opts.normalise ?? normaliseModelId;
   const sel = policy.models.fallback;
   if (!sel) return undefined;
   const conn = connections.find((c) => c.id === sel.connection);
   if (!conn) return undefined;
   const models = catalog(conn.id);
-  if (models.length > 0 && !findInCatalog(models, sel.model)) return undefined;
-  if (seatToCover.model.connectionId === conn.id && seatToCover.model.name === sel.model) return undefined;
+  if (models.length > 0 && !findInCatalog(models, sel.model, { normalise })) return undefined;
+  if (seatToCover.model.connectionId === conn.id) {
+    const a = normalise(seatToCover.model.name);
+    const b = normalise(sel.model);
+    // Same model, or one is a dated/decorated variant of the other.
+    if (modelIdMatches(a, b) || modelIdMatches(b, a)) return undefined;
+  }
   const ref: ModelRef = { connectionId: conn.id, provider: conn.provider, name: sel.model };
   if (sel.effort) ref.effort = sel.effort;
   return ref;

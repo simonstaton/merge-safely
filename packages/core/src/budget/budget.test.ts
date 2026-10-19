@@ -5,7 +5,9 @@ import {
   AlertLatch,
   admit,
   CEILING_POLICY_KEYS,
+  ceilingEvaluator,
   classifyRunnerExit,
+  DEFAULT_LENS_PRIORITY,
   downgradeLadder,
   estimatePanel,
   evaluateCeilings,
@@ -71,6 +73,62 @@ describe("evaluateCeilings", () => {
   });
 });
 
+describe("evaluateCeilings: fail closed and advisory", () => {
+  const policy = loadPolicy({ budget: { windowUsd: 100, spendLimitUsd: 1000, perInstallationMonthlyUsd: 500 } });
+
+  it("marks configured ceilings with missing spend as unknownSpend and breached", () => {
+    const r = evaluateCeilings({ policy, seatEstimates: [{ seatId: "a", usd: 1 }], changeSpendUsd: 0 });
+    for (const c of ["window", "all-time", "monthly"] as const) {
+      expect(r.find((x) => x.ceiling === c)).toMatchObject({ unknownSpend: true, breached: true });
+    }
+  });
+
+  it("unset ceilings with missing spend are fine", () => {
+    const r = evaluateCeilings({ policy: base, seatEstimates: [], changeSpendUsd: 0 });
+    expect(r.some((x) => x.unknownSpend)).toBe(false);
+    expect(admit({ policy: base, seatEstimates: [], changeSpendUsd: 0 }).ok).toBe(true);
+  });
+
+  it("admit fails closed with a ledger-required message", () => {
+    const r = admit({
+      policy,
+      seatEstimates: [{ seatId: "a", usd: 1 }],
+      changeSpendUsd: 0,
+      allTimeSpendUsd: 0,
+      monthlySpendUsd: 0,
+    });
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.binding.ceiling).toBe("window");
+    expect(r.message).toContain("spend for window unknown; ledger required");
+  });
+
+  it("advisory ceilings never block but are reported", () => {
+    const r = admit({
+      policy,
+      seatEstimates: [{ seatId: "a", usd: 2 }],
+      changeSpendUsd: 0,
+      windowSpendUsd: 0,
+      allTimeSpendUsd: 0,
+      monthlySpendUsd: 499,
+      advisory: ["monthly"],
+    });
+    expect(r.ok).toBe(true);
+    expect(r.advisoryBreaches.map((x) => x.ceiling)).toEqual(["monthly"]);
+    expect(r.results.find((x) => x.ceiling === "monthly")).toMatchObject({ breached: true, advisory: true });
+    // Advisory also covers unknown spend (the Action has no monthly ledger).
+    const r2 = admit({
+      policy,
+      seatEstimates: [],
+      changeSpendUsd: 0,
+      windowSpendUsd: 0,
+      allTimeSpendUsd: 0,
+      advisory: ["monthly"],
+    });
+    expect(r2.ok).toBe(true);
+  });
+});
+
 describe("admit", () => {
   it("admits when nothing breaches", () => {
     const r = admit({ policy: base, seatEstimates: [{ seatId: "a", usd: 1 }], changeSpendUsd: 0 });
@@ -123,6 +181,23 @@ describe("AlertLatch", () => {
     expect(l.observe("b", 0.6)).toHaveLength(1);
   });
 
+  it("ignores a threshold of 0", () => {
+    const l = new AlertLatch([0, 0.5]);
+    expect(l.observe("per-change", 0)).toEqual([]);
+    expect(l.toJSON().thresholds).toEqual([0.5]);
+  });
+
+  it("observeResults skips unset/disabled ceilings and keys per-seat by seat", () => {
+    const l = new AlertLatch([0.5]);
+    const results = evaluateCeilings({
+      policy: loadPolicy({ budget: { perChangeUsd: 0 } }),
+      seatEstimates: [{ seatId: "judge:1", usd: 4 }],
+      changeSpendUsd: 1e6,
+    });
+    const ev = l.observeResults(results);
+    expect(ev.map((e) => e.ceiling)).toEqual(["per-seat:judge:1"]);
+  });
+
   it("round-trips through JSON", () => {
     const l = new AlertLatch([0.5, 0.8]);
     l.observe("all-time", 0.9);
@@ -173,34 +248,36 @@ const tierOf = (m: ModelRef): ModelTierClass | undefined => LADDER[m.name]?.tier
 describe("downgradeLadder", () => {
   const seats = [hunter("intent"), hunter("correctness"), hunter("repro"), hunter("security"), judge(1), judge(2)];
   // full cost: 4 hunters * 2 + 2 judges * 4 = 16
-
-  it("returns unchanged when already within budget", () => {
-    const r = downgradeLadder({
+  const perChange = (limit: number, spent = 0) =>
+    ceilingEvaluator(
+      { policy: loadPolicy({ budget: { perChangeUsd: limit, perSeatUsd: 0 } }), changeSpendUsd: spent },
+      estimate,
+    );
+  const go = (limit: number, extra: Partial<Parameters<typeof downgradeLadder>[0]> = {}, spent = 0) =>
+    downgradeLadder({
       seats,
       policy: base,
-      estimate,
+      evaluate: perChange(limit, spent),
       cheaper,
-      limitUsd: 16,
-      alreadySpentUsd: 0,
+      tierOf,
       quorumRequired: 2,
+      ...extra,
     });
-    expect(r).toEqual({ seats, steps: [], withinBudget: true });
+
+  it("returns unchanged when already within budget", () => {
+    const r = go(16);
+    expect(r.seats).toBe(seats);
+    expect(r.steps).toEqual([]);
+    expect(r.withinBudget).toBe(true);
   });
 
   it("steps hunters first and records downgradedFrom", () => {
     // hunters to haiku: 4*0.5 + 8 = 10
-    const r = downgradeLadder({
-      seats,
-      policy: base,
-      estimate,
-      cheaper,
-      limitUsd: 10,
-      alreadySpentUsd: 0,
-      quorumRequired: 2,
-    });
+    const r = go(10);
     expect(r.withinBudget).toBe(true);
     expect(r.steps.map((s) => s.step)).toEqual(["hunters-model"]);
     expect(r.steps[0]).toMatchObject({ from: "c/sonnet", to: "c/haiku" });
+    expect(r.steps[0]?.reason).toContain("budget.perChangeUsd");
     const h = r.seats.filter((s) => s.role === "hunter");
     expect(h.every((s) => s.model.name === "haiku" && s.downgradedFrom?.name === "sonnet")).toBe(true);
     expect(r.seats.filter((s) => s.role === "judge").every((s) => s.downgradedFrom === undefined)).toBe(true);
@@ -212,11 +289,9 @@ describe("downgradeLadder", () => {
     const r = downgradeLadder({
       seats: opusHunters,
       policy: base,
-      estimate,
+      evaluate: perChange(8),
       cheaper,
       tierOf,
-      limitUsd: 8,
-      alreadySpentUsd: 0,
       quorumRequired: 2,
     });
     expect(r.steps.map((s) => s.step)).toEqual(["hunters-model", "judges-model"]);
@@ -224,190 +299,184 @@ describe("downgradeLadder", () => {
     expect(r.seats.filter((s) => s.role === "judge").every((s) => s.model.name === "sonnet")).toBe(true);
   });
 
-  it("does not drop judges below hunters (with and without tierOf)", () => {
-    const s = [hunter("intent", "sonnet"), judge(1, "sonnet")];
-    for (const t of [tierOf, undefined]) {
-      const r = downgradeLadder({
-        seats: s,
-        policy: base,
-        estimate,
-        cheaper,
-        tierOf: t,
-        limitUsd: 0.6,
-        alreadySpentUsd: 0,
-        quorumRequired: 1,
-      });
-      // hunters -> haiku; judge sonnet -> haiku would be equal to hunters (allowed by tier) only with tierOf
-      const j = r.seats.find((x) => x.role === "judge");
-      if (t) expect(j?.model.name).toBe("haiku");
-      expect(r.withinBudget).toBe(false);
-      expect(r.steps.at(-1)?.step).toBe("block");
-    }
-    // Hunters stuck at mid (no cheaper model): a judge may not step below mid.
+  it("refuses a judge step below the hunters, or to a model of unknown tier", () => {
     LADDER.stuck = { tier: "mid", usd: 2 };
     const stuck = [hunter("intent", "stuck"), judge(1, "sonnet")];
     const r = downgradeLadder({
       seats: stuck,
       policy: base,
-      estimate,
+      evaluate: perChange(1),
       cheaper,
       tierOf,
-      limitUsd: 1,
-      alreadySpentUsd: 0,
       quorumRequired: 1,
     });
     expect(r.seats.find((x) => x.role === "judge")?.model.name).toBe("sonnet");
     expect(r.steps.map((x) => x.step)).toEqual(["block"]);
     delete LADDER.stuck;
+    const unknownTier = () => undefined;
+    const r2 = downgradeLadder({
+      seats: [hunter("a", "haiku"), judge(1)],
+      policy: base,
+      evaluate: perChange(1),
+      cheaper,
+      tierOf: unknownTier,
+      quorumRequired: 1,
+    });
+    expect(r2.seats.find((x) => x.role === "judge")?.model.name).toBe("opus");
   });
 
-  it("drops hunter seats to the quorum minimum, keeping lenses listed first", () => {
+  it("drops hunters to quorum using the default lens priority", () => {
+    expect(DEFAULT_LENS_PRIORITY.slice(0, 3)).toEqual(["correctness", "security", "intent"]);
     // after hunters->haiku and judges->sonnet: 4*0.5 + 2*2 = 6; need <= 5 → drop 2 hunters (5)
-    const r = downgradeLadder({
-      seats,
-      policy: base,
-      estimate,
-      cheaper,
-      tierOf,
-      limitUsd: 5,
-      alreadySpentUsd: 0,
-      quorumRequired: 2,
-    });
+    const r = go(5);
     expect(r.steps.map((s) => s.step)).toEqual(["hunters-model", "judges-model", "seat-count"]);
     expect(r.withinBudget).toBe(true);
-    expect(r.seats.filter((s) => s.role === "hunter").map((s) => s.lens)).toEqual(["intent", "correctness"]);
+    expect(r.seats.filter((s) => s.role === "hunter").map((s) => s.lens)).toEqual(["correctness", "security"]);
     expect(r.steps[2]).toMatchObject({ from: "4 hunters", to: "2 hunters" });
   });
 
-  it("honours an explicit lens priority", () => {
+  it("drops unlisted lenses before listed ones and honours an explicit priority", () => {
+    const withCustom = [hunter("custom"), hunter("perf"), hunter("correctness"), judge(1, "haiku")];
     const r = downgradeLadder({
-      seats,
+      seats: withCustom,
       policy: base,
-      estimate,
+      evaluate: perChange(1.6),
       cheaper,
       tierOf,
-      limitUsd: 5,
-      alreadySpentUsd: 0,
       quorumRequired: 2,
-      lensPriority: ["security", "repro"],
     });
-    expect(r.seats.filter((s) => s.role === "hunter").map((s) => s.lens)).toEqual(["repro", "security"]);
+    expect(r.seats.filter((s) => s.role === "hunter").map((s) => s.lens)).toEqual(["perf", "correctness"]);
+    const r2 = go(5, { lensPriority: ["repro", "intent"] });
+    expect(r2.seats.filter((s) => s.role === "hunter").map((s) => s.lens)).toEqual(["intent", "repro"]);
   });
 
-  it("blocks when nothing fits, counting what was already spent", () => {
-    const r = downgradeLadder({
-      seats,
-      policy: base,
+  it("works against a per-seat ceiling, not just per-change", () => {
+    // per-seat cap $3: opus judges ($4) breach; judges -> sonnet ($2) fixes it once hunters are at haiku.
+    const evaluate = ceilingEvaluator(
+      { policy: loadPolicy({ budget: { perSeatUsd: 3, perChangeUsd: 0 } }), changeSpendUsd: 0 },
       estimate,
-      cheaper,
-      tierOf,
-      limitUsd: 25,
-      alreadySpentUsd: 24,
-      quorumRequired: 2,
-    });
+    );
+    const r = downgradeLadder({ seats, policy: base, evaluate, cheaper, tierOf, quorumRequired: 2 });
+    expect(r.withinBudget).toBe(true);
+    expect(r.steps.map((s) => s.step)).toEqual(["hunters-model", "judges-model"]);
+    expect(r.steps[0]?.reason).toContain("budget.perSeatUsd");
+  });
+
+  it("blocks naming the binding ceiling and its policy key, never onOverBudget", () => {
+    const evaluate = ceilingEvaluator(
+      {
+        policy: loadPolicy({ budget: { windowUsd: 10 } }),
+        changeSpendUsd: 0,
+        windowSpendUsd: 9.9,
+        allTimeSpendUsd: 0,
+        monthlySpendUsd: 0,
+      },
+      estimate,
+    );
+    const r = downgradeLadder({ seats, policy: base, evaluate, cheaper, tierOf, quorumRequired: 2 });
     expect(r.withinBudget).toBe(false);
     expect(r.steps.map((s) => s.step)).toEqual(["hunters-model", "judges-model", "seat-count", "block"]);
+    const reason = r.steps.at(-1)?.reason ?? "";
+    expect(reason).toContain('"window"');
+    expect(reason).toContain("budget.windowUsd");
+    expect(reason).not.toContain("onOverBudget");
     expect(r.seats.filter((s) => s.role === "hunter")).toHaveLength(2);
+  });
+
+  it("counts what was already spent on the change", () => {
+    const r = go(25, {}, 24);
+    expect(r.withinBudget).toBe(false);
     expect(r.steps.at(-1)?.reason).toContain("budget.perChangeUsd");
   });
 
   it("onOverBudget: block skips straight to block", () => {
-    const policy = loadPolicy({ budget: { onOverBudget: "block" } });
-    const r = downgradeLadder({
-      seats,
-      policy,
-      estimate,
-      cheaper,
-      limitUsd: 10,
-      alreadySpentUsd: 0,
-      quorumRequired: 2,
-    });
+    const r = go(10, { policy: loadPolicy({ budget: { onOverBudget: "block" } }) });
     expect(r.steps.map((s) => s.step)).toEqual(["block"]);
     expect(r.seats).toBe(seats);
   });
 
   it("a disabled limit is always within budget", () => {
-    const r = downgradeLadder({
-      seats,
-      policy: base,
-      estimate,
-      cheaper,
-      limitUsd: 0,
-      alreadySpentUsd: 1e9,
-      quorumRequired: 2,
-    });
-    expect(r.withinBudget).toBe(true);
+    expect(go(0, {}, 1e9).withinBudget).toBe(true);
   });
 });
 
 describe("classifyRunnerExit", () => {
   const caps = { maxUsd: 5, maxTurns: 50, deadlineMs: 600_000 };
+  const exit1 = { exitCode: 1, stderr: "", budgetFlagSet: true, caps, wallMs: 1000 };
 
   it("exit 0 is ok", () => {
-    expect(classifyRunnerExit({ exitCode: 0, stderr: "", budgetFlagSet: true, caps, wallMs: 1000 }).status).toBe("ok");
+    expect(classifyRunnerExit({ ...exit1, exitCode: 0 }).status).toBe("ok");
   });
 
   it("timedOut is timeout", () => {
-    const r = classifyRunnerExit({
-      exitCode: null,
-      signal: "SIGKILL",
-      stderr: "",
-      budgetFlagSet: true,
-      caps,
-      wallMs: 1,
-      timedOut: true,
-    });
+    const r = classifyRunnerExit({ ...exit1, exitCode: null, signal: "SIGKILL", timedOut: true });
     expect(r.status).toBe("timeout");
     expect(r.recovery).toContain("budget.seatDeadlineMs");
   });
 
-  it("non-zero exit at the usd cap with the flag set is a budget pause", () => {
-    const r = classifyRunnerExit({
-      exitCode: 1,
-      stderr: "Error: exceeded max budget",
-      budgetFlagSet: true,
-      usage: { usd: 4.8 },
-      caps,
-      wallMs: 1000,
-    });
+  it("SIGKILL at 46/50 turns with empty stderr (OOM) is an error", () => {
+    const r = classifyRunnerExit({ ...exit1, exitCode: null, signal: "SIGKILL", usage: { turns: 46 } });
+    expect(r.status).toBe("error");
+  });
+
+  it("a signal is an error even with usage at the cap", () => {
+    expect(classifyRunnerExit({ ...exit1, exitCode: null, signal: "SIGTERM", usage: { turns: 50 } }).status).toBe(
+      "error",
+    );
+  });
+
+  it("429 rate limit near the usd cap is an error", () => {
+    const r = classifyRunnerExit({ ...exit1, stderr: "Error: 429 rate_limit_error", usage: { usd: 4.8 } });
+    expect(r.status).toBe("error");
+  });
+
+  it("401 authentication failure near the usd cap is an error", () => {
+    const r = classifyRunnerExit({ ...exit1, stderr: "AuthenticationError: 401", usage: { usd: 4.6 } });
+    expect(r.status).toBe("error");
+    expect(r.recovery).toBeUndefined();
+  });
+
+  it("usd at >= 95% of the cap with clean stderr is a budget pause", () => {
+    const r = classifyRunnerExit({ ...exit1, usage: { usd: 4.8 } });
     expect(r.status).toBe("budget-exceeded");
     expect(r.recovery).toBe("Raise budget.perSeatUsd and re-run the check.");
+    expect(classifyRunnerExit({ ...exit1, usage: { usd: 4.6 } }).status).toBe("error"); // 92%: not enough
   });
 
-  it("turn cap names seatMaxTurns", () => {
-    const r = classifyRunnerExit({
-      exitCode: 1,
-      stderr: "",
-      budgetFlagSet: true,
-      usage: { turns: 50 },
-      caps,
-      wallMs: 1,
-    });
+  it("turns at the cap names seatMaxTurns; 46/50 is not enough", () => {
+    const r = classifyRunnerExit({ ...exit1, usage: { turns: 50 } });
     expect(r.status).toBe("budget-exceeded");
     expect(r.recovery).toContain("budget.seatMaxTurns");
+    expect(classifyRunnerExit({ ...exit1, usage: { turns: 46 } }).status).toBe("error");
   });
 
-  it("a stack trace means a crash even at the cap", () => {
-    const stderr = "TypeError: x is undefined\n    at run (/app/runner.js:10:5)\n    at main (/app/index.js:3:1)";
-    const r = classifyRunnerExit({ exitCode: 1, stderr, budgetFlagSet: true, usage: { usd: 5 }, caps, wallMs: 1 });
-    expect(r.status).toBe("error");
-    expect(r.reason).not.toContain("TypeError"); // stderr is never echoed
+  it("an explicit budget subtype counts as evidence", () => {
+    const r = classifyRunnerExit({ ...exit1, budgetSubtype: "error_max_turns" });
+    expect(r.status).toBe("budget-exceeded");
+    expect(r.recovery).toContain("seatMaxTurns");
+    expect(classifyRunnerExit({ ...exit1, budgetSubtype: "error_max_budget_usd" }).recovery).toContain("perSeatUsd");
   });
 
-  it("no budget flag, or usage far from cap, is an error", () => {
-    expect(
-      classifyRunnerExit({ exitCode: 1, stderr: "", budgetFlagSet: false, usage: { usd: 5 }, caps, wallMs: 1 }).status,
-    ).toBe("error");
-    expect(
-      classifyRunnerExit({ exitCode: 1, stderr: "", budgetFlagSet: true, usage: { usd: 1 }, caps, wallMs: 1 }).status,
-    ).toBe("error");
-    expect(classifyRunnerExit({ exitCode: 1, stderr: "", budgetFlagSet: true, caps, wallMs: 1 }).status).toBe("error");
+  it("stack traces (CJS, ESM file:// and absolute frames) mean a crash", () => {
+    for (const stderr of [
+      "    at run (/app/runner.js:10:5)",
+      "    at file:///app/a.mjs:1:2",
+      "    at async main (file:///app/a.mjs:3:1)",
+      "    at /app/x.js:1:2",
+      "Traceback (most recent call last):",
+      "uncaught exception",
+    ]) {
+      expect(classifyRunnerExit({ ...exit1, stderr, usage: { turns: 50 } }).status, stderr).toBe("error");
+    }
   });
 
-  it("non-zero exit past the deadline is a timeout", () => {
-    expect(classifyRunnerExit({ exitCode: 137, stderr: "", budgetFlagSet: false, caps, wallMs: 600_001 }).status).toBe(
-      "timeout",
-    );
+  it("stderr is never echoed into the reason", () => {
+    expect(classifyRunnerExit({ ...exit1, stderr: "Error: sk-secret" }).reason).not.toContain("sk-secret");
+  });
+
+  it("no budget flag, or no evidence, is an error", () => {
+    expect(classifyRunnerExit({ ...exit1, budgetFlagSet: false, usage: { usd: 5 } }).status).toBe("error");
+    expect(classifyRunnerExit({ ...exit1 }).status).toBe("error");
   });
 });
 
