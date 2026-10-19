@@ -55,24 +55,19 @@ function normalisePath(p: string): string {
 export type FindingDraft = Omit<Finding, "id"> & { id?: string };
 
 /**
- * Fingerprint: first 10 hex chars of sha256 over (normalised path, line window, class, normalised title).
- * With a file but no line the window is "*"; with no file only class and title are hashed.
- * Any id the model supplied is ignored: ids are assigned by the core.
+ * Fingerprint per design section 3: first 10 hex chars of sha256 over (normalised path, 10-line window,
+ * class). The title is deliberately not hashed for findings with a file, because models reword titles
+ * between rounds and the id must survive that. Two same-class findings in one window share an id and are
+ * merged by dedupe. With a file but no line the window is "*"; with no file there is nothing to anchor
+ * on, so (class, normalised title) is hashed. Any id the model supplied is ignored.
  */
 export function fingerprintFinding(f: FindingDraft): string {
   const cls = f.class.trim().toLowerCase();
-  const title = normaliseTitle(f.title);
   const file = f.file ? normalisePath(f.file) : "";
   const parts =
     file === ""
-      ? ["nofile", cls, title]
-      : [
-          "file",
-          file,
-          f.line !== undefined && f.line > 0 ? String(Math.floor((f.line - 1) / LINE_WINDOW)) : "*",
-          cls,
-          title,
-        ];
+      ? ["nofile", cls, normaliseTitle(f.title)]
+      : ["file", file, f.line !== undefined && f.line > 0 ? String(Math.floor((f.line - 1) / LINE_WINDOW)) : "*", cls];
   return createHash("sha256").update(parts.join("\u0000")).digest("hex").slice(0, 10);
 }
 
@@ -100,13 +95,13 @@ function union<T>(a: T[] | undefined, b: T[] | undefined): T[] | undefined {
 
 /**
  * Merge findings sharing a fingerprint, preserving first-seen order. Merged: lenses and evidence (union),
- * severity (highest), detail and suggestedFix (longest), votes (concatenated). Findings without an id are
- * fingerprinted first.
+ * severity (highest), detail and suggestedFix (longest), votes (concatenated). Ids are always recomputed
+ * from content, so an id a model wrote can never merge a real blocker into a dropped style finding.
  */
-export function dedupeFindings(findings: Finding[]): Finding[] {
+export function dedupeFindings(findings: Array<Finding | FindingDraft>): Finding[] {
   const byId = new Map<string, Finding>();
   for (const raw of findings) {
-    const f = raw.id ? raw : { ...raw, id: fingerprintFinding(raw) };
+    const f: Finding = { ...raw, id: fingerprintFinding(raw) };
     const prior = byId.get(f.id);
     if (!prior) {
       byId.set(f.id, { ...f });

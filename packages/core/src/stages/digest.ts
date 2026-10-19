@@ -1,5 +1,6 @@
 import type { Policy } from "../policy/schema.js";
 import type { Finding, HumanDigest, ReviewerRun, Severity, Tier, Verdict } from "../types.js";
+import { redactText } from "./intake.js";
 
 /** GitHub rejects check-run summaries over 65535 chars; stay well under. */
 export const MAX_DIGEST_CHARS = 60_000;
@@ -18,10 +19,18 @@ const GROUPS: Array<{ severity: Severity; label: string }> = [
   { severity: "pre-existing", label: "Pre-existing" },
 ];
 
+// ---------------------------------------------------------------------------
+// Untrusted text rendering. Everything a model, a PR author or a policy file wrote goes through one of
+// three functions: `inline` (one markdown line), `quote` (a markdown blockquote) or `plain` (text digest).
+// All three redact secret shapes first: reviewers read the workspace and can quote real secrets.
+// ---------------------------------------------------------------------------
+
+const ZWSP = "​";
+
 /**
- * Text from models, policy patterns and PR metadata is rendered as data: HTML is escaped, markdown
- * emphasis, link and code characters are backslash-escaped (so a glob like `src/**` is not read as bold)
- * and @mentions are broken with a zero-width space so a finding cannot ping people or inject markup.
+ * Escape markdown/HTML so text is rendered as data: HTML is escaped, emphasis/link/code characters are
+ * backslash-escaped (a glob like `src/**` is not read as bold), autolinks are broken, and @mentions get a
+ * zero-width space so a finding cannot ping people.
  */
 export function escapeMarkdown(s: string): string {
   return s
@@ -29,15 +38,61 @@ export function escapeMarkdown(s: string): string {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/[\\`*_[\]|~]/g, (c) => `\\${c}`)
-    .replace(/@(?=[A-Za-z0-9])/g, "@​");
+    .replace(/:\/\//g, `:/${ZWSP}/`)
+    .replace(/\bwww\./gi, (w) => `${w.slice(0, 3)}${ZWSP}.`)
+    .replace(/@(?=[A-Za-z0-9])/g, `@${ZWSP}`);
 }
-const md = escapeMarkdown;
 
-/** An inline code span. Markdown and HTML are inert inside it; only backticks need neutralising. */
-const code = (s: string): string => `\`${s.replace(/`/g, "'").replace(/\r?\n/g, " ")}\``;
+/** Escape block-level markers at the start of a line (headings, quotes, lists, setext/thematic rules). */
+function escapeLineStart(line: string): string {
+  const trimmed = line.replace(/^[ \t]+/, "");
+  return trimmed.replace(/^(#|>|-|\+|=|\d+[.)])/, (m) => `\\${m}`);
+}
+
+/** One line of markdown: newlines collapsed, leading block markers neutralised, escaped, redacted. */
+function inline(s: string, max = 200): string {
+  const collapsed = clip(redactText(s).replace(/\s+/g, " ").trim(), max);
+  return escapeLineStart(escapeMarkdown(collapsed));
+}
+
+/**
+ * A markdown blockquote: every line is prefixed `> `, escaped, and has leading block markers escaped, so
+ * nothing inside can open a heading, list, table, fence or rule, or end the quote.
+ */
+function quote(s: string, max: number): string[] {
+  const text = clip(redactText(s).trim(), max);
+  if (!text) return [];
+  return text.split(/\r?\n/).map((line) => {
+    const l = escapeLineStart(escapeMarkdown(line));
+    return l.trim() === "" ? ">" : `> ${l}`;
+  });
+}
+
+/** Plain text for the text digest (also posted to chat tools): redacted and de-pinged. */
+function plain(s: string, max = Number.POSITIVE_INFINITY, oneLine = false): string {
+  let out = clip(redactText(s), max);
+  if (oneLine) out = out.replace(/\s+/g, " ").trim();
+  return out.replace(/<([!@#])/g, `<${ZWSP}$1`).replace(/@(?=[A-Za-z0-9])/g, `@${ZWSP}`);
+}
+
+/** An inline code span. Markdown and HTML are inert inside it; only backticks and newlines need neutralising. */
+const code = (s: string): string => `\`${redactText(s).replace(/`/g, "'").replace(/\s+/g, " ")}\``;
 
 function clip(s: string, n: number): string {
-  return s.length > n ? `${s.slice(0, n - 1)}…` : s;
+  if (s.length <= n) return s;
+  // Never split a surrogate pair.
+  let cut = n - 1;
+  const c = s.charCodeAt(cut - 1);
+  if (c >= 0xd800 && c <= 0xdbff) cut--;
+  return `${s.slice(0, cut)}…`;
+}
+
+/** Truncate at a line boundary so no tag, entity or code span is cut in half. */
+function truncateAtLine(s: string, max: number, note: string): string {
+  if (s.length <= max) return s;
+  const budget = max - note.length;
+  const cut = s.lastIndexOf("\n", budget);
+  return `${s.slice(0, cut > 0 ? cut : 0)}${note}`;
 }
 
 const plural = (n: number, one: string, many = `${one}s`): string => `${n} ${n === 1 ? one : many}`;
@@ -96,10 +151,15 @@ function costLine(verdict: Verdict): Section {
   const bySeat = Object.entries(verdict.cost.bySeat)
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
     .map(([seat, c]) => `${seat} → ${c.connectionId}/${c.model}${c.usd !== undefined ? ` ${fmtUsd(c.usd)}` : ""}`);
-  const line = `Cost: ${parts.join(" · ")}`;
   return {
-    md: [`**Cost:** ${md(parts.join(" · "))}`, ...(bySeat.length ? [`<sub>${md(bySeat.join("; "))}</sub>`] : [])],
-    text: [line, ...(bySeat.length ? [`  Connections: ${bySeat.join("; ")}`] : [])],
+    md: [
+      `**Cost:** ${inline(parts.join(" · "), 500)}`,
+      ...(bySeat.length ? [`<sub>${inline(bySeat.join("; "), 4000)}</sub>`] : []),
+    ],
+    text: [
+      `Cost: ${plain(parts.join(" · "), 500, true)}`,
+      ...(bySeat.length ? [`  Connections: ${plain(bySeat.join("; "), 4000, true)}`] : []),
+    ],
   };
 }
 
@@ -113,50 +173,68 @@ function findingsSection(findings: Finding[], maxPer: number): Section & { omitt
     for (const f of group.slice(0, maxPer)) {
       const loc = location(f);
       out.md.push(
-        `- **[${md(f.class)}] ${md(clip(f.title, 200))}**${loc ? ` — ${code(loc)}` : ""} <sub>${shortId(f.id)}</sub>`,
+        "",
+        `**[${inline(f.class, 64)}] ${inline(f.title)}**${loc ? ` — ${code(loc)}` : ""} <sub>${shortId(f.id)}</sub>`,
       );
-      out.text.push(`  [${f.class}] ${clip(f.title, 200)}${loc ? ` — ${loc}` : ""} (${shortId(f.id)})`);
-      const detail = clip(f.detail.trim(), MAX_DETAIL_CHARS);
-      if (detail) {
-        out.md.push(`  ${md(detail).replace(/\n/g, "\n  ")}`);
-        out.text.push(`     ${detail.replace(/\n/g, "\n     ")}`);
-      }
-      if (f.evidence && f.evidence.length > 0) {
-        const ev = f.evidence.map((e) => clip(e, 500));
-        out.md.push(`  - Evidence: ${ev.map(md).join("; ")}`);
-        out.text.push(`     Evidence: ${ev.join("; ")}`);
+      out.text.push(
+        `  [${plain(f.class, 64, true)}] ${plain(f.title, 200, true)}${loc ? ` — ${plain(loc)}` : ""} (${shortId(f.id)})`,
+      );
+      const body: string[] = [...quote(f.detail, MAX_DETAIL_CHARS)];
+      const detail = plain(f.detail.trim(), MAX_DETAIL_CHARS);
+      if (detail) out.text.push(`     ${detail.replace(/\n/g, "\n     ")}`);
+      for (const e of f.evidence ?? []) {
+        if (body.length > 0) body.push(">");
+        const lines = quote(e, 500);
+        if (lines[0]) lines[0] = lines[0].replace(/^> ?/, "> **Evidence:** ");
+        body.push(...lines);
+        out.text.push(`     Evidence: ${plain(e, 500, true)}`);
       }
       if (f.suggestedFix) {
-        out.md.push(`  - Suggested: ${md(clip(f.suggestedFix, 800))}`);
-        out.text.push(`     Suggested: ${clip(f.suggestedFix, 800)}`);
+        if (body.length > 0) body.push(">");
+        const lines = quote(f.suggestedFix, 800);
+        if (lines[0]) lines[0] = lines[0].replace(/^> ?/, "> **Suggested:** ");
+        body.push(...lines);
+        out.text.push(`     Suggested: ${plain(f.suggestedFix, 800, true)}`);
       }
+      if (body.length > 0) out.md.push("", ...body);
     }
     if (group.length > maxPer) {
       const n = group.length - maxPer;
       out.omitted += n;
-      out.md.push(`- _…and ${n} more ${label.toLowerCase()} not shown_`);
+      out.md.push("", `_…and ${n} more ${label.toLowerCase()} not shown_`);
       out.text.push(`  …and ${n} more not shown`);
     }
   }
   return out;
 }
 
+/** Seats whose result did not count, with their status, so an outage reads as an outage. */
+function seatProblems(seats: ReviewerRun[]): Section {
+  const bad = seats.filter((s) => s.status !== "ok");
+  if (bad.length === 0) return { md: [], text: [] };
+  const items = bad.map((s) => `${s.seat.id || s.seat.lens} (${s.status}${s.error ? `: ${s.error}` : ""})`);
+  return {
+    md: [`**Seats not counted (${bad.length}):** ${items.map((i) => inline(i, 300)).join("; ")}`],
+    text: [`Seats not counted (${bad.length}): ${items.map((i) => plain(i, 300, true)).join("; ")}`],
+  };
+}
+
 function build(verdict: Verdict, maxPer: number, policy?: Policy): HumanDigest & { omitted: number } {
   const headline = verdictHeadline(verdict, policy);
   const m: string[] = [];
   const t: string[] = [];
-  const meta = [`commit ${shortSha(verdict.headSha)}`];
-  m.push(`## Merge Safely: ${headline}`, "", `<sub>${meta.join(" · ")}</sub>`, "");
-  t.push(`Verdict: ${headline}`, meta.join(" · "));
+  const meta = `commit ${shortSha(verdict.headSha)}`;
+  m.push(`## Merge Safely: ${headline}`, "", `<sub>${inline(meta)}</sub>`, "");
+  t.push(`Verdict: ${headline}`, plain(meta));
 
   const why = verdict.tier.reasons.length > 0 ? verdict.tier.reasons.join("; ") : `score ${verdict.tier.score}`;
-  m.push(`**Why tier ${verdict.tier.level}:** ${md(why)}`);
-  t.push(`Why tier ${verdict.tier.level}: ${why}`);
+  m.push(`**Why tier ${verdict.tier.level}:** ${inline(why, 4000)}`);
+  t.push(`Why tier ${verdict.tier.level}: ${plain(why, 4000, true)}`);
 
   if (verdict.triaged) {
     const reason = verdict.triageReason ?? "deterministic triage";
-    m.push("", `**Triaged:** ${md(reason)} — no reviewer seats were run.`);
-    t.push(`Triaged: ${reason} — no reviewer seats were run.`);
+    m.push("", `**Triaged:** ${inline(reason, 500)} — no reviewer seats were run.`);
+    t.push(`Triaged: ${plain(reason, 500, true)} — no reviewer seats were run.`);
   } else {
     const q = verdict.quorum;
     const quorum = `${q.required} required, ${q.passed} passed, ${q.blocked} blocked, ${q.invalid} invalid`;
@@ -165,8 +243,13 @@ function build(verdict: Verdict, maxPer: number, policy?: Policy): HumanDigest &
   }
   if (verdict.kind === "human" && verdict.signedBy) {
     const signed = `${verdict.signedBy.login}${verdict.reason ? `: ${verdict.reason}` : ""}`;
-    m.push("", `**Signed by:** ${md(signed)}`);
-    t.push(`Signed by: ${signed}`);
+    m.push("", `**Signed by:** ${inline(signed, 1000)}`);
+    t.push(`Signed by: ${plain(signed, 1000, true)}`);
+  }
+  const problems = seatProblems(verdict.seats);
+  if (problems.md.length > 0) {
+    m.push("", ...problems.md);
+    t.push(...problems.text);
   }
 
   const fs = findingsSection(verdict.findings, maxPer);
@@ -184,7 +267,7 @@ function build(verdict: Verdict, maxPer: number, policy?: Policy): HumanDigest &
     const since = Math.max(1, verdict.round - 1);
     const a = `Addressed since round ${since}: ${addressed.length} of ${addressed.length + carried.length} findings.`;
     const n = carried.length > 0 ? ` Not addressed: ${carried.map(shortId).join(", ")}.` : "";
-    tail.md.push(`**${a}**${md(n)}`);
+    tail.md.push(`**${a}**${n ? ` ${inline(n.trim(), 2000)}` : ""}`);
     tail.text.push(`${a}${n}`);
   }
   if (verdict.seats.length > 0) {
@@ -192,7 +275,7 @@ function build(verdict: Verdict, maxPer: number, policy?: Policy): HumanDigest &
     const commands = verdict.seats.reduce((n, s) => n + s.audit.commandsRun.length, 0);
     const insufficient = verdict.seats.filter((s) => s.status === "insufficient-work").length;
     const effort = `${plural(files, "file")} read, ${plural(commands, "command")}${
-      insufficient > 0 ? `; ${plural(insufficient, "pass", "passes")} rejected for insufficient work` : ""
+      insufficient > 0 ? `; ${plural(insufficient, "seat")} rejected for insufficient work` : ""
     }.`;
     tail.md.push(`**Reviewer effort:** ${effort}`);
     tail.text.push(`Reviewer effort: ${effort}`);
@@ -202,16 +285,16 @@ function build(verdict: Verdict, maxPer: number, policy?: Policy): HumanDigest &
     const d = downgrades
       .map((s) => `${s.step}${s.from || s.to ? ` (${s.from ?? "?"} → ${s.to ?? "?"})` : ""}: ${s.reason}`)
       .join("; ");
-    tail.md.push(`**Downgrades applied:** ${md(d)}`);
-    tail.text.push(`Downgrades applied: ${d}`);
+    tail.md.push(`**Downgrades applied:** ${inline(d, 2000)}`);
+    tail.text.push(`Downgrades applied: ${plain(d, 2000, true)}`);
   }
   const seatDowngrades = verdict.seats.filter((s) => s.seat.downgradedFrom);
   if (seatDowngrades.length > 0) {
     const d = seatDowngrades
       .map((s) => `${s.seat.id}: ${s.seat.downgradedFrom?.name ?? "?"} → ${s.seat.model.name}`)
       .join("; ");
-    tail.md.push(`**Seats downgraded:** ${md(d)}`);
-    tail.text.push(`Seats downgraded: ${d}`);
+    tail.md.push(`**Seats downgraded:** ${inline(d, 2000)}`);
+    tail.text.push(`Seats downgraded: ${plain(d, 2000, true)}`);
   }
   if (verdict.contested) {
     const c = "Contested: an unresolved block is stored for this commit, so this result could not overwrite it.";
@@ -237,10 +320,11 @@ function build(verdict: Verdict, maxPer: number, policy?: Policy): HumanDigest &
 }
 
 /**
- * Render the human digest for a verdict (design section 4.3): headline, why this tier, quorum, findings
- * grouped by severity, rounds progress, reviewer effort, downgrades, contested/escalated notes and cost.
- * Markdown is GitHub-flavoured and kept under MAX_DIGEST_CHARS by showing fewer findings per severity,
- * with a note saying how many were left out.
+ * Render the human digest for a verdict (design section 4.3): headline, why this tier, quorum, seats that
+ * did not count, findings grouped by severity, rounds progress, reviewer effort, downgrades,
+ * contested/escalated notes and cost. All model, author and policy text is redacted and rendered as data
+ * (titles inline, bodies in blockquotes). Markdown is GitHub-flavoured and kept under MAX_DIGEST_CHARS by
+ * showing fewer findings per severity, then by truncating at a line boundary, with a note either way.
  */
 export function renderDigest(verdict: Verdict, opts: DigestOptions = {}): HumanDigest {
   let maxPer = Math.max(1, opts.maxFindingsPerSeverity ?? DEFAULT_MAX_PER_SEVERITY);
@@ -249,14 +333,17 @@ export function renderDigest(verdict: Verdict, opts: DigestOptions = {}): HumanD
     maxPer = Math.max(1, Math.floor(maxPer / 2));
     out = build(verdict, maxPer, opts.policy);
   }
-  let { markdown, text } = out;
+  let { markdown } = out;
   if (markdown.length > MAX_DIGEST_CHARS) {
-    const note = "\n\n_Digest truncated to fit the GitHub size limit; see the full verdict for every finding._";
-    markdown = markdown.slice(0, MAX_DIGEST_CHARS - note.length) + note;
+    markdown = truncateAtLine(
+      markdown,
+      MAX_DIGEST_CHARS,
+      "\n\n_Digest truncated to fit the GitHub size limit; see the full verdict for every finding._",
+    );
   } else if (out.omitted > 0) {
     markdown += `\n\n_${out.omitted} findings not shown to keep this summary readable; all are in the stored verdict._`;
   }
-  if (text.length > MAX_DIGEST_CHARS) text = `${text.slice(0, MAX_DIGEST_CHARS - 20)}\n…(truncated)`;
+  const text = truncateAtLine(out.text, MAX_DIGEST_CHARS, "\n…(truncated)");
   return { headline: out.headline, markdown, text };
 }
 
@@ -269,23 +356,23 @@ export function renderBudgetBlockedDigest(args: {
 }): HumanDigest {
   const headline = `Verdict: BLOCKED BY BUDGET (tier ${args.tier.level})`;
   const est = args.estimateUsd !== undefined ? `Estimated panel cost: ${fmtUsd(args.estimateUsd)}.` : "";
-  const fix = `To review this change, raise \`budget.${args.ceiling}\` in .merge-safely.yml or wait for the window to roll over.`;
   const why = args.tier.reasons.join("; ");
+  const fixTail = "in .merge-safely.yml or wait for the window to roll over.";
   const markdown = [
     `## Merge Safely: BLOCKED BY BUDGET (tier ${args.tier.level})`,
     `**Ceiling hit:** ${code(args.ceiling)}`,
-    `**Reason:** ${md(args.reason)}`,
+    `**Reason:** ${inline(args.reason, 1000)}`,
     ...(est ? [est] : []),
-    ...(why ? [`**Why tier ${args.tier.level}:** ${md(why)}`] : []),
-    fix,
+    ...(why ? [`**Why tier ${args.tier.level}:** ${inline(why, 4000)}`] : []),
+    `To review this change, raise ${code(`budget.${args.ceiling}`)} ${fixTail}`,
   ].join("\n\n");
   const text = [
     headline,
-    `Ceiling hit: ${args.ceiling}`,
-    `Reason: ${args.reason}`,
+    `Ceiling hit: ${plain(args.ceiling, 200, true)}`,
+    `Reason: ${plain(args.reason, 1000, true)}`,
     ...(est ? [est] : []),
-    ...(why ? [`Why tier ${args.tier.level}: ${why}`] : []),
-    fix.replace(/`/g, ""),
+    ...(why ? [`Why tier ${args.tier.level}: ${plain(why, 4000, true)}`] : []),
+    `To review this change, raise budget.${plain(args.ceiling, 200, true)} ${fixTail}`,
   ].join("\n");
   return { headline, markdown, text };
 }
@@ -300,8 +387,8 @@ export function renderPendingDigest(tier?: Tier): HumanDigest {
     `## Merge Safely: PENDING${suffix}`,
     "",
     body,
-    ...(why ? ["", `**Why tier ${tier?.level}:** ${md(why)}`] : []),
+    ...(why ? ["", `**Why tier ${tier?.level}:** ${inline(why, 4000)}`] : []),
   ].join("\n");
-  const text = [headline, body, ...(why ? [`Why tier ${tier?.level}: ${why}`] : [])].join("\n");
+  const text = [headline, body, ...(why ? [`Why tier ${tier?.level}: ${plain(why, 4000, true)}`] : [])].join("\n");
   return { headline, markdown, text };
 }

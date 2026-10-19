@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { intake, redactDiff, redactSecrets } from "./intake.js";
+import { intake, redactDiff, redactFinding, redactSecrets } from "./intake.js";
 import { makeChange, makeFile, makePolicy } from "./test-helpers.js";
 
 // Fake credentials assembled at runtime so secret scanners never see a literal key in this repo.
@@ -34,6 +34,18 @@ describe("redactSecrets", () => {
     ["slack-token", `slack ${SLACK}`],
     ["jwt", `Authorization: Bearer ${JWT}`],
     ["private-key", PEM],
+    ["stripe-key", `stripe ${j("sk_live_", "4eC39HqLyjWDarjtT1zdp7dc")}`],
+    ["stripe-key", `restricted ${j("rk_live_", "4eC39HqLyjWDarjtT1zdp7dc")}`],
+    ["google-api-key", `key=${j("AIza", "SyD-9tSrke72PouQMnMX-a7eZSW0jkFMBWY")}`],
+    ["gitlab-token", `GL ${j("glpat-", "xxxx1234yyyy5678zzzz")}`],
+    ["npm-token", `//registry.npmjs.org/:_authToken=${j("npm_", "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8")}`],
+    [
+      "sendgrid-key",
+      `SENDGRID ${j("SG.", "ngeVfQFYQlKU0ufo8x5d1A", ".", "TwL2iGABf9DHoTf-09kqeF8tAmbihYzrnopKc-1s5cr")}`,
+    ],
+    ["bearer-token", `curl -H "Authorization: Bearer ${j("abc123", "def456ghi789jkl")}"`],
+    ["url-credentials", `DATABASE_URL=${j("postgres://admin:", "Sup3rS3cret", "@db.internal:5432/app")}`],
+    ["slack-webhook", j("https://hooks.slack.com/services/", "T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX")],
   ])("redacts %s", (kind, input) => {
     const r = redactSecrets(input);
     expect(r.text).toContain(`[REDACTED:${kind}]`);
@@ -89,6 +101,10 @@ describe("redactSecrets", () => {
       "the task-list-item-checkbox-container class",
       'const apiKey: string = config.get("apiKey");',
       "sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "Bearer tokens are sent in the Authorization header",
+      "see https://example.com/docs and git@github.com:acme/widgets.git",
+      "postgres://localhost:5432/app",
+      "const disk = 'sk_live_mode';",
     ];
     it.each(untouched)("leaves ordinary text alone: %s", (input) => {
       const r = redactSecrets(input);
@@ -148,6 +164,30 @@ describe("intake", () => {
     const { untrusted } = intake(change, {}, makePolicy({ runner: { redactSecrets: false } }));
     expect(untrusted.title).toBe(`Fix ${AWS}`);
     expect(untrusted.commitMessages).toBeUndefined();
+  });
+
+  it("keeps the url user and host when redacting the password", () => {
+    const r = redactSecrets(j("https://bob:", "hunter2xyz", "@example.com/x"));
+    expect(r.text).toBe("https://bob:[REDACTED:url-credentials]@example.com/x");
+  });
+
+  it("redacts model-written finding text", () => {
+    const f = redactFinding({
+      title: `leaks ${AWS}`,
+      detail: `token ${GHP}`,
+      evidence: [`saw ${SK_ANT}`],
+      suggestedFix: `rotate ${SLACK}`,
+      votes: [{ findingId: "x", decision: "confirm", reason: `confirmed ${AWS}` }],
+    });
+    expect(JSON.stringify(f)).not.toMatch(/AKIA|ghp_|sk-ant|xoxb/);
+  });
+
+  it("keeps a rename source when merging duplicate entries", () => {
+    const change = makeChange({
+      files: [makeFile("src/x.ts"), makeFile("src/x.ts", { previousPath: "src/auth/x.ts", status: "renamed" })],
+    });
+    const { change: out } = intake(change, {}, makePolicy());
+    expect(out.files[0]).toMatchObject({ previousPath: "src/auth/x.ts", status: "renamed" });
   });
 
   it("normalises paths, merges duplicates and keeps stats consistent", () => {

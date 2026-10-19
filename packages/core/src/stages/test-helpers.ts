@@ -73,11 +73,15 @@ export function makeAudit(overrides: Partial<ToolUseAudit> = {}): ToolUseAudit {
   };
 }
 
+let seatCounter = 0;
+
+/** A seat. Ids default to `<role>:<lens>:<n>` with a process-wide counter, so every seat is distinct. */
 export function makeSeat(overrides: Partial<Seat> & { role?: SeatRole } = {}): Seat {
   const role = overrides.role ?? "hunter";
   const lens = overrides.lens ?? "correctness";
+  seatCounter++;
   return {
-    id: `${role}:${lens}:1`,
+    id: `${role}:${lens}:${seatCounter}`,
     lens,
     role,
     model: { connectionId: "conn-main", provider: "anthropic", name: "model-a" },

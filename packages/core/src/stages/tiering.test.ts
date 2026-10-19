@@ -83,13 +83,29 @@ describe("tier", () => {
     expect(t.reasons.some((r) => r.includes("ignored for sizing"))).toBe(true);
   });
 
-  it("sizes from stats when the file list is truncated", () => {
+  it("forces tier 3 and sizes from stats when the file list is truncated", () => {
     const change = makeChange({ files: ["src/a.ts"] });
     change.stats = { additions: 4000, deletions: 1000, files: 3000 };
     const t = tier(change, policy);
     expect(t.factors.files).toBe(3000);
     expect(t.factors.loc).toBe(5000);
-    expect(t.reasons.some((r) => r.includes("truncated"))).toBe(true);
+    expect(t.level).toBe(3);
+    expect(t.reasons).toContain("file list truncated (1 of 3000 files visible)");
+    const small = makeChange({ files: ["src/a.ts"] });
+    small.stats = { additions: 1, deletions: 0, files: 2 };
+    expect(tier(small, policy).level).toBe(3);
+  });
+
+  it("matches critical paths case-insensitively", () => {
+    expect(tier(makeChange({ files: ["src/Auth/Login.cs"] }), policy).level).toBe(3);
+    expect(tier(makeChange({ files: ["db/Migrations/001.SQL"] }), policy).level).toBe(3);
+  });
+
+  it("notes critical-path files with no patch", () => {
+    const t = tier(makeChange({ files: ["src/auth/big.ts"] }), policy);
+    expect(t.reasons).toContain("critical-path file src/auth/big.ts has no patch; feature-flag removals not checked");
+    const withPatch = tier(makeChange({ files: [makeFile("src/auth/x.ts", { patch: "@@ -1 +1 @@\n+x" })] }), policy);
+    expect(withPatch.reasons.some((r) => r.includes("no patch"))).toBe(false);
   });
 
   it("maps thresholds to levels", () => {
@@ -156,9 +172,44 @@ describe("tier", () => {
       expect(t.score).toBeGreaterThan(without.score);
     });
 
+    it("detects a flag call split across removed lines", () => {
+      const p = [
+        "@@ -1,5 +1,2 @@",
+        "-if (isEnabled(",
+        '-  "checkout-v2"',
+        "-)) {",
+        '+if (isEnabled("other")) {',
+        " x",
+      ].join("\n");
+      const t = tier(makeChange({ files: [makeFile("src/c.ts", { patch: p })] }), policy);
+      expect(t.factors.flagRemovals).toEqual(['src/c.ts: isEnabled("checkout-v2")']);
+      expect(t.level).toBe(3);
+    });
+
+    it("treats a call that stays split the same way as kept", () => {
+      const p = ["@@ -1,3 +1,3 @@", "-isEnabled(", "-  'x')", "+isEnabled(", '+  "x")'].join("\n");
+      expect(findFlagRemovals(makeFile("a.ts", { patch: p }), [/isEnabled\s*\(/g])).toEqual([]);
+    });
+
+    it("treats removed SQL comments inside a hunk as content", () => {
+      const p = ["@@ -1,2 +1,1 @@", "-- a/legacy comment", "--- b/old", " select 1;"].join("\n");
+      expect(diffLines(p).removed).toEqual(["- a/legacy comment", "-- b/old"]);
+    });
+
     it("ignores diff file headers and added lines", () => {
-      const p = ["--- a/src/x.ts", "+++ b/src/x.ts", "@@ -1 +1 @@", "+useFlag('x')"].join("\n");
-      expect(diffLines(p)).toEqual({ removed: [], added: ["useFlag('x')"] });
+      const p = [
+        "diff --git a/src/x.ts b/src/x.ts",
+        "--- a/src/x.ts",
+        "+++ b/src/x.ts",
+        "@@ -1 +1 @@",
+        "+useFlag('x')",
+      ].join("\n");
+      expect(diffLines(p)).toEqual({
+        removed: [],
+        added: ["useFlag('x')"],
+        removedRuns: [],
+        addedRuns: ["useFlag('x')"],
+      });
       expect(findFlagRemovals(makeFile("src/x.ts", { patch: p }), [/useFlag\s*\(/g])).toEqual([]);
     });
 

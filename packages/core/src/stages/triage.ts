@@ -13,12 +13,17 @@ function allMatch(files: ChangedFile[], patterns: string[]): boolean {
   return files.every((f) => pathsOf(f).every((p) => matchAny(patterns, p)));
 }
 
+const OPAQUE_STATUSES = new Set<ChangedFile["status"]>(["added", "modified", "removed", "renamed"]);
+
 const plural = (n: number, one: string): string => `${n} ${one}${n === 1 ? "" : "s"}`;
 
 /**
  * Deterministic triage for tier 0 changes. Returns auto-pass for docs-only, assets-only and lockfile-only
  * changes (each behind its policy toggle), or for small changes within `triage.maxFiles` and
  * `triage.maxLines` with no critical path hit or flag removal. Everything else needs review.
+ *
+ * A file with zero counted lines and no patch (binary, mode change, symlink) blocks auto-pass unless it
+ * matches `assetPatterns`. Path matching is case-insensitive.
  *
  * Size uses the raw file list (ignorePaths are a scoring aid, not a triage exemption), so a one-line change
  * that also rewrites a vendored directory is not waved through. Draft status never changes triage.
@@ -43,6 +48,25 @@ export function triage(change: Change, tier: Tier, policy: Policy): TriageResult
   }
 
   const t = policy.triage;
+  // Binaries, mode changes and symlink retargets report 0/0 lines and no patch: the size check cannot see
+  // them, so they only auto-pass when they are recognisable assets.
+  const opaque = files.filter(
+    (f) =>
+      f.additions + f.deletions === 0 &&
+      f.patch === undefined &&
+      OPAQUE_STATUSES.has(f.status) &&
+      !pathsOf(f).every((p) => matchAny(t.assetPatterns, p)),
+  );
+  if (opaque.length > 0) {
+    const names = opaque
+      .slice(0, 3)
+      .map((f) => f.path)
+      .join(", ");
+    return {
+      decision: "review",
+      reason: `${plural(opaque.length, "file")} with no visible line changes (binary, mode or symlink change): ${names}${opaque.length > 3 ? ", …" : ""}`,
+    };
+  }
   if (t.docsOnlyAutoPass && allMatch(files, t.docsPatterns)) {
     return { decision: "auto-pass", reason: `docs-only change (${plural(files.length, "file")})` };
   }

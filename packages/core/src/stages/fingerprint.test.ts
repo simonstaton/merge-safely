@@ -42,12 +42,14 @@ describe("fingerprintFinding", () => {
     expect(a).toBe(fingerprintFinding(makeFinding()));
   });
 
-  it("changes with file, class, title and line window", () => {
+  it("changes with file, class and line window, but not with title rewording", () => {
     const base = fingerprintFinding(makeFinding());
     expect(fingerprintFinding(makeFinding({ file: "src/other.ts" }))).not.toBe(base);
     expect(fingerprintFinding(makeFinding({ class: "race" }))).not.toBe(base);
-    expect(fingerprintFinding(makeFinding({ title: "Unhandled rejection" }))).not.toBe(base);
     expect(fingerprintFinding(makeFinding({ line: 10 + LINE_WINDOW }))).not.toBe(base);
+    expect(fingerprintFinding(makeFinding({ class: "injection", title: "SQL injection in search query" }))).toBe(
+      fingerprintFinding(makeFinding({ class: "injection", title: "Unsanitised user input reaches raw SQL" })),
+    );
   });
 
   it("hashes only class and title when there is no file", () => {
@@ -55,6 +57,7 @@ describe("fingerprintFinding", () => {
     const b = fingerprintFinding(makeFinding({ file: undefined, line: 300 }));
     expect(a).toBe(b);
     expect(a).not.toBe(fingerprintFinding(makeFinding({ line: undefined })));
+    expect(a).not.toBe(fingerprintFinding(makeFinding({ file: undefined, title: "Something else entirely" })));
   });
 
   it("property: stable under line drift within a window", () => {
@@ -70,13 +73,13 @@ describe("fingerprintFinding", () => {
     }
   });
 
-  it("property: stable under title rewording that keeps the same words", () => {
+  it("property: file-less findings are stable under title rewording that keeps the same words", () => {
     const words = ["unbounded", "scan", "users", "table", "backfill"];
-    const base = fingerprintFinding(makeFinding({ title: words.join(" ") }));
+    const base = fingerprintFinding(makeFinding({ file: undefined, title: words.join(" ") }));
     for (let i = 0; i < 50; i++) {
       const shuffled = [...words].sort(() => ((i * 7919) % 3) - 1);
       const title = `The ${shuffled.join(", ")} at line ${i}`;
-      expect(fingerprintFinding(makeFinding({ title }))).toBe(base);
+      expect(fingerprintFinding(makeFinding({ file: undefined, title }))).toBe(base);
     }
   });
 });
@@ -124,6 +127,14 @@ describe("dedupeFindings", () => {
       line: 10,
     });
     expect(out[1]?.id).toBe(c.id);
+  });
+
+  it("never trusts a model-supplied id when merging", () => {
+    const style = makeFinding({ id: "same", class: "style", title: "Prefer const", severity: "nit" });
+    const real = makeFinding({ id: "same", class: "logic-error", file: "src/pay.ts", severity: "blocker" });
+    const out = dedupeFindings([style, real]);
+    expect(out).toHaveLength(2);
+    expect(out.find((f) => f.class === "logic-error")?.severity).toBe("blocker");
   });
 
   it("fingerprints findings that arrive without an id", () => {

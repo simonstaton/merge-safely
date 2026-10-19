@@ -2,15 +2,21 @@ import type { Policy } from "../policy/schema.js";
 import type { Decision, Finding, ReviewerRun, Tier, Verdict } from "../types.js";
 import { attest } from "./attest.js";
 import { dedupeFindings, fingerprintFinding, SEVERITY_RANK } from "./fingerprint.js";
+import type { JudgeResult } from "./judge.js";
 
 export interface AggregateInput {
   tier: Tier;
   hunterRuns: ReviewerRun[];
   judgeRuns: ReviewerRun[];
-  /** Surviving findings after the judge phase. */
-  findings: Finding[];
+  /** The judge phase result: surviving findings and how many judges counted. */
+  judge: Pick<JudgeResult, "surviving" | "judgesCounted">;
+  /**
+   * Known findings from earlier rounds that this round did not address (see `reconcileRounds`). They stay
+   * in the verdict and keep blocking: hunters are told not to repeat known findings, so absence from this
+   * round's output is not evidence of a fix.
+   */
+  carried?: Finding[];
   policy: Policy;
-  judgesCounted: number;
 }
 
 export interface AggregateResult {
@@ -55,14 +61,21 @@ const where = (f: Finding): string => (f.file ? ` (${f.file}${f.line ? `:${f.lin
  * - blocked: ok hunter blocks with at least one finding that survived the judges at blocker/important
  *   severity. A block whose findings were all refuted or downgraded below important does not count.
  * - invalid: every other hunter run (failed, timed out, insufficient work, refuted blocks).
- * Decision: block if any surviving blocker or blocked > 0; pass if passed >= required; else pending.
+ * Decision: block if any surviving blocker, blocked > 0, or any carried blocker/important finding;
+ * pass if passed >= required; else pending. Carried findings are included in `findings`.
  * Hunter finding ids are always recomputed from content: ids the model wrote are never trusted.
  */
 export function aggregate(input: AggregateInput): AggregateResult {
-  const { tier, policy, judgesCounted } = input;
+  const { tier, policy } = input;
+  const { judgesCounted } = input.judge;
   const required = requiredPasses(tier.level, policy);
-  const findings = rankFindings(dedupeFindings(input.findings));
-  const surviving = new Map(findings.map((f) => [f.id, f]));
+  const fresh = dedupeFindings(input.judge.surviving);
+  const surviving = new Map(fresh.map((f) => [f.id, f]));
+  // Carried findings keep their known severity unless this round re-raised them (then the fresh,
+  // judged copy wins). A carried finding the judges refuted this round still stands: only "addressed"
+  // or a human verdict clears a known finding.
+  const carried = dedupeFindings(input.carried ?? []).filter((f) => !surviving.has(f.id));
+  const findings = rankFindings([...fresh, ...carried]);
 
   let passed = 0;
   let blocked = 0;
@@ -89,19 +102,23 @@ export function aggregate(input: AggregateInput): AggregateResult {
   const quorum = { required, passed, blocked, invalid };
 
   const reasons: string[] = [`quorum: ${required} required, ${passed} passed, ${blocked} blocked, ${invalid} invalid`];
-  const blockers = findings.filter((f) => f.severity === "blocker");
-  if (judgesCounted === 0 && findings.length > 0) {
+  const blockers = fresh.filter((f) => f.severity === "blocker");
+  const carriedSerious = carried.filter((f) => f.severity === "blocker" || f.severity === "important");
+  if (judgesCounted === 0 && fresh.length > 0) {
     reasons.push(
       input.judgeRuns.length > 0
-        ? `unjudged: all ${input.judgeRuns.length} judge seats failed; ${findings.length} findings were not verified`
-        : `unjudged: no judge phase ran; ${findings.length} findings were not verified`,
+        ? `unjudged: no judge seat counted (${input.judgeRuns.length} ran); ${fresh.length} findings were not verified`
+        : `unjudged: no judge phase ran; ${fresh.length} findings were not verified`,
     );
   }
 
   let decision: Decision;
-  if (blockers.length > 0 || blocked > 0) {
+  if (blockers.length > 0 || blocked > 0 || carriedSerious.length > 0) {
     decision = "block";
     for (const f of blockers) reasons.push(`blocker [${f.class}] ${f.title}${where(f)}`);
+    for (const f of carriedSerious) {
+      reasons.push(`carried ${f.severity} from an earlier round, not addressed: [${f.class}] ${f.title}${where(f)}`);
+    }
     if (blocked > 0) reasons.push(`${blocked} hunter seat${blocked === 1 ? "" : "s"} blocked with upheld findings`);
   } else if (passed >= required) {
     decision = "pass";

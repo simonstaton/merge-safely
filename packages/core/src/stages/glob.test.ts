@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { DEFAULT_CRITICAL_PATHS } from "../policy/schema.js";
-import { firstMatch, matchAny, matchPath } from "./glob.js";
+import { expandBraces, firstMatch, matchAny, matchPath, wildcardMatch } from "./glob.js";
 
 /** Small deterministic PRNG (mulberry32) so property tests are reproducible without a dependency. */
 function rng(seed: number): () => number {
@@ -75,9 +75,50 @@ describe("matchPath", () => {
     expect(matchPath("**/{auth,authz}/**", "a/author/b")).toBe(false);
   });
 
-  it("is case-sensitive", () => {
-    expect(matchPath("**/Auth/**", "src/auth/x.ts")).toBe(false);
-    expect(matchPath("**/*.md", "README.MD")).toBe(false);
+  it("is case-insensitive by default, with an opt-out", () => {
+    expect(matchPath("**/auth/**", "src/Auth/login.ts")).toBe(true);
+    expect(matchPath("**/payments/**", "src/Payments/Charge.cs")).toBe(true);
+    expect(matchPath("**/migrations/**", "db/Migrations/001.sql")).toBe(true);
+    expect(matchPath("**/*.sql", "db/X.SQL")).toBe(true);
+    expect(matchPath("**/Dockerfile", "dockerfile")).toBe(true);
+    expect(matchPath("**/auth/**", "src/Author/bio.ts")).toBe(false);
+    expect(matchPath("**/Auth/**", "src/auth/x.ts", { caseInsensitive: false })).toBe(false);
+    expect(matchPath("**/*.md", "README.MD", { caseInsensitive: false })).toBe(false);
+  });
+
+  it("treats a trailing slash as a directory", () => {
+    expect(matchPath("docs/", "docs/a.md")).toBe(true);
+    expect(matchPath("docs/", "src/docs/a.md")).toBe(true);
+    expect(matchPath("docs/", "docs")).toBe(false);
+    expect(matchPath("docs/", "src/docs.md")).toBe(false);
+    expect(matchPath("site/docs/", "site/docs/x/y.md")).toBe(true);
+    expect(matchPath("site/docs/", "other/site/docs/x.md")).toBe(false);
+  });
+
+  it("stays fast on pathological patterns", () => {
+    const longSeg = "a".repeat(5000);
+    const deep = Array.from({ length: 200 }, () => "a").join("/");
+    const start = performance.now();
+    expect(matchPath("*a*a*a*a*a*a*a*a*b", longSeg)).toBe(false);
+    expect(matchPath("**/a/**/a/**/a/**/a/**/b", deep)).toBe(false);
+    expect(matchPath("{a,b}*{a,b}*{a,b}*{a,b}*c", longSeg)).toBe(false);
+    expect(performance.now() - start).toBeLessThan(500);
+  });
+
+  it("expands braces with a cap", () => {
+    expect(expandBraces("x.{ts,tsx}")).toEqual(["x.ts", "x.tsx"]);
+    expect(expandBraces("{a,b}{c,d}")).toEqual(["ac", "ad", "bc", "bd"]);
+    expect(expandBraces("{unclosed")).toEqual(["{unclosed"]);
+    expect(expandBraces("{a,b,c,d}".repeat(6)).length).toBe(256);
+  });
+
+  it("matches single-segment wildcards", () => {
+    expect(wildcardMatch("*.ts", "a.ts")).toBe(true);
+    expect(wildcardMatch("a?c", "abc")).toBe(true);
+    expect(wildcardMatch("a?c", "ac")).toBe(false);
+    expect(wildcardMatch("*", "")).toBe(true);
+    expect(wildcardMatch("a*b*c", "axxbyyc")).toBe(true);
+    expect(wildcardMatch("a*b*c", "axxbyy")).toBe(false);
   });
 
   it("escapes regex metacharacters", () => {

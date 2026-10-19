@@ -30,9 +30,16 @@ describe("attest", () => {
     expect(attest(run, policy).status).toBe("ok");
   });
 
-  it("leaves judges and failed runs alone", () => {
-    const judge = makeJudgeRun({ audit: makeAudit({ substantiveCalls: 0, filesRead: [] }) });
-    expect(attest(judge, policy)).toBe(judge);
+  it("attests judges: one that did not look has its votes ignored", () => {
+    const lazy = makeJudgeRun({ audit: makeAudit({ substantiveCalls: 0, filesRead: [] }) });
+    const out = attest(lazy, policy);
+    expect(out.status).toBe("insufficient-work");
+    expect(out.error).toContain("judge votes ignored");
+    const diligent = makeJudgeRun();
+    expect(attest(diligent, policy)).toBe(diligent);
+  });
+
+  it("leaves failed runs alone", () => {
     const failed = makeRun({ status: "timeout", output: null });
     expect(attest(failed, policy)).toBe(failed);
   });
@@ -50,5 +57,6 @@ describe("countsTowardQuorum", () => {
     expect(countsTowardQuorum(makeRun({ status: "insufficient-work" }))).toBe(false);
     expect(countsTowardQuorum(makeRun({ status: "schema-invalid", output: null }))).toBe(false);
     expect(countsTowardQuorum(makeJudgeRun())).toBe(false);
+    expect(countsTowardQuorum(makeRun({ audit: makeAudit({ substantiveCalls: 0 }) }), policy)).toBe(false);
   });
 });

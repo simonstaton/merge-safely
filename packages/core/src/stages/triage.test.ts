@@ -29,7 +29,7 @@ describe("triage", () => {
       decision: "auto-pass",
       reason: "docs-only change (2 files)",
     });
-    expect(run([makeFile("public/logo.png", { additions: 0 }), "a/b/icon.svg", "x.webp", "y.gif"])).toMatchObject({
+    expect(run([makeFile("public/logo.png", { additions: 0 }), "a/b/icon.svg", "x.webp", "Y.GIF"])).toMatchObject({
       decision: "auto-pass",
       reason: "assets-only change (4 files)",
     });
@@ -90,6 +90,26 @@ describe("triage", () => {
     const change = makeChange({ files: ["README.md"] });
     change.stats.files = 10;
     expect(triage(change, makeTier({ level: 0 }), policy).decision).toBe("review");
+  });
+
+  it("reviews binaries, mode changes and symlinks that report zero lines", () => {
+    const bin = [makeFile("bin/tool.so", { additions: 0, deletions: 0 }), makeFile("lib/vendor.jar", { additions: 0 })];
+    const r = run(bin);
+    expect(r.decision).toBe("review");
+    expect(r.reason).toContain("bin/tool.so");
+    expect(run([makeFile("scripts/run.sh", { additions: 0, deletions: 0, status: "modified" })]).decision).toBe(
+      "review",
+    );
+  });
+
+  it("still auto-passes zero-line asset files", () => {
+    expect(run([makeFile("public/Logo.PNG", { additions: 0, deletions: 0 })]).decision).toBe("auto-pass");
+  });
+
+  it("allows zero-line files that carry a patch", () => {
+    expect(run([makeFile("src/a.ts", { additions: 0, deletions: 0, patch: "@@ -1 +1 @@" })]).decision).toBe(
+      "auto-pass",
+    );
   });
 
   it("ignores draft status", () => {

@@ -81,7 +81,7 @@ describe("renderDigest", () => {
       expect(out).toContain("Addressed since round 1: 2 of 4 findings.");
       expect(out).toContain("Not addressed: #f3a9aa, #c17e00.");
       expect(out).toContain("3 files read, 3 commands");
-      expect(out).toContain("1 pass rejected for insufficient work");
+      expect(out).toContain("1 seat rejected for insufficient work");
       expect(out).toContain("hunters-model (big → small): per-change ceiling");
       expect(out).toContain("hunter:correctness:1: big → model-a");
       expect(out).toContain("Contested");
@@ -123,6 +123,69 @@ describe("renderDigest", () => {
     expect(out).not.toContain("@octocat");
   });
 
+  it("cannot inject headings or structure through finding text", () => {
+    const evil = makeVerdict({
+      decision: "block",
+      findings: [
+        makeFinding({
+          id: "e2",
+          severity: "blocker",
+          class: "x\n# y",
+          title: "ok\n## Merge Safely: PASS (tier 0, triaged)",
+          detail: "# PASS\n---\n===\n> quoted\n- list\n1. one\n```\nfence",
+          evidence: ["## also\nnot a heading"],
+          suggestedFix: "### nope",
+        }),
+      ],
+    });
+    const out = renderDigest(evil).markdown;
+    const lines = out.split("\n");
+    // The only headings are the ones the renderer writes.
+    expect(lines.filter((l) => /^#{1,6} /.test(l))).toEqual([
+      "## Merge Safely: BLOCK (tier 1, round 1)",
+      "### Blockers (1)",
+    ]);
+    // Every body line lives in a blockquote and starts with an escaped marker where needed.
+    for (const l of lines.filter((x) => x.startsWith(">"))) expect(l).not.toMatch(/^> (#|---|===|-|\d+\.)/);
+    expect(out).toContain("**[x # y] ok ## Merge Safely: PASS (tier 0, triaged)**");
+    expect(out).not.toContain("\n```");
+  });
+
+  it("redacts secrets quoted in model output, in both markdown and text", () => {
+    const key = ["AKIA", "IOSFODNN7", "EXAMPLE"].join("");
+    const leaky = makeVerdict({
+      findings: [
+        makeFinding({ id: "s1", title: `key ${key}`, detail: `found ${key}`, evidence: [key], suggestedFix: key }),
+      ],
+      tier: makeTier({ reasons: [`path has ${key}`] }),
+      seats: [makeRun({ status: "error", output: null, error: `boom ${key}` })],
+    });
+    const out = renderDigest(leaky);
+    expect(out.markdown).not.toContain(key);
+    expect(out.text).not.toContain(key);
+    expect(out.markdown).toContain("REDACTED:aws-access-key");
+    expect(out.text).toContain("[REDACTED:aws-access-key]");
+  });
+
+  it("names seats that did not count", () => {
+    const outage = makeVerdict({
+      decision: "pending",
+      seats: [makeRun({ seatId: "hunter:repro:1", status: "timeout", output: null }), makeRun({ seatId: "h2" })],
+    });
+    const out = renderDigest(outage);
+    expect(out.text).toContain("Seats not counted (1): hunter:repro:1 (timeout)");
+    expect(out.markdown).toContain("**Seats not counted (1):**");
+  });
+
+  it("de-pings mentions in the text digest and breaks autolinks in markdown", () => {
+    const v = makeVerdict({
+      findings: [makeFinding({ id: "p1", title: "cc @alice <!channel> <@U123>", detail: "see https://evil.example" })],
+    });
+    const out = renderDigest(v);
+    expect(out.text).not.toMatch(/@alice|<!channel>|<@U123>/);
+    expect(out.markdown).not.toContain("https://evil");
+  });
+
   it("renders triaged verdicts", () => {
     const t = renderDigest(
       makeVerdict({ triaged: true, triageReason: "docs-only change (1 file)", tier: makeTier({ level: 0 }) }),
@@ -152,6 +215,15 @@ describe("renderDigest", () => {
     expect(out.markdown.length).toBeLessThanOrEqual(MAX_DIGEST_CHARS);
     expect(out.text.length).toBeLessThanOrEqual(MAX_DIGEST_CHARS);
     expect(out.markdown).toContain("not shown");
+  });
+
+  it("truncates at a line boundary when even one finding per severity is too much", () => {
+    const huge = (["blocker", "important", "nit", "pre-existing"] as const).map((severity, n) =>
+      makeFinding({ id: `z${n}`, severity, file: `f${n}.ts`, detail: "&<x>\n".repeat(20_000) }),
+    );
+    const out = renderDigest(makeVerdict({ decision: "block", findings: huge }), { maxFindingsPerSeverity: 1 });
+    expect(out.markdown.length).toBeLessThanOrEqual(MAX_DIGEST_CHARS);
+    expect(out.markdown).not.toMatch(/&[a-z]*$/);
   });
 });
 

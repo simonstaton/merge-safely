@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Finding, JudgeVote } from "../types.js";
 import { assignFingerprints, fingerprintFinding } from "./fingerprint.js";
 import { applyJudgeVotes } from "./judge.js";
-import { makeFinding, makeJudgeRun, makePolicy } from "./test-helpers.js";
+import { makeAudit, makeFinding, makeJudgeRun, makePolicy } from "./test-helpers.js";
 
 const policy = makePolicy();
 const [A, B] = assignFingerprints([
@@ -96,6 +96,42 @@ describe("applyJudgeVotes", () => {
     const r = applyJudgeVotes([A, style], [], policy);
     expect(r.surviving.map((f) => f.id)).toEqual([A.id]);
     expect(r.dropped.map((f) => f.id)).toEqual([style.id]);
+  });
+
+  it("counts two judges that share a seat id as two votes", () => {
+    const r = applyJudgeVotes(
+      [A],
+      [
+        judge("judge:1", [{ findingId: A.id, decision: "confirm" }]),
+        judge("judge:1", [{ findingId: A.id, decision: "confirm" }]),
+      ],
+      policy,
+    );
+    expect(r.judgesCounted).toBe(2);
+    expect(r.surviving.map((f) => f.id)).toEqual([A.id]);
+    expect(r.surviving[0]?.votes).toHaveLength(2);
+  });
+
+  it("ignores votes from judges that did not do the work", () => {
+    const lazy = makeJudgeRun({
+      seatId: "lazy",
+      audit: makeAudit({ substantiveCalls: 0, filesRead: [] }),
+      judgeOutput: { votes: [{ findingId: A.id, decision: "refute" }] },
+    });
+    const r = applyJudgeVotes([A], [lazy, judge("j2", [{ findingId: A.id, decision: "confirm" }])], policy);
+    expect(r.judgesCounted).toBe(1);
+    expect(r.surviving.map((f) => f.id)).toEqual([A.id]);
+  });
+
+  it("recomputes candidate ids so a model-chosen id cannot hide a blocker", () => {
+    const style = { ...makeFinding({ class: "style", title: "Prefer const" }), id: "shared" };
+    const blocker = {
+      ...makeFinding({ severity: "blocker", file: "src/pay.ts", title: "Charges twice" }),
+      id: "shared",
+    };
+    const r = applyJudgeVotes([style, blocker], [], policy);
+    expect(r.surviving.map((f) => f.severity)).toEqual(["blocker"]);
+    expect(r.dropped.map((f) => f.class)).toEqual(["style"]);
   });
 
   it("only counts ok judge runs with output", () => {

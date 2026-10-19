@@ -45,53 +45,94 @@ function compileFlagPatterns(sources: string[]): RegExp[] {
   return out;
 }
 
-const HEADER_RE = /^(?:---|\+\+\+) (?:a\/|b\/|\/dev\/null)/;
-
-/** Removed and added lines of a unified diff hunk text, with the +/- marker stripped. */
-export function diffLines(patch: string): { removed: string[]; added: string[] } {
-  const removed: string[] = [];
-  const added: string[] = [];
-  for (const line of patch.split(/\r?\n/)) {
-    if (HEADER_RE.test(line)) continue;
-    if (line.startsWith("-")) removed.push(line.slice(1));
-    else if (line.startsWith("+")) added.push(line.slice(1));
-  }
-  return { removed, added };
+interface DiffRuns {
+  /** Removed lines (marker stripped). */
+  removed: string[];
+  /** Added lines (marker stripped). */
+  added: string[];
+  /** Consecutive removed lines within a hunk, joined with "\n". */
+  removedRuns: string[];
+  /** Consecutive added lines within a hunk, joined with "\n". */
+  addedRuns: string[];
 }
 
-/** The matched call plus its argument list up to the balancing paren on the same line. */
-function extractCall(line: string, start: number, matchText: string): string {
+/**
+ * Parse unified diff hunk text. Lines before the first `@@` of each file section (`diff --git`, `index`,
+ * `--- a/x`, `+++ b/x`) are headers and skipped; inside a hunk every `-`/`+` line is content, so a removed
+ * SQL comment such as `-- a/b` is never mistaken for a header.
+ */
+export function diffLines(patch: string): DiffRuns {
+  const out: DiffRuns = { removed: [], added: [], removedRuns: [], addedRuns: [] };
+  let inHunk = false;
+  let run: { kind: "-" | "+"; lines: string[] } | null = null;
+  const flush = () => {
+    if (run) (run.kind === "-" ? out.removedRuns : out.addedRuns).push(run.lines.join("\n"));
+    run = null;
+  };
+  for (const line of patch.split(/\r?\n/)) {
+    if (line.startsWith("diff --git ")) {
+      flush();
+      inHunk = false;
+      continue;
+    }
+    if (line.startsWith("@@")) {
+      flush();
+      inHunk = true;
+      continue;
+    }
+    if (!inHunk) continue;
+    const kind = line.startsWith("-") ? "-" : line.startsWith("+") ? "+" : null;
+    if (kind === null) {
+      flush();
+      continue;
+    }
+    const content = line.slice(1);
+    (kind === "-" ? out.removed : out.added).push(content);
+    if (run && run.kind !== kind) flush();
+    if (!run) run = { kind, lines: [] };
+    run.lines.push(content);
+  }
+  flush();
+  return out;
+}
+
+/**
+ * The matched call plus its argument list up to the balancing paren. Works across the newlines of a
+ * joined run; an unbalanced call (argument list continues past the run) is returned up to the run end.
+ */
+function extractCall(text: string, start: number, matchText: string): string {
   let end = start + matchText.length;
   let depth = (matchText.match(/\(/g) ?? []).length - (matchText.match(/\)/g) ?? []).length;
-  while (end < line.length && depth > 0) {
-    const ch = line.charAt(end);
+  while (end < text.length && depth > 0) {
+    const ch = text.charAt(end);
     if (ch === "(") depth++;
     else if (ch === ")") depth--;
     end++;
   }
-  return line.slice(start, end);
+  return text.slice(start, end);
 }
 
 const normaliseCall = (s: string): string => s.replace(/\s+/g, "").replace(/'|`/g, '"');
 
 /**
- * Feature-flag reads removed by a file's patch. A removed line counts when it matches any flag pattern,
- * unless an added line in the same file contains the same call (moved or reformatted, not removed).
+ * Feature-flag reads removed by a file's patch. Consecutive removed lines of a hunk are joined before
+ * matching, so a call split across lines (`isEnabled(\n  "checkout-v2"\n)`) is seen whole. A removal
+ * counts unless a run of added lines in the same file contains the same call (moved or reformatted).
  */
 export function findFlagRemovals(file: ChangedFile, patterns: RegExp[]): string[] {
   if (!file.patch || patterns.length === 0) return [];
-  const { removed, added } = diffLines(file.patch);
-  if (removed.length === 0) return [];
-  const addedNorm = added.map(normaliseCall);
+  const { removedRuns, addedRuns } = diffLines(file.patch);
+  if (removedRuns.length === 0) return [];
+  const addedNorm = addedRuns.map(normaliseCall);
   const out = new Set<string>();
-  for (const line of removed) {
+  for (const text of removedRuns) {
     for (const re of patterns) {
       re.lastIndex = 0;
-      for (const m of line.matchAll(re)) {
+      for (const m of text.matchAll(re)) {
         if (m[0].length === 0) continue;
-        const call = extractCall(line, m.index ?? 0, m[0]).trim();
+        const call = extractCall(text, m.index ?? 0, m[0]);
         const norm = normaliseCall(call);
-        if (!addedNorm.some((a) => a.includes(norm))) out.add(call);
+        if (!addedNorm.some((a) => a.includes(norm))) out.add(call.replace(/\s*\n\s*/g, "").trim());
       }
     }
   }
@@ -116,11 +157,13 @@ export function tier(change: Change, policy: Policy): Tier {
   let loc = scored.reduce((n, f) => n + Math.max(0, f.additions) + Math.max(0, f.deletions), 0);
   let files = scored.length;
   const reasons: string[] = [];
-  // The provider may truncate the file list (GitHub caps it). Never score less than the change stats say.
-  if (change.stats.files > change.files.length) {
+  // The provider may truncate the file list (GitHub caps it). Unseen files may hit critical paths, so a
+  // truncated list fails closed to tier 3; size never scores less than the change stats say.
+  const truncated = change.stats.files > change.files.length;
+  if (truncated) {
     files = Math.max(files, change.stats.files - ignored);
     loc = Math.max(loc, change.stats.additions + change.stats.deletions);
-    reasons.push(`file list truncated (${change.files.length} of ${change.stats.files} listed); sized from stats`);
+    reasons.push(`file list truncated (${change.files.length} of ${change.stats.files} files visible)`);
   }
   const modules = new Set(scored.map((f) => moduleOf(f.path))).size;
 
@@ -144,6 +187,10 @@ export function tier(change: Change, policy: Policy): Tier {
 
   const flagPatterns = compileFlagPatterns(tiers.flagReadPatterns);
   const flagRemovals = change.files.flatMap((f) => findFlagRemovals(f, flagPatterns));
+  // Critical files whose patch the provider did not supply (too large, binary): flag removals unchecked.
+  const unpatchedCritical = change.files.filter(
+    (f) => f.patch === undefined && [...hitExamples.values()].some((ex) => ex.includes(f.path)),
+  );
 
   const raw =
     TIER_WEIGHTS.loc * saturate(loc, HALF.loc) +
@@ -156,7 +203,7 @@ export function tier(change: Change, policy: Policy): Tier {
   const byScore = levelFor(score, tiers.thresholds);
   const forcedByCritical = hitPatterns.length > 0;
   const forcedByFlags = flagRemovals.length > 0 && tiers.flagRemovalIsCritical;
-  const level: TierLevel = forcedByCritical || forcedByFlags ? 3 : byScore;
+  const level: TierLevel = forcedByCritical || forcedByFlags || truncated ? 3 : byScore;
 
   reasons.unshift(
     `size: ${plural(loc, "line")} changed across ${plural(files, "file")} in ${plural(modules, "module")} (score ${score})`,
@@ -169,10 +216,20 @@ export function tier(change: Change, policy: Policy): Tier {
   }
   for (const r of flagRemovals.slice(0, 5)) reasons.push(`removes feature-flag read ${r}`);
   if (flagRemovals.length > 5) reasons.push(`removes ${flagRemovals.length - 5} more feature-flag reads`);
+  for (const f of unpatchedCritical.slice(0, 5)) {
+    reasons.push(`critical-path file ${f.path} has no patch; feature-flag removals not checked`);
+  }
+  if (unpatchedCritical.length > 5) {
+    reasons.push(`${unpatchedCritical.length - 5} more critical-path files have no patch`);
+  }
 
   const t = tiers.thresholds;
-  if (forcedByCritical || forcedByFlags) {
-    const why = [forcedByCritical ? "critical path hit" : "", forcedByFlags ? "feature-flag removal" : ""]
+  if (forcedByCritical || forcedByFlags || truncated) {
+    const why = [
+      forcedByCritical ? "critical path hit" : "",
+      forcedByFlags ? "feature-flag removal" : "",
+      truncated ? "truncated file list" : "",
+    ]
       .filter(Boolean)
       .join(" and ");
     reasons.push(`tier 3 forced by ${why} (score alone would be tier ${byScore})`);

@@ -1,5 +1,6 @@
 import type { Policy } from "../policy/schema.js";
 import type { Finding, JudgeVote, ReviewerRun, Severity } from "../types.js";
+import { attest } from "./attest.js";
 import { assignFingerprints, dedupeFindings, minSeverity, SEVERITY_RANK } from "./fingerprint.js";
 
 export interface JudgeResult {
@@ -17,16 +18,22 @@ function oneStepDown(s: Severity): Severity {
   return SEVERITY_ORDER[Math.min(SEVERITY_ORDER.length - 1, SEVERITY_RANK[s] + 1)] ?? s;
 }
 
-/** A judge run's vote counts only when the run completed and produced judge output. */
-export function judgeCounts(run: ReviewerRun): boolean {
-  return run.seat.role === "judge" && run.status === "ok" && run.judgeOutput != null;
+/**
+ * A judge run's votes count only when the run completed, produced judge output and (when a policy is
+ * given) passes proof-of-work attestation.
+ */
+export function judgeCounts(run: ReviewerRun, policy?: Policy): boolean {
+  const r = policy ? attest(run, policy) : run;
+  return r.seat.role === "judge" && r.status === "ok" && r.judgeOutput != null;
 }
 
 /**
  * Apply judge votes to the hunters' candidate findings.
  *
  * Rules:
- * 1. Only judge runs with status "ok" and a judgeOutput count; `judgesCounted` is how many.
+ * 1. Only judge runs with status "ok", a judgeOutput and enough observed work (see `attest`) count;
+ *    `judgesCounted` is how many. Votes are keyed by run, never by seat id, so two judges that share an
+ *    id still cast two votes. Candidate ids are recomputed from content before votes are matched.
  * 2. Findings whose class is in `policy.quorum.dropClasses` are dropped outright (also when unjudged).
  * 3. Each counted judge has at most one vote per finding (its last). Votes on unknown ids are ignored.
  *    A judge that does not vote on a candidate is counted as not agreeing.
@@ -48,26 +55,26 @@ export function applyJudgeVotes(candidates: Finding[], judgeRuns: ReviewerRun[],
   const dropped = deduped.filter(isDropped);
   const kept = deduped.filter((f) => !isDropped(f));
 
-  const judges = judgeRuns.filter(judgeCounts);
+  const judges = judgeRuns.filter((r) => judgeCounts(r, policy));
   const judgesCounted = judges.length;
   if (judgesCounted === 0) return { surviving: kept, refuted: [], dropped, judgesCounted };
 
   const known = new Map(kept.map((f) => [f.id, f]));
-  // votes[findingId][seatId] = vote
-  const votes = new Map<string, Map<string, JudgeVote>>();
-  const castVote = (v: JudgeVote) => {
-    const seatVotes = votes.get(v.findingId) ?? new Map<string, JudgeVote>();
-    seatVotes.set(v.seatId ?? "", v);
-    votes.set(v.findingId, seatVotes);
+  // votes[findingId][judge run index] = vote
+  const votes = new Map<string, Map<number, JudgeVote>>();
+  const castVote = (judge: number, v: JudgeVote) => {
+    const byJudge = votes.get(v.findingId) ?? new Map<number, JudgeVote>();
+    byJudge.set(judge, v);
+    votes.set(v.findingId, byJudge);
   };
 
-  // New findings by fingerprint: which judges raised them, and each raised copy.
-  const raised = new Map<string, { seats: Set<string>; copies: Finding[] }>();
+  // New findings by fingerprint: which judges (by run index) raised them, and each raised copy.
+  const raised = new Map<string, { judges: Map<number, string>; copies: Finding[] }>();
 
   judges.forEach((run, index) => {
     const seatId = run.seat.id || `judge#${index}`;
     for (const v of run.judgeOutput?.votes ?? []) {
-      if (known.has(v.findingId)) castVote({ ...v, seatId });
+      if (known.has(v.findingId)) castVote(index, { ...v, seatId });
     }
     const fresh = assignFingerprints(run.judgeOutput?.newFindings ?? []).map((f) => ({
       ...f,
@@ -79,13 +86,13 @@ export function applyJudgeVotes(candidates: Finding[], judgeRuns: ReviewerRun[],
         continue;
       }
       if (known.has(f.id)) {
-        if (!votes.get(f.id)?.has(seatId)) {
-          castVote({ findingId: f.id, decision: "confirm", reason: "independently raised by judge", seatId });
+        if (!votes.get(f.id)?.has(index)) {
+          castVote(index, { findingId: f.id, decision: "confirm", reason: "independently raised by judge", seatId });
         }
         continue;
       }
-      const entry = raised.get(f.id) ?? { seats: new Set<string>(), copies: [] };
-      entry.seats.add(seatId);
+      const entry = raised.get(f.id) ?? { judges: new Map<number, string>(), copies: [] };
+      entry.judges.set(index, seatId);
       entry.copies.push(f);
       raised.set(f.id, entry);
     }
@@ -113,14 +120,14 @@ export function applyJudgeVotes(candidates: Finding[], judgeRuns: ReviewerRun[],
     const merged = dedupeFindings(entry.copies)[0];
     if (!merged) continue;
     const lowest = entry.copies.reduce<Severity>((s, c) => minSeverity(s, c.severity), "blocker");
-    const confirmations: JudgeVote[] = [...entry.seats].map((seatId) => ({
+    const confirmations: JudgeVote[] = [...entry.judges.values()].map((seatId) => ({
       findingId: id,
       decision: "confirm",
       reason: "raised by judge",
       seatId,
     }));
     const finding: Finding = { ...merged, votes: [...(merged.votes ?? []), ...confirmations] };
-    if (entry.seats.size >= 2) {
+    if (entry.judges.size >= 2) {
       surviving.push({ ...finding, severity: lowest });
     } else if (judgesCounted === 1) {
       surviving.push({ ...finding, severity: minSeverity(lowest, "important") });

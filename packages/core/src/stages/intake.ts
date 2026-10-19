@@ -1,5 +1,5 @@
 import type { Policy } from "../policy/schema.js";
-import type { Change, ChangedFile, TicketRef, UntrustedText } from "../types.js";
+import type { Change, ChangedFile, Finding, TicketRef, UntrustedText } from "../types.js";
 
 /**
  * Intake: normalise the change and quarantine every piece of author-controlled text into `UntrustedText`.
@@ -90,6 +90,21 @@ const RULES: Rule[] = [
     replace: (m) => (/[0-9]/.test(m.slice(3)) && /[A-Za-z]/.test(m.slice(3)) ? tag("openai-key") : null),
   },
   { kind: "slack-token", re: /\bxox[abposre]-[A-Za-z0-9-]{10,}/g, replace: whole("slack-token") },
+  { kind: "stripe-key", re: /\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b/g, replace: whole("stripe-key") },
+  { kind: "google-api-key", re: /\bAIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])/g, replace: whole("google-api-key") },
+  { kind: "gitlab-token", re: /\bglpat-[A-Za-z0-9_-]{20,}/g, replace: whole("gitlab-token") },
+  { kind: "npm-token", re: /\bnpm_[A-Za-z0-9]{36}\b/g, replace: whole("npm-token") },
+  { kind: "sendgrid-key", re: /\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}/g, replace: whole("sendgrid-key") },
+  {
+    // https://user:pass@host -> https://user:[REDACTED:url-credentials]@host
+    kind: "url-credentials",
+    re: /\b([a-z][a-z0-9+.-]*:\/\/[^\s:/@]+):([^\s@/]+)@/gi,
+    replace: (_m, g) => {
+      const pass = g[1] ?? "";
+      if (pass.length === 0 || isPlaceholder(pass)) return null;
+      return `${g[0] ?? ""}:${tag("url-credentials")}@`;
+    },
+  },
   {
     kind: "slack-webhook",
     re: /https:\/\/hooks\.slack\.com\/services\/[A-Za-z0-9/_-]{20,}/g,
@@ -99,6 +114,16 @@ const RULES: Rule[] = [
     kind: "jwt",
     re: /\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g,
     replace: whole("jwt"),
+  },
+  {
+    // Authorization: Bearer <token>. Needs 16+ token chars with a digit so prose like "Bearer tokens" survives.
+    kind: "bearer-token",
+    re: /\b(Bearer\s+)([A-Za-z0-9._~+/=-]{16,})/g,
+    replace: (_m, g) => {
+      const value = g[1] ?? "";
+      if (!/[0-9]/.test(value) || isPlaceholder(value)) return null;
+      return `${g[0] ?? ""}${tag("bearer-token")}`;
+    },
   },
   {
     // password = "hunter22", "api_key": 'abc123...', token: `...`
@@ -155,6 +180,23 @@ export function redactSecrets(text: string): { text: string; redactions: number 
   return { text: out, redactions };
 }
 
+/** Redact a string and return only the text. */
+export function redactText(text: string): string {
+  return redactSecrets(text).text;
+}
+
+/**
+ * Redact every model-written string on a finding (title, detail, evidence, suggestedFix). Reviewers read
+ * the workspace, so their findings can quote real secrets; run this before storing or rendering.
+ */
+export function redactFinding<F extends Pick<Finding, "title" | "detail"> & Partial<Finding>>(f: F): F {
+  const out: F = { ...f, title: redactText(f.title), detail: redactText(f.detail) };
+  if (f.evidence) out.evidence = f.evidence.map(redactText);
+  if (f.suggestedFix !== undefined) out.suggestedFix = redactText(f.suggestedFix);
+  if (f.votes) out.votes = f.votes.map((v) => (v.reason === undefined ? v : { ...v, reason: redactText(v.reason) }));
+  return out;
+}
+
 /** Redact a unified diff when the policy asks for it; otherwise return it unchanged. */
 export function redactDiff(diff: string, policy: Policy): string {
   return policy.runner.redactSecrets ? redactSecrets(diff).text : diff;
@@ -203,6 +245,11 @@ export function intake(change: Change, ctx: IntakeContext, policy: Policy): Inta
     if (f.patch !== undefined) file.patch = clean(f.patch);
     const prior = byPath.get(path);
     if (prior) {
+      // Keep the rename source: it is what catches a move out of a critical directory.
+      if (prior.previousPath === undefined && file.previousPath !== undefined) {
+        prior.previousPath = file.previousPath;
+        prior.status = file.status;
+      }
       prior.additions += file.additions;
       prior.deletions += file.deletions;
       if (file.patch !== undefined) prior.patch = prior.patch ? `${prior.patch}\n${file.patch}` : file.patch;
