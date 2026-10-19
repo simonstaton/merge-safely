@@ -238,7 +238,7 @@ export const policySchema = z
 
     runner: z
       .object({
-        /** Commands reviewers may execute (exact string or prefix match), e.g. ["npm test", "npm run lint"]. Default: none. */
+        /** Commands reviewers may execute. Exact match by default; an entry ending in " *" allows extra arguments after that prefix (e.g. "npm test", "npx vitest run *"). Default: none. */
         allowedCommands: z.array(z.string()).default([]),
         commandTimeoutMs: z
           .number()
