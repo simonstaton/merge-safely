@@ -23,6 +23,7 @@
  */
 import { seatBudgetFromPolicy } from "../budget/seat-budget.js";
 import type { ModelSelection, PanelTierPolicy, Policy } from "../policy/schema.js";
+import { matchAny } from "../stages/glob.js";
 import type {
   Change,
   ConnectionRecord,
@@ -35,7 +36,6 @@ import type {
   Tier,
 } from "../types.js";
 import { SeatingError } from "./errors.js";
-import { matchesAny } from "./glob.js";
 import { matchModelId, modelIdMatches, normaliseModelId } from "./model-id.js";
 
 export interface SeatingInput {
@@ -68,7 +68,7 @@ export function lensesFor(tierPolicy: PanelTierPolicy, change: Change, policy: P
   const out: LensId[] = [];
   for (const lens of tierPolicy.hunters) {
     const globs = policy.panel.conditionalLenses[lens];
-    if (globs && !paths.some((p) => matchesAny(globs, p))) continue;
+    if (globs && !paths.some((p) => matchAny(globs, p))) continue;
     if (!out.includes(lens)) out.push(lens);
   }
   return out;

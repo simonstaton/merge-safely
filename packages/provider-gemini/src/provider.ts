@@ -10,10 +10,8 @@ import type {
   ValidationResult,
   WorkspaceHandle,
 } from "@merge-safely/core";
+import { AgenticLoop, errorMessage, type RetryOptions, redactWithSecrets, secretStrings } from "@merge-safely/tools";
 import { defaultClientFactory, type GeminiModel, type GenAILike } from "./client.js";
-import { AgenticLoop } from "./common/loop.js";
-import { errorMessage, redact, secretStrings } from "./common/redact.js";
-import type { RetryOptions } from "./common/retry.js";
 import { classifyGeminiError } from "./errors.js";
 import { isAgenticModel, toModelInfo } from "./models.js";
 import { GeminiTransport } from "./transport.js";
@@ -70,7 +68,7 @@ export function geminiProvider(opts: GeminiProviderOptions = {}): ModelProvider 
           };
         if (info.kind === "network")
           return { ok: false, message: `Gemini API unreachable (${info.message})`, latencyMs };
-        return { ok: false, message: `validation failed: ${redact(info.message, secrets)}`, latencyMs };
+        return { ok: false, message: `validation failed: ${redactWithSecrets(info.message, secrets)}`, latencyMs };
       }
     },
 
@@ -93,7 +91,7 @@ export function geminiProvider(opts: GeminiProviderOptions = {}): ModelProvider 
           try {
             client = factory(conn);
           } catch (err: unknown) {
-            setupError = `could not create Gemini client: ${redact(errorMessage(err), secrets)}`;
+            setupError = `could not create Gemini client: ${redactWithSecrets(errorMessage(err), secrets)}`;
           }
           const loop = new AgenticLoop({
             model,

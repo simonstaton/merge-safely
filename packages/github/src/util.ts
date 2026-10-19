@@ -1,4 +1,4 @@
-import type { RepoRef } from "@merge-safely/core";
+import { type RepoRef, redactText } from "@merge-safely/core";
 
 /** Prefix of every check run this package writes. The source provider ignores these so the gate never reads itself. */
 export const CHECK_NAME_PREFIX = "merge-safely/";
@@ -68,28 +68,11 @@ export function clip(s: string, max: number): string {
 
 /**
  * Mask secret shapes before text leaves the process in a check run or comment (error messages can
- * echo request headers). Local until the core redactor lands, then this should delegate to it.
- * Covers GitHub/GitLab/npm tokens, Anthropic/OpenAI/Stripe keys, Google `AIza`, AWS `AKIA`, Slack
- * `xox*`, bearer/token/api-key headers and PEM private keys.
+ * echo request headers). Delegates to core's redactor in aggressive mode (GitHub/GitLab/npm tokens,
+ * provider/cloud/chat keys, Authorization/api-key headers, URL credentials and PEM blocks).
  */
 export function redactSecrets(s: string): string {
-  return s
-    .replace(
-      /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g,
-      "[redacted private key]",
-    )
-    .replace(/\b(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g, "[redacted]")
-    .replace(/\bglpat-[A-Za-z0-9_-]{20,}/g, "[redacted]")
-    .replace(/\bnpm_[A-Za-z0-9]{36}\b/g, "[redacted]")
-    .replace(/\b(sk-(?:ant-|proj-)?[A-Za-z0-9_-]{16,})/g, "[redacted]")
-    .replace(/\b[sr]k_live_[A-Za-z0-9]{16,}/g, "[redacted]")
-    .replace(/\bAIza[0-9A-Za-z_-]{35}/g, "[redacted]")
-    .replace(/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, "[redacted]")
-    .replace(/\bxox[abposr]-[A-Za-z0-9-]{10,}/g, "[redacted]")
-    .replace(/((?:x-)?api-key["']?\s*[:=]\s*["']?)[^\s"',;]+/gi, "$1[redacted]")
-    .replace(/(authorization["']?\s*[:=]\s*["']?)(bearer|token|basic)\s+[^\s"',;]+/gi, "$1$2 [redacted]")
-    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{16,}/g, "Bearer [redacted]")
-    .replace(/(x-access-token:)[^@\s]+@/g, "$1[redacted]@");
+  return redactText(s, { aggressive: true, replacement: "[redacted]" });
 }
 
 /** Map with bounded concurrency, preserving input order. */

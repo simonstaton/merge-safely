@@ -158,11 +158,87 @@ const RULES: Rule[] = [
   },
 ];
 
-/** Redact secret-shaped substrings. Returns the redacted text and how many substrings were replaced. */
-export function redactSecrets(text: string): { text: string; redactions: number } {
+/**
+ * Recall-oriented rules that only run with `aggressive: true`: for text leaving the process (error messages,
+ * tool output fed to a model, check-run bodies) where a false positive costs little and a leak costs a lot.
+ * These are the union of the shapes the adapters (tools, providers, github) used to keep locally.
+ * `AGGRESSIVE_PRE` runs before the default rules (it must see raw text), `AGGRESSIVE_POST` after them.
+ */
+const notCode = (v: string): boolean =>
+  !v.includes("(") && !v.includes("[REDACTED:") && !/^(?:\$\{|\{\{|<|process\.env)/.test(v);
+
+const AGGRESSIVE_PRE: Rule[] = [
+  {
+    // git remote errors: https://x-access-token:<token>@github.com, with or without a scheme.
+    kind: "url-credentials",
+    re: /(x-access-token:)[^@\s]+@/g,
+    replace: (_m, g) => `${g[0] ?? ""}${tag("url-credentials")}@`,
+  },
+  {
+    // Any PEM block, including one whose END line was cut off: redact to the end of the text.
+    kind: "pem-block",
+    re: /-----BEGIN [A-Z0-9 ]+-----[\s\S]*?(?:-----END [A-Z0-9 ]+-----|$)/g,
+    replace: whole("pem-block"),
+  },
+  {
+    // ?key=...&token=... query parameters (keeps the other parameters).
+    kind: "query-credential",
+    re: /([?&](?:key|api[_-]?key|token|access[_-]?token|auth|password|secret|client[_-]?secret|sig|signature)=)([^&\s"'#]+)/gi,
+    replace: (_m, g) => (notCode(g[1] ?? "") ? `${g[0] ?? ""}${tag("query-credential")}` : null),
+  },
+  {
+    // Authorization header values (any scheme), to the end of the line.
+    kind: "authorization",
+    re: /(\bauthorization["']?\s*[:=]\s*)([^\r\n]+)/gi,
+    replace: (_m, g) => (notCode(g[1] ?? "") ? `${g[0] ?? ""}${tag("authorization")}` : null),
+  },
+];
+
+const AGGRESSIVE_POST: Rule[] = [
+  {
+    // x-api-key / api-key / auth-token header or assignment values of any shape.
+    kind: "api-key",
+    re: /(\b(?:x-)?(?:api[_-]?key|auth[_-]?token)["']?\s*[:=]\s*["']?)([^\s"',;}]{4,})/gi,
+    replace: (_m, g) => (notCode(g[1] ?? "") ? `${g[0] ?? ""}${tag("api-key")}` : null),
+  },
+  {
+    // password = "any value, even with spaces" (4+ chars).
+    kind: "credential",
+    re: /(\b[A-Za-z0-9_]*(?:password|passwd|token|secret|api_?key)\s*[:=]\s*)(["'])([^"'\r\n]{4,})\2/gi,
+    replace: (_m, g) =>
+      isPlaceholder(g[2] ?? "") ? null : `${g[0] ?? ""}${g[1] ?? ""}${tag("credential")}${g[1] ?? ""}`,
+  },
+  {
+    // KEY=value with no spaces (env, ini, URL query), 4+ chars.
+    kind: "credential",
+    re: /(\b[A-Za-z0-9_]*(?:password|passwd|token|secret|api_?key)=)(?!["'])([^\s&"'`]{4,})/gi,
+    replace: (_m, g) => (isPlaceholder(g[1] ?? "") ? null : `${g[0] ?? ""}${tag("credential")}`),
+  },
+  {
+    kind: "bearer-token",
+    re: /\b(Bearer\s+)([A-Za-z0-9._~+/=-]{8,})/gi,
+    replace: (_m, g) => `${g[0] ?? ""}${tag("bearer-token")}`,
+  },
+  { kind: "anthropic-key", re: /\bsk-ant-[A-Za-z0-9_-]{8,}/g, replace: whole("anthropic-key") },
+  { kind: "openai-key", re: /\bsk-[A-Za-z0-9_-]{12,}/g, replace: whole("openai-key") },
+  { kind: "github-token", re: /\bgh[pousr]_[A-Za-z0-9]{20,}/g, replace: whole("github-token") },
+  { kind: "google-api-key", re: /\bAIza[0-9A-Za-z_-]{20,}/g, replace: whole("google-api-key") },
+];
+
+export interface RedactOptions {
+  /**
+   * Also apply the recall-oriented rules (any PEM block, Authorization header lines, short bearer tokens and
+   * key shapes, api-key headers, query-string credentials). Use for text leaving the process; leave off for
+   * diffs and prompts, where reviewers need the surrounding code intact. Default false.
+   */
+  aggressive?: boolean;
+  /** Replace every `[REDACTED:<kind>]` marker with this fixed string (e.g. `[REDACTED]`). */
+  replacement?: string;
+}
+
+function applyRules(rules: readonly Rule[], text: string, count: () => void): string {
   let out = text;
-  let redactions = 0;
-  for (const rule of RULES) {
+  for (const rule of rules) {
     rule.re.lastIndex = 0;
     out = out.replace(rule.re, (match: string, ...rest: unknown[]) => {
       // rest = [...groups, offset, input, namedGroups?]; keep only the capture groups.
@@ -173,16 +249,33 @@ export function redactSecrets(text: string): { text: string; redactions: number 
       }
       const replaced = rule.replace(match, groups);
       if (replaced === null) return match;
-      redactions++;
+      count();
       return replaced;
     });
+  }
+  return out;
+}
+
+/** Redact secret-shaped substrings. Returns the redacted text and how many substrings were replaced. */
+export function redactSecrets(text: string, opts: RedactOptions = {}): { text: string; redactions: number } {
+  let redactions = 0;
+  const count = () => {
+    redactions++;
+  };
+  let out = text;
+  if (opts.aggressive) out = applyRules(AGGRESSIVE_PRE, out, count);
+  out = applyRules(RULES, out, count);
+  if (opts.aggressive) out = applyRules(AGGRESSIVE_POST, out, count);
+  if (opts.replacement !== undefined) {
+    const replacement = opts.replacement;
+    out = out.replace(/\[REDACTED:[a-z-]+\]/g, () => replacement);
   }
   return { text: out, redactions };
 }
 
 /** Redact a string and return only the text. */
-export function redactText(text: string): string {
-  return redactSecrets(text).text;
+export function redactText(text: string, opts?: RedactOptions): string {
+  return redactSecrets(text, opts).text;
 }
 
 /**
@@ -191,7 +284,7 @@ export function redactText(text: string): string {
  */
 export function redactFinding<F extends Pick<Finding, "title" | "detail"> & Partial<Finding>>(f: F): F {
   const out: F = { ...f, title: redactText(f.title), detail: redactText(f.detail) };
-  if (f.evidence) out.evidence = f.evidence.map(redactText);
+  if (f.evidence) out.evidence = f.evidence.map((e) => redactText(e));
   if (f.suggestedFix !== undefined) out.suggestedFix = redactText(f.suggestedFix);
   if (f.votes) out.votes = f.votes.map((v) => (v.reason === undefined ? v : { ...v, reason: redactText(v.reason) }));
   return out;

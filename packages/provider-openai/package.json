@@ -24,7 +24,6 @@
   "dependencies": {
     "@merge-safely/core": "0.1.0",
     "@merge-safely/registry": "0.1.0",
-    "@merge-safely/providers": "0.1.0",
     "@merge-safely/tools": "0.1.0",
     "openai": "^5.0.0"
   }

@@ -28,7 +28,9 @@ Path patterns are used by `tiers.criticalPaths`, `tiers.ignorePaths`, the `triag
 
 - Matching works on **whole path segments**. `**/auth/**` matches `src/auth/session.ts` but not `src/author/profile.ts`.
 - Matching is **case-insensitive**.
-- Patterns are anchored at the repository root. `*.tsx` matches only files at the root. Use `**/*.tsx` for "anywhere".
+- A pattern with a `/` is anchored at the repository root (`src/**/*.tsx`). A pattern without one matches the file name at any depth, so `*.tsx` behaves like `**/*.tsx`.
+- A trailing `/` means a directory: `docs/` matches everything inside any `docs` directory.
+- Every list above uses the same matcher, so a pattern means the same thing in `conditionalLenses` as in `criticalPaths`.
 - For a rename, the previous path is checked too.
 
 ## Tiers and the score

@@ -1,7 +1,7 @@
 # @merge-safely/provider-gemini
 
 `ModelProvider` for Google Gemini through the Gemini Developer API (`@google/genai`,
-`models.generateContent`). It uses the same agentic loop as the OpenAI provider. The reviewer
+`models.generateContent`). It uses the same agentic loop as the OpenAI provider (`AgenticLoop` from `@merge-safely/tools`). The reviewer
 investigates through the shared read-only tool set, declared as `functionDeclarations`, and finishes
 by calling `submit_review`, whose `parametersJsonSchema` is the review JSON schema. `responseSchema`
 is not used, because the function carries the schema.

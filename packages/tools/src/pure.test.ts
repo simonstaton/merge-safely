@@ -15,7 +15,7 @@ import { createReadOnlyTools } from "./executor.js";
 import { globToRegExp, matchGlob } from "./glob.js";
 import { PathError, resolveSafe } from "./paths.js";
 import { toolsSystemPromptFragment } from "./prompt.js";
-import { redactSecrets } from "./redact.js";
+import { redactSecrets, redactWithSecrets, replaceLiterals } from "./redact.js";
 import { isHiddenPath, isSensitivePath } from "./sensitive.js";
 import { submitReviewDefinition } from "./submit-review.js";
 import { matchAllowlist, tokenizeCommand } from "./tokenize.js";
@@ -188,6 +188,13 @@ describe("redactSecrets", () => {
     const code = "const token = getToken();\nif (password === input) return skip;\nconst sk = 1;";
     expect(redactSecrets(code)).toBe(code);
   });
+  it("replaces known secret values longest first, then shapes", () => {
+    expect(redactWithSecrets("a hunter22hunter22 b hunter22", ["hunter22", "hunter22hunter22"])).toBe(
+      "a [REDACTED] b [REDACTED]",
+    );
+    expect(redactWithSecrets("tiny abc", ["abc"])).toBe("tiny abc");
+    expect(replaceLiterals("x secret-value y", ["secret-value"], (v) => `…${v.slice(-2)}`)).toBe("x …ue y");
+  });
 });
 
 describe("sensitive paths", () => {
@@ -231,6 +238,24 @@ describe("shape converters", () => {
       function: { name: "read_file", description: defs[0]?.description, parameters: defs[0]?.inputSchema },
     });
     expect(toOpenAIResponsesTools(defs)[0]).toMatchObject({ type: "function", name: "read_file", strict: false });
+  });
+
+  it("sends strict only when asked: always explicit on Responses, omitted unless true on Chat", () => {
+    const strictDef = { name: "submit_review", description: "d", inputSchema: { type: "object" }, strict: true };
+    expect(toOpenAIFunctionTools([strictDef])[0]?.function.strict).toBe(true);
+    expect(JSON.stringify(toOpenAIFunctionTools([{ ...strictDef, strict: false }]))).not.toContain("strict");
+    expect(toOpenAIResponsesTools([strictDef])[0]?.strict).toBe(true);
+  });
+
+  it("drops nested $schema keywords too", () => {
+    const def = {
+      name: "t",
+      description: "d",
+      inputSchema: { $schema: "x", type: "object", properties: { a: { $schema: "y", type: "string" } } },
+    };
+    for (const out of [toAnthropicTools([def]), toOpenAIFunctionTools([def]), toGeminiFunctionDeclarations([def])]) {
+      expect(JSON.stringify(out)).not.toContain("$schema");
+    }
   });
 
   it("maps to Gemini declarations via parametersJsonSchema", () => {

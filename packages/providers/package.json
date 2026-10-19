@@ -23,7 +23,6 @@
   },
   "dependencies": {
     "@merge-safely/core": "0.1.0",
-    "@merge-safely/registry": "0.1.0",
     "zod": "^3.23.8"
   }
 }

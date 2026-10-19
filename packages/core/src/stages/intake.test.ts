@@ -125,6 +125,65 @@ describe("redactSecrets", () => {
   });
 });
 
+describe("redactSecrets aggressive mode (shapes the adapters used to keep locally)", () => {
+  const loud = (t: string) => redactSecrets(t, { aggressive: true }).text;
+  const PEM_CERT = j("-----BEGIN ", "CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIU\n-----END ", "CERTIFICATE-----");
+
+  it.each([
+    ["authorization", "Authorization: Bearer abc.def\nnext", "Authorization: [REDACTED:authorization]\nnext"],
+    [
+      "authorization",
+      "extraheader = AUTHORIZATION: basic eHg6eXk=",
+      "extraheader = AUTHORIZATION: [REDACTED:authorization]",
+    ],
+    ["bearer-token", "got Bearer abc.def.ghi back", "got Bearer [REDACTED:bearer-token] back"],
+    ["api-key", "x-api-key: qqqqqqqqqqqq", "x-api-key: [REDACTED:api-key]"],
+    ["credential", "api-key=abc123secretvalue", "api-key=[REDACTED:credential]"],
+    ["query-credential", "GET https://x/v1?key=AAAA1234&x=1", "GET https://x/v1?key=[REDACTED:query-credential]&x=1"],
+    [
+      "query-credential",
+      "https://x.test/?token=abcdef123&x=1",
+      "https://x.test/?token=[REDACTED:query-credential]&x=1",
+    ],
+    ["credential", 'password = "correct horse"', 'password = "[REDACTED:credential]"'],
+    ["credential", "PASSWORD=hunter", "PASSWORD=[REDACTED:credential]"],
+    ["anthropic-key", j("sk-ant-", "zzzzzzzzzzzz"), "[REDACTED:anthropic-key]"],
+    ["openai-key", j("sk-", "abcdefghijklmnop123"), "[REDACTED:openai-key]"],
+    ["openai-key", j("key sk-", "proj-abcdefghijklmnopqrst done"), "key [REDACTED:openai-key] done"],
+    ["github-token", j("gho_", "0123456789abcdefghijABCD"), "[REDACTED:github-token]"],
+    ["google-api-key", j("AIza", "SyA1234567890abcdefghijk"), "[REDACTED:google-api-key]"],
+    [
+      "url-credentials",
+      j("github.com x-access-token:", "v1.abc@github.com"),
+      "github.com x-access-token:[REDACTED:url-credentials]@github.com",
+    ],
+    ["pem-block", j("-----BEGIN ", "PRIVATE KEY-----\nMIIE cut by truncation"), "[REDACTED:pem-block]"],
+    ["pem-block", PEM_CERT, "[REDACTED:pem-block]"],
+  ])("%s: %s", (_kind, input, expected) => {
+    expect(loud(input)).toBe(expected);
+  });
+
+  it("leaves those inputs alone in the default (diff/prompt) mode", () => {
+    for (const t of ["Authorization: Bearer abc.def", "x-api-key: qqqqqqqqqqqq", "?key=AAAA1234&x=1", PEM_CERT]) {
+      expect(redactSecrets(t).text).toBe(t);
+    }
+  });
+
+  it("still leaves ordinary code and prose alone", () => {
+    const code = "const token = getToken();\nif (password === input) return skip;\nconst sk = 1;\nsrc/sk-learn.ts";
+    expect(loud(code)).toBe(code);
+    expect(loud("headers.authorization = buildHeader(user)")).toBe("headers.authorization = buildHeader(user)");
+    expect(loud("plain error message")).toBe("plain error message");
+  });
+
+  it("replaces every marker with a fixed string when asked, and still counts each redaction", () => {
+    const r = redactSecrets(`a ${AWS} b Bearer abc.def.ghi`, { aggressive: true, replacement: "[REDACTED]" });
+    expect(r.text).toBe("a [REDACTED] b Bearer [REDACTED]");
+    expect(r.redactions).toBe(2);
+    expect(redactSecrets(`key ${AWS}`, { replacement: "***" }).text).toBe("key ***");
+  });
+});
+
 describe("redactDiff", () => {
   it("honours policy.runner.redactSecrets", () => {
     const diff = `+const k = "${AWS}";`;

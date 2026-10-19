@@ -11,6 +11,11 @@ const result = await tools.execute({ name: "read_file", input: { path: "src/inde
 const audit = tools.audit(); // { substantiveCalls, totalCalls, filesRead, commandsRun }
 ```
 
+## Shape converters and runner helpers
+
+- `toAnthropicTools`, `toOpenAIFunctionTools`, `toOpenAIResponsesTools`, `toGeminiFunctionDeclarations` convert tool definitions (optionally `strict`) to each vendor's wire shape. Every provider package uses them.
+- The OpenAI and Gemini runners share the provider-neutral loop exported here: `AgenticLoop` (a `Transport` owns the wire format), `RunGuard` (turns, deadline, USD via registry pricing, abort), `withRetry` / `parseRetryAfter` / `backoffDelay`, `sanitizeSchema` / `isStrictCompatible`, `addUsage`, and the safe error helpers `errorMessage`, `secretStrings`, `systemErrorCode`.
+
 ## Tools
 
 `read_file`, `list_dir`, `find_files`, `search` (ripgrep when installed, otherwise a JS fallback), `git_diff`, `git_log` and `git_blame`. `run_command` is added only when `allowedCommands` is non-empty.
@@ -33,7 +38,7 @@ const audit = tools.audit(); // { substantiveCalls, totalCalls, filesRead, comma
   - untracked git-ignored files (a developer's local secrets in `--local` mode)
   - anything under `.git`
 - **ripgrep** gets the model's glob *before* the exclusions, because in rg the last matching glob wins. Every result is also post-filtered.
-- **Redaction**: all tool output passes through `redactSecrets` before it reaches the model. It covers API keys, GitHub/Slack/AWS tokens, PEM blocks, `Authorization:` values and `password=`/`token=` assignments.
+- **Redaction**: all tool output passes through `redactSecrets` before it reaches the model. It is core's redactor (`@merge-safely/core` `redactSecrets` with `aggressive: true`) and covers API keys, GitHub/Slack/AWS/Google tokens, PEM blocks, `Authorization:` values, query-string credentials and `password=`/`token=` assignments. `redactWithSecrets(text, secrets)` first removes known literal values (connection keys, header values).
 - **Binaries**: `git`, `rg` and run_command executables are resolved once, to absolute paths, using only PATH entries that are absolute and outside the checkout. A PR-committed `node_modules/.bin/git` can never shadow them.
 - **git** runs with an allowlisted environment:
   - only PATH, LANG, LC_ALL, TZ, SSH_AUTH_SOCK and SSH_AGENT_PID are kept; no inherited `GIT_*`

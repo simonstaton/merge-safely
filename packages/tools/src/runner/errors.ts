@@ -1,27 +1,4 @@
-/**
- * Secret redaction for anything that may leave the runner (errors, logs, run.error).
- * Known secrets are replaced verbatim; common key shapes are masked as a second line of defence.
- */
-
-const KEY_SHAPES: RegExp[] = [
-  /sk-[A-Za-z0-9_-]{12,}/g, // OpenAI / OpenRouter / many gateways
-  /AIza[0-9A-Za-z_-]{20,}/g, // Google API keys
-  /(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi,
-  /([?&](?:key|api_key|apikey|token|access_token)=)[^&\s"']+/gi,
-];
-
-export function redact(text: string, secrets: ReadonlyArray<string | undefined> = []): string {
-  let out = text;
-  for (const s of secrets) {
-    if (s && s.length >= 4) out = out.split(s).join("[REDACTED]");
-  }
-  for (const re of KEY_SHAPES) {
-    out = out.replace(re, (_m: string, prefix: unknown) =>
-      typeof prefix === "string" ? `${prefix}[REDACTED]` : "[REDACTED]",
-    );
-  }
-  return out;
-}
+/** Error helpers shared by the API runners: secret collection, safe messages and network error codes. */
 
 /** Collect every string secret held by a connection secret blob (keys, tokens, header values). */
 export function secretStrings(secret: unknown): string[] {

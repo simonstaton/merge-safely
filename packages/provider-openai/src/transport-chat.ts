@@ -1,11 +1,18 @@
 import type { Logger } from "@merge-safely/core";
+import {
+  type NormalizedCall,
+  type ToolResultMessage,
+  type Transport,
+  type TransportInit,
+  type TurnResult,
+  toOpenAIFunctionTools,
+} from "@merge-safely/tools";
 import type {
   ChatCompletionFunctionTool,
   ChatCompletionMessageFunctionToolCall,
   ChatCompletionMessageParam,
 } from "openai/resources/chat/completions/completions";
 import type { OpenAILike } from "./client.js";
-import type { NormalizedCall, ToolResultMessage, Transport, TransportInit, TurnResult } from "./common/loop.js";
 import { isSchemaRejection } from "./errors.js";
 import { toEffort } from "./transport-responses.js";
 
@@ -29,16 +36,7 @@ export class ChatTransport implements Transport {
       { role: "system", content: init.system },
       { role: "user", content: init.user },
     ];
-    this.tools = init.tools.map((t) => ({
-      type: "function",
-      function: {
-        name: t.name,
-        description: t.description,
-        parameters: t.parameters,
-        // Only sent when true: many compatible servers reject the field outright.
-        ...(t.strict ? { strict: true } : {}),
-      },
-    }));
+    this.tools = toOpenAIFunctionTools(init.tools);
     this.effort = toEffort(init.effort, logger);
   }
 
