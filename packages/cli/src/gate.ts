@@ -9,6 +9,7 @@
 import { join } from "node:path";
 import {
   type Change,
+  type ChangeRef,
   type Connection,
   type CostLedger,
   createGate,
@@ -139,8 +140,44 @@ export function namedConnections(policy: Policy): string[] {
   return [...new Set(ids.filter((x): x is string => typeof x === "string"))];
 }
 
+interface ValidationResult {
+  conn: Connection;
+  ok: boolean;
+  message: string;
+  models?: ModelInfo[];
+}
+
+async function validateEach(
+  registry: ProviderRegistry,
+  connections: Connection[],
+  timeoutMs: number,
+): Promise<ValidationResult[]> {
+  return Promise.all(
+    connections.map(async (conn): Promise<ValidationResult> => {
+      try {
+        const v = await withTimeoutMs(registry.forConnection(conn).validate(conn), timeoutMs, `validating ${conn.id}`);
+        return {
+          conn,
+          ok: v.ok,
+          message: v.message ?? "validation failed",
+          ...(v.ok && v.models && v.models.length > 0 ? { models: v.models } : {}),
+        };
+      } catch (err: unknown) {
+        return { conn, ok: false, message: err instanceof Error ? err.message : String(err) };
+      }
+    }),
+  );
+}
+
+function unreachable(r: ValidationResult): CliError {
+  return new CliError(
+    "CONNECTION_UNREACHABLE",
+    `connection ${r.conn.id} is unreachable or rejected (${r.message}). Fix: check its key, base URL and network, then run \`merge-safely connections test ${r.conn.id}\``,
+  );
+}
+
 /**
- * Validate connections before seating (`run`), with a timeout each. A connection the policy names that fails is
+ * Validate connections before seating, with a timeout each. A connection the policy names that fails is
  * fatal (CONNECTION_UNREACHABLE naming it and the fix); with automatic model choice failed connections are dropped
  * with a warning, and it is fatal only when none is left. Models returned by validate prefill the catalog cache.
  */
@@ -152,30 +189,86 @@ export async function preflightConnections(
   timeoutMs = DEFAULT_VALIDATE_TIMEOUT_MS,
 ): Promise<{ connections: Connection[]; cache: Map<string, ModelInfo[]> }> {
   const cache = new Map<string, ModelInfo[]>();
-  const results = await Promise.all(
-    connections.map(async (conn) => {
-      try {
-        const v = await withTimeoutMs(registry.forConnection(conn).validate(conn), timeoutMs, `validating ${conn.id}`);
-        if (v.ok && v.models && v.models.length > 0) cache.set(conn.id, v.models);
-        return { conn, ok: v.ok, message: v.message ?? "validation failed" };
-      } catch (err: unknown) {
-        return { conn, ok: false, message: err instanceof Error ? err.message : String(err) };
-      }
-    }),
-  );
+  const results = await validateEach(registry, connections, timeoutMs);
+  for (const r of results) if (r.models) cache.set(r.conn.id, r.models);
   const failed = results.filter((r) => !r.ok);
-  const fail = (r: (typeof results)[number]) =>
-    new CliError(
-      "CONNECTION_UNREACHABLE",
-      `connection ${r.conn.id} is unreachable or rejected (${r.message}). Fix: check its key, base URL and network, then run \`merge-safely connections test ${r.conn.id}\``,
-    );
   const named = new Set(namedConnections(policy));
   const namedFailure = failed.find((r) => named.has(r.conn.id));
-  if (namedFailure) throw fail(namedFailure);
+  if (namedFailure) throw unreachable(namedFailure);
   const ok = results.filter((r) => r.ok).map((r) => r.conn);
-  if (ok.length === 0 && failed[0]) throw fail(failed[0]);
+  if (ok.length === 0 && failed[0]) throw unreachable(failed[0]);
   for (const r of failed) logger.warn(`connection ${r.conn.id} skipped: ${r.message}`);
   return { connections: ok, cache };
+}
+
+/**
+ * The gate `run` reviews with, validating connections only once a panel will actually run (design: triage first).
+ *
+ * 1. Estimate with no catalog and no network: when triage auto-passes (or nothing is seated) the review needs no
+ *    model, so no connection is validated or listed and a dead one cannot block a docs-only change.
+ * 2. Otherwise build the catalog, seat, and validate only the connections the seated panel uses. A failing
+ *    connection the policy names is fatal; under automatic model choice a failing one is dropped with a warning
+ *    and the panel is re-seated without it (fatal only when no connection is left).
+ */
+export async function gateForReview(
+  base: GateDeps,
+  registry: ProviderRegistry,
+  target: ChangeRef | Change,
+  opts: { timeoutMs?: number } = {},
+): Promise<Gate> {
+  const { policy, logger } = base;
+  const triageGate = createGate({ ...base, catalog: () => [] });
+  try {
+    const est = await triageGate.estimate(target);
+    if (est.seats.length === 0) return triageGate;
+  } catch (_err: unknown) {
+    // Seating needs the catalog (or the change could not be loaded): fall through to the full path, which reports it.
+  }
+
+  const named = new Set(namedConnections(policy));
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_VALIDATE_TIMEOUT_MS;
+  const cache = new Map<string, ModelInfo[]>();
+  const validated = new Set<string>();
+  const warned = new Set<string>();
+  let connections = base.connections;
+  let firstFailure: ValidationResult | undefined;
+  for (;;) {
+    const catalogData = await buildCatalog(registry, connections, { cache });
+    for (const p of catalogData.problems) {
+      if (warned.has(p.connectionId)) continue;
+      warned.add(p.connectionId);
+      logger?.warn(`connection ${p.connectionId}: ${p.message}`);
+    }
+    const gate = createGate({ ...base, connections, catalog: catalogLookup(catalogData) });
+    let toCheck: Connection[];
+    try {
+      const est = await gate.estimate(target);
+      const seated = new Set(est.seats.map((s) => s.model.connectionId));
+      toCheck = connections.filter((c) => seated.has(c.id) && !validated.has(c.id));
+    } catch (_err: unknown) {
+      // Could not seat (often because a dead connection listed no models): validate what is left, so a dead
+      // connection is named; if every one is fine, the review reports the original error itself.
+      toCheck = connections.filter((c) => !validated.has(c.id));
+    }
+    if (toCheck.length === 0) return gate;
+    const results = await validateEach(registry, toCheck, timeoutMs);
+    const namedFailure = results.find((r) => !r.ok && named.has(r.conn.id));
+    if (namedFailure) throw unreachable(namedFailure);
+    const failed = new Set<string>();
+    for (const r of results) {
+      validated.add(r.conn.id);
+      if (r.ok) {
+        if (r.models) cache.set(r.conn.id, r.models);
+        continue;
+      }
+      firstFailure ??= r;
+      failed.add(r.conn.id);
+      logger?.warn(`connection ${r.conn.id} skipped: ${r.message}`);
+    }
+    if (failed.size === 0) return gate;
+    connections = connections.filter((c) => !failed.has(c.id));
+    if (connections.length === 0 && firstFailure) throw unreachable(firstFailure);
+  }
 }
 
 const FINAL_EVENTS: ReadonlySet<ReportEvent["type"]> = new Set(["verdict", "escalated", "budget-blocked", "error"]);
@@ -395,12 +488,20 @@ export function toCliEstimate(e: Estimate): CliEstimate {
   };
 }
 
-export function adaptGate(g: Gate, policy: Policy, abort?: (reason: string) => Promise<void>): CliGate {
+export function adaptGate(
+  g: Gate,
+  policy: Policy,
+  abort?: (reason: string) => Promise<void>,
+  /** Picks the gate a review runs on (`run` validates connections lazily, see `gateForReview`). */
+  forReview?: (target: ChangeRef | Change) => Promise<Gate>,
+): CliGate {
+  const pick = (target: ChangeRef | Change): Promise<Gate> => (forReview ? forReview(target) : Promise.resolve(g));
   return {
     ...(abort ? { abort } : {}),
     async review(ref, opts) {
+      const gate = await pick(ref);
       return toCliResult(
-        await g.review(ref, opts.headSha ? { headSha: opts.headSha, trigger: "cli" } : { trigger: "cli" }),
+        await gate.review(ref, opts.headSha ? { headSha: opts.headSha, trigger: "cli" } : { trigger: "cli" }),
       );
     },
     async reviewChange(input) {
@@ -409,8 +510,13 @@ export function adaptGate(g: Gate, policy: Policy, abort?: (reason: string) => P
         ...(input.untrusted.comments ? { comments: input.untrusted.comments } : {}),
       };
       // --local: never stored, never escalated (persist: false); reporters still see every event.
+      const gate = await pick(input.change);
       return toCliResult(
-        await g.reviewChange(input.change, { diff: input.diff, untrusted }, { persist: false, trigger: "cli-local" }),
+        await gate.reviewChange(
+          input.change,
+          { diff: input.diff, untrusted },
+          { persist: false, trigger: "cli-local" },
+        ),
       );
     },
     async estimate(target) {
@@ -433,7 +539,20 @@ export function realGateFactory(
   overrides: GateOverrides = {},
 ): GateFactory {
   return async (setup) => {
-    const { deps, abort } = await buildGateDeps(setup, registry(), overrides);
+    const reg = registry();
+    if (setup.validateConnections && setup.catalog !== false) {
+      // `run`: no catalog or validation up front; gateForReview triages first and validates only a seated panel.
+      const { deps, abort } = await buildGateDeps(
+        { ...setup, catalog: false, validateConnections: false },
+        reg,
+        overrides,
+      );
+      const timeout = setup.validateTimeoutMs !== undefined ? { timeoutMs: setup.validateTimeoutMs } : {};
+      return adaptGate(createGate(deps), setup.policy.policy, abort, (target) =>
+        gateForReview(deps, reg, target, timeout),
+      );
+    }
+    const { deps, abort } = await buildGateDeps(setup, reg, overrides);
     return adaptGate(createGate(deps), setup.policy.policy, abort);
   };
 }

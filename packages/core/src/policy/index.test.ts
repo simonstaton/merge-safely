@@ -19,4 +19,13 @@ describe("policy strictness", () => {
     expect(parsePolicy({ panel: { t1: { hunters: ["correctness"], judge: 1 } } }).ok).toBe(false);
     expect(parsePolicy({ models: { hunters: { connection: "a", model: "b", efort: "x" } } }).ok).toBe(false);
   });
+
+  it("rejects the removed keys trust.provider codeowners and rounds.neverRepeatFindings", () => {
+    expect(parsePolicy({ trust: { provider: "codeowners" } }).ok).toBe(false);
+    expect(parsePolicy({ rounds: { neverRepeatFindings: true } }).ok).toBe(false);
+    for (const provider of ["none", "github-teams", "allowlist"]) {
+      expect(parsePolicy({ trust: { provider } }).ok).toBe(true);
+    }
+    expect(DEFAULT_POLICY.rounds).toEqual({ max: 3, diffOnlyAfterRound: 1 });
+  });
 });

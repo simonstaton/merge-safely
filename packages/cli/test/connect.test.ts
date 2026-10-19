@@ -167,6 +167,17 @@ describe("connect", () => {
     expect((await h.run("connect", "anthropic", "--api-key", KEY, "--runner", "cli", "--id", "cc")).code).toBe(0);
     const f = fileOf(h.home);
     expect(f.connections[0]).toMatchObject({ kind: "subscription" });
+    const sub = await h.run("connect", "anthropic", "--subscription", "--id", "claude-sub");
+    expect(sub.stdout).toContain("secret: none (this record holds no secret)");
+    expect(sub.stdout).not.toContain("plaintext");
     expect(f.connections[1]).toMatchObject({ options: { runner: "cli" } });
+  });
+
+  it("says keyless local presets hold no secret, even with a master key set", async () => {
+    const h = harness({ env: { MERGE_SAFELY_MASTER_KEY: generateMasterKey() } });
+    const r = await h.run("connect", "ollama", "--no-validate");
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain("secret: none (this record holds no secret)");
+    expect(r.stdout).not.toContain("encrypted");
   });
 });

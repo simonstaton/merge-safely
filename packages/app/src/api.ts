@@ -3,6 +3,9 @@
  *   GET  /installations/:id/prs/:n?repo=owner/name   verdict, digest and history via gate.explain
  *   POST /installations/:id/verdict                  human verdict (design 14 Q3: a human pass replaces a machine
  *                                                    block, with provenance: signedBy + reason, SHA-bound)
+ *
+ * A human verdict must name the PR's current head (409 `stale-head-sha` otherwise; `allowStaleSha: true` records it
+ * anyway with a warning in the reason) and must not be signed by the PR's author (403 `signer-is-author`).
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
@@ -32,6 +35,8 @@ export const humanVerdictSchema = z
       .string()
       .trim()
       .regex(/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})(?:\[bot\])?$/, "signedBy must be a GitHub login"),
+    /** Record against a headSha that is no longer the PR's head (a warning is added to the reason). */
+    allowStaleSha: z.boolean().optional(),
   })
   .strict();
 
@@ -105,12 +110,38 @@ export async function apiHandler(deps: ApiDeps, req: IncomingMessage, res: Serve
       });
       return true;
     }
+    if (prep.authorLogin && prep.authorLogin.toLowerCase() === v.signedBy.toLowerCase()) {
+      sendJson(res, 403, {
+        error: "signer-is-author",
+        message: `${v.signedBy} authored this PR and cannot sign its human verdict; ask another reviewer`,
+      });
+      return true;
+    }
+    let reason = v.reason;
+    if (prep.currentHeadSha.toLowerCase() !== v.headSha.toLowerCase()) {
+      if (!v.allowStaleSha) {
+        sendJson(res, 409, {
+          error: "stale-head-sha",
+          message: `headSha ${v.headSha} is not the PR's current head ${prep.currentHeadSha}; review the current head and resend, or pass "allowStaleSha": true to record it against the older commit`,
+          currentHeadSha: prep.currentHeadSha,
+        });
+        return true;
+      }
+      reason = `${v.reason} [warning: recorded with allowStaleSha against ${v.headSha}; the PR head was ${prep.currentHeadSha}]`;
+      deps.logger.warn("human verdict recorded against a stale head", {
+        installationId,
+        repo: v.repo,
+        number: v.number,
+        headSha: v.headSha,
+        currentHeadSha: prep.currentHeadSha,
+      });
+    }
     const recorded = await prep.gate.recordHumanVerdict({
       ref: prep.ref,
       headSha: v.headSha,
       decision: v.decision,
       signedBy: { kind: "human", login: v.signedBy },
-      reason: v.reason,
+      reason,
     });
     deps.logger.info("human verdict recorded", {
       installationId,

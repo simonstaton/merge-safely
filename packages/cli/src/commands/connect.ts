@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import type { Connection, ModelInfo, ModelProvider } from "@merge-safely/core";
-import { MASTER_KEY_ENV, parseConnectionsInput, secretValues } from "@merge-safely/providers";
+import { type ConnectionFileEntry, MASTER_KEY_ENV, parseConnectionsInput, secretValues } from "@merge-safely/providers";
 import { describeModel, modelsFor } from "@merge-safely/registry";
 import { readRawConnections, toFileEntry, upsertEntry, writeRawConnections } from "../connections-file.js";
 import { type TierCost, TYPICAL_PR_LINES, tierCosts } from "../cost.js";
@@ -107,6 +107,18 @@ const NETWORK_ERROR =
 /** True when a validation message describes a connectivity problem rather than a rejected credential. */
 export function looksLikeNetworkError(message: string): boolean {
   return NETWORK_ERROR.test(message);
+}
+
+/** How the saved record holds its secret, judged from what was actually written (not from the flags given). */
+export function describeStorage(entry: ConnectionFileEntry): string {
+  const ref = entry.secretRef;
+  if (entry.apiKeyEnv) return `reference to $${entry.apiKeyEnv}`;
+  if (ref && "env" in ref) return `reference to $${ref.env}`;
+  if (ref && "file" in ref) return `reference to file ${ref.file}`;
+  if (ref && "encrypted" in ref) return `encrypted with $${MASTER_KEY_ENV}`;
+  const kind = entry.secret?.kind;
+  if (!kind || kind === "subscription" || kind === "cloud") return "none (this record holds no secret)";
+  return "plaintext (0600)";
 }
 
 function groupModels(models: ModelInfo[]): string[] {
@@ -238,13 +250,7 @@ export async function connectCommand(rt: Runtime, providerArg: string, opts: Con
   const dirWarnings = await writeRawConnections(rt.paths.connections, file, { home: rt.paths.home });
   for (const w of [...warnings, ...dirWarnings]) rt.warn(w);
 
-  const storage = key.apiKeyEnv
-    ? `reference to $${key.apiKeyEnv}`
-    : masterKey
-      ? `encrypted with $${MASTER_KEY_ENV}`
-      : "secret" in entry && entry.secret
-        ? "plaintext (0600)"
-        : "no secret";
+  const storage = describeStorage(entry);
   if (rt.json) {
     rt.printJson({
       id,

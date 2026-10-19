@@ -449,6 +449,41 @@ describe("admin API", () => {
     ).toBe(404);
   });
 
+  it("refuses a human verdict on a stale head unless allowStaleSha, and one signed by the PR author", async () => {
+    const payload = {
+      repo: "o/r",
+      number: 7,
+      headSha: "d".repeat(40),
+      decision: "pass",
+      reason: "reviewed by hand",
+      signedBy: "alice",
+    };
+    const post = (body: unknown) =>
+      fetch(`${base}/installations/42/verdict`, { method: "POST", headers: auth, body: JSON.stringify(body) });
+    const stale = await post(payload);
+    expect(stale.status).toBe(409);
+    const sj = (await stale.json()) as { error: string; message: string; currentHeadSha: string };
+    expect(sj.error).toBe("stale-head-sha");
+    expect(sj.currentHeadSha).toBe(HEAD_SHA);
+    expect(sj.message).toContain("allowStaleSha");
+    expect(gate.humanVerdicts).toHaveLength(0);
+    expect(octo.calls.some((c) => c.method === "pulls.get")).toBe(true);
+
+    const forced = await post({ ...payload, allowStaleSha: true });
+    expect(forced.status).toBe(201);
+    expect(gate.humanVerdicts[0]?.headSha).toBe("d".repeat(40));
+    expect(gate.humanVerdicts[0]?.reason).toMatch(
+      /^reviewed by hand \[warning: recorded with allowStaleSha .*the PR head was/,
+    );
+
+    for (const signedBy of ["dev", "DEV"]) {
+      const self = await post({ ...payload, headSha: HEAD_SHA, signedBy });
+      expect(self.status).toBe(403);
+      expect(((await self.json()) as { error: string }).error).toBe("signer-is-author");
+    }
+    expect(gate.humanVerdicts).toHaveLength(1);
+  });
+
   it("explains a PR", async () => {
     expect((await fetch(`${base}/installations/42/prs/7?repo=o/r`)).status).toBe(401);
     const r = await fetch(`${base}/installations/42/prs/7?repo=o/r`, { headers: auth });

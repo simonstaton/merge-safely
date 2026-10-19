@@ -428,7 +428,7 @@ export function renderSetup(v: SetupView): string {
   if (v.spend) {
     parts.push(`<h2>Spend (this gate's ledger)</h2><table>
 <tr><td>Last ${esc(v.spend.windowDays)} days</td><td>${esc(money(v.spend.windowUsd))}</td></tr>
-<tr><td>This calendar month (UTC)</td><td>${esc(money(v.spend.monthlyUsd))}</td></tr>
+<tr><td>Monthly (rolling 30 days)</td><td>${esc(money(v.spend.monthlyUsd))}</td></tr>
 <tr><td>All time</td><td>${esc(money(v.spend.allTimeUsd))}</td></tr></table>
 <p class="muted">Enforcement uses these numbers, never the provider's own account usage.</p>`);
   }

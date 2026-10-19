@@ -125,8 +125,16 @@ export async function fetchPolicy(octokit: AppOctokit, owner: string, repo: stri
   return r.ok ? { ok: true, policy: r.policy, hash: r.hash, source: "file" } : { ok: false, errors: r.errors };
 }
 
+/** What `pulls.get` said about the PR when it was prepared (the human-verdict endpoint checks against it). */
+export interface PreparedPr {
+  /** The PR's current head commit, whatever headSha was asked for. */
+  currentHeadSha: string;
+  /** The PR author's login, when GitHub reports one. */
+  authorLogin?: string;
+}
+
 export type Prepared =
-  | {
+  | ({
       kind: "ready";
       gate: Gate;
       ref: ChangeRef;
@@ -136,8 +144,15 @@ export type Prepared =
       policyHash: string;
       policySource: "file" | "default";
       octokit: AppOctokit;
-    }
-  | { kind: "invalid-policy"; ref: ChangeRef; headSha: string; baseRef: string; errors: string[]; octokit: AppOctokit };
+    } & PreparedPr)
+  | ({
+      kind: "invalid-policy";
+      ref: ChangeRef;
+      headSha: string;
+      baseRef: string;
+      errors: string[];
+      octokit: AppOctokit;
+    } & PreparedPr);
 
 async function installationToken(octokit: AppOctokit): Promise<string | undefined> {
   const a = await octokit.auth({ type: "installation" });
@@ -213,9 +228,14 @@ export async function prepare(
   const pr = (await octokit.pulls.get({ owner, repo: name, pull_number: number })).data;
   const sha = headSha || pr.head.sha;
   const baseRef = pr.base.ref;
+  const prInfo: PreparedPr = {
+    currentHeadSha: pr.head.sha,
+    ...(pr.user?.login ? { authorLogin: pr.user.login } : {}),
+  };
 
   const fetched = await fetchPolicy(octokit, owner, name, baseRef);
-  if (!fetched.ok) return { kind: "invalid-policy", ref, headSha: sha, baseRef, errors: fetched.errors, octokit };
+  if (!fetched.ok)
+    return { kind: "invalid-policy", ref, headSha: sha, baseRef, errors: fetched.errors, octokit, ...prInfo };
 
   const policy = applyBudgetOverrides(fetched.policy, loadBudgetOverrides(deps.db, installationId, deps.logger));
   const hash = policyHash(policy);
@@ -283,6 +303,7 @@ export async function prepare(
     policyHash: hash,
     policySource: fetched.source,
     octokit,
+    ...prInfo,
   };
 }
 

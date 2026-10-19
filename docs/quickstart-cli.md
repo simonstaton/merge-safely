@@ -65,7 +65,7 @@ merge-safely run --local --base origin/main --policy .merge-safely.yml
 - Nothing is stored and nothing touches GitHub. The digest prints to stdout. Spend is still recorded in the local cost ledger.
 - Reviewers read the working tree in place through the read-only tool set.
 - If the diff exceeds 2 MB, the files past the cap are left out of what reviewers see, a warning names them, and the change is treated as tier 3 with no auto-pass.
-- Before seating, every connection is validated (15 s each). If the one the policy names is down, the run stops with `error [CONNECTION_UNREACHABLE]`; this happens even for a change triage would auto-pass.
+- Triage runs first: a change it auto-passes (docs-only, for example) validates no connection, so a dead one cannot block it. Otherwise the connections the seated panel uses are validated (15 s each) before any model call. If the one the policy names is down, the run stops with `error [CONNECTION_UNREACHABLE]`.
 - PR-only flags (`--repo`, `--pr`, `--report`, `--store`, `--head`, `--slack-webhook`, `--dry-run`) are rejected with `error [USAGE]`.
 - With no connections at all, `run --local` and `estimate --local` stop with `error [NO_CONNECTIONS]` (exit 2).
 
@@ -98,7 +98,7 @@ merge-safely explain --repo my-org/my-repo --pr 1234 --store checkrun           
 
 The token is `GITHUB_TOKEN`, then `GH_TOKEN`, then `gh auth token`. A token starting `ghs_`, or a non-PAT `GITHUB_TOKEN` inside GitHub Actions, counts as an App or Actions token; `ghp_`, `github_pat_`, `gho_` and `ghu_` tokens are user tokens. With a user token, `--report github` or `--store checkrun` prints a warning, because those need an App or Actions token.
 
-The PR is checked out as a disposable clone of the head SHA under `$MERGE_SAFELY_HOME/repos`. Before seating, `run` validates the connections it will use (15 s each) and stops with `error [CONNECTION_UNREACHABLE]` when one the policy names is down; under automatic model choice a dead connection is skipped with a warning. Ctrl-C (SIGINT or SIGTERM) cancels the review: an in-progress check run or status is completed as an interrupted failure, the checkouts are removed, and the command exits 130.
+The PR is checked out as a disposable clone of the head SHA under `$MERGE_SAFELY_HOME/repos`. Unless triage auto-passes the change, `run` validates the connections the seated panel uses (15 s each) and stops with `error [CONNECTION_UNREACHABLE]` when one the policy names is down; under automatic model choice a dead connection is skipped with a warning and the panel is re-seated without it. Ctrl-C (SIGINT or SIGTERM) cancels the review: an in-progress check run or status is completed as an interrupted failure, the checkouts are removed, and the command exits 130.
 
 `explain` prints the digest of the latest verdict for the PR from the store. It calls no model and needs no usable connection. Its exit code follows that verdict (0 pass, 1 block, 2 pending, contested or no verdict).
 

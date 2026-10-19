@@ -123,6 +123,9 @@ curl -fsS -X POST "$PUBLIC_URL/installations/123/verdict" \
   -d '{"repo":"my-org/my-repo","number":42,"headSha":"<40-char sha>","decision":"pass","reason":"verified the migration by hand","signedBy":"alice"}'
 ```
 
+`headSha` must be the PR's current head (`409 stale-head-sha` otherwise; `"allowStaleSha": true` records it anyway
+with a warning appended to the reason), and `signedBy` must not be the PR's author (`403 signer-is-author`).
+
 ## How it behaves
 
 - **Policy comes from the base branch.** `.merge-safely.yml` is read at the PR's base ref, never at the head SHA, so a
@@ -148,7 +151,7 @@ curl -fsS -X POST "$PUBLIC_URL/installations/123/verdict" \
 - **Single replica.** Run one instance per database file. Claims are IMMEDIATE transactions, but the in-process
   worker, alert latch and per-PR serialisation assume one process.
 - **Budgets.** Every ceiling is enforced by the gate at admission. Installation ceilings (rolling window, all-time,
-  monthly) are also re-evaluated at webhook intake, after each job and every minute, with edge-triggered alerts at
+  monthly over a rolling 30 days, the same window the gate uses) are also re-evaluated at webhook intake, after each job and every minute, with edge-triggered alerts at
   50/80/100% to the log and Slack. Setup-page overrides persist: empty = never configured (the repo policy or the
   default applies), `0` = explicitly disabled, any other number replaces the policy value. A corrupt stored value falls
   back to "never configured" with a logged error.

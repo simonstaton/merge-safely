@@ -151,6 +151,46 @@ describe("7. run fails fast on a dead connection", () => {
     expect(dead.calls).toHaveLength(0);
   });
 
+  it("does not validate any connection when triage auto-passes (a docs-only change with a dead connection)", async () => {
+    const dir = repo();
+    writeFileSync(join(dir, "README.md"), "# demo\n\nMore words.\n");
+    writeFileSync(join(dir, ".merge-safely.yml"), "models:\n  hunters: { connection: dead-one, model: fake-model }\n");
+    git(dir, "add", ".");
+    git(dir, "commit", "-q", "-m", "policy");
+    writeFileSync(join(dir, "README.md"), "# demo\n\nEven more words.\n");
+    const dead = tkProvider({ id: "dead", validate: { ok: false, message: "connect ECONNREFUSED 127.0.0.1:9" } });
+    const h = harness({ cwd: dir, exec: execCommand });
+    writeConnections(h.home, [{ ...fakeConn("dead-one"), provider: "dead" }]);
+    h.ctx.gateFactory = realGateFactory(() => createProviderRegistry([dead]));
+    const r = await h.run("run", "--local", "--base", "HEAD");
+    expect(r.stderr).not.toContain("CONNECTION_UNREACHABLE");
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain("triaged");
+    expect(r.stdout).toContain("docs-only change");
+    expect(dead.validated).toHaveLength(0);
+    expect(dead.calls).toHaveLength(0);
+  });
+
+  it("validates only the connections the seated panel uses", async () => {
+    const dir = repo();
+    writeFileSync(join(dir, "src.ts"), Array.from({ length: 40 }, (_, i) => `export const v${i} = ${i};`).join("\n"));
+    // dead-one lists no models, so seating never picks it: it must not be validated either.
+    const dead = tkProvider({
+      id: "dead",
+      models: [],
+      validate: { ok: false, message: "connect ECONNREFUSED 127.0.0.1:9" },
+    });
+    const live = tkProvider({ id: "fake", script: scenarios.allPass() });
+    const h = harness({ cwd: dir, exec: execCommand });
+    writeConnections(h.home, [{ ...fakeConn("dead-one"), provider: "dead" }, fakeConn("live-one")]);
+    h.ctx.gateFactory = realGateFactory(() => createProviderRegistry([dead, live]));
+    const r = await h.run("run", "--local", "--base", "main");
+    expect(r.code).toBe(0);
+    expect(dead.validated).toHaveLength(0);
+    expect(live.validated.map((c) => c.id)).toEqual(["live-one"]);
+    expect(live.calls.length).toBeGreaterThan(0);
+  });
+
   it("drops it with a warning under automatic model choice and reviews with the live one", async () => {
     const { h, live } = deadSetup();
     const r = await h.run("run", "--local", "--base", "main");
