@@ -1,0 +1,23 @@
+# Mergify: queue a PR only when the Merge Safely verdict passes on its current head SHA.
+queue_rules:
+  - name: default
+    queue_conditions:
+      - base = main
+      - -draft
+      - check-success = merge-safely/verdict
+    # merge_conditions are evaluated on the queue's own test branch or draft PR, which Merge Safely does not
+    # review. Put your CI checks here, not the verdict.
+    merge_conditions:
+      - check-success = ci
+
+pull_request_rules:
+  - name: queue when the verdict passes
+    conditions:
+      - base = main
+      - -draft
+      - check-success = merge-safely/verdict
+      # Keeps a person in charge of when to merge. Remove to queue every passing PR.
+      - label = ready-to-merge
+    actions:
+      queue:
+        name: default

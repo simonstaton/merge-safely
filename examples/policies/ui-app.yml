@@ -1,0 +1,60 @@
+# Policy for a front-end application with a design system.
+# Copy to .merge-safely.yml at the repo root.
+version: 1
+
+tiers:
+  criticalPaths:
+    - "src/layouts/**"
+    - "src/app/routes/**"
+    - "src/design-system/tokens/**"
+    - "src/auth/**"
+    - "**/payments/**"
+    - "**/feature-flags/**"
+    - ".github/workflows/**"
+    - ".merge-safely.yml"
+    - ".claude/**"
+    - ".cursor/**"
+    - ".codex/**"
+    - "**/CLAUDE.md"
+    - "**/AGENTS.md"
+  flagRemovalIsCritical: true
+  ignorePaths:
+    - "**/package-lock.json"
+    - "**/*.snap"
+    - "**/dist/**"
+    - "**/generated/**"
+    - "public/locales/**"
+
+triage:
+  docsOnlyAutoPass: true
+  assetsOnlyAutoPass: true
+
+panel:
+  t1: { hunters: [correctness, design-fidelity], judges: 1 }
+  t2: { hunters: [intent, correctness, design-fidelity, blast-radius, perf], judges: 2 }
+  t3:
+    hunters: [intent, correctness, repro, security, perf, rollout, blast-radius, design-fidelity]
+    judges: 2
+    secondJudgeRound: true
+  # Seat design-fidelity only when the change touches UI files.
+  conditionalLenses:
+    design-fidelity:
+      - "src/**/*.tsx"
+      - "src/**/*.css"
+      - "src/design-system/**"
+
+models:
+  hunters: { connection: gemini-main, model: gemini-3.5-flash }
+  judges:  { connection: anthropic-main, model: claude-opus-5-5 }
+  decorrelate: true
+
+rounds:
+  max: 3
+
+budget:
+  perChangeUsd: 15
+
+runner:
+  allowedCommands:
+    - "npm run typecheck"
+    - "npx vitest run *"

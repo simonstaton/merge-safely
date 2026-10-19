@@ -1,0 +1,36 @@
+#!/bin/sh
+# Merge Safely pre-push hook: review your changes against the base branch before they leave your machine.
+#
+# Install:
+#   cp examples/local-precommit/pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push
+# Skip once:
+#   MERGE_SAFELY_SKIP=1 git push        (or git push --no-verify)
+#
+# Needs a connection made with `merge-safely connect` (see docs/quickstart-cli.md).
+
+set -eu
+
+if [ "${MERGE_SAFELY_SKIP:-}" = "1" ]; then
+  exit 0
+fi
+
+BASE="${MERGE_SAFELY_BASE:-origin/main}"
+
+if ! git rev-parse --verify --quiet "$BASE" >/dev/null; then
+  echo "merge-safely: base ref $BASE not found; set MERGE_SAFELY_BASE. Skipping review." >&2
+  exit 0
+fi
+
+if command -v merge-safely >/dev/null 2>&1; then
+  MS="merge-safely"
+else
+  MS="npx --no-install merge-safely"
+fi
+
+echo "merge-safely: reviewing changes against $BASE ..." >&2
+if ! $MS run --local --base "$BASE"; then
+  echo "" >&2
+  echo "merge-safely: the review blocked or could not complete. Fix the findings above, or push with" >&2
+  echo "MERGE_SAFELY_SKIP=1 to skip once. The PR gate will still review the pushed commit." >&2
+  exit 1
+fi

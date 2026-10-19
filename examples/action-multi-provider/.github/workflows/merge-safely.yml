@@ -1,0 +1,29 @@
+# Two providers: hunters alternate across them, judges prefer the other one, and OpenAI covers an Anthropic outage.
+# Needs repository secrets ANTHROPIC_API_KEY and OPENAI_API_KEY, and the policy in .merge-safely.yml next to this.
+name: merge-safely
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  checks: write
+  pull-requests: write
+  contents: read
+
+concurrency:
+  group: merge-safely-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: simonstaton/merge-safely@v0
+        with:
+          policy: .merge-safely.yml
+          fail-on-block: true
+          connections: |
+            anthropic-main: { provider: anthropic, apiKey: "${{ secrets.ANTHROPIC_API_KEY }}" }
+            openai-main:    { provider: openai,    apiKey: "${{ secrets.OPENAI_API_KEY }}" }
