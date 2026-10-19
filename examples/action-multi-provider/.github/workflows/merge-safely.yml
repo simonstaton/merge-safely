@@ -1,10 +1,21 @@
 # Two providers: hunters alternate across them, judges prefer the other one, and OpenAI covers an Anthropic outage.
-# Needs repository secrets ANTHROPIC_API_KEY and OPENAI_API_KEY, and the policy in .merge-safely.yml next to this.
+# Needs repository secrets ANTHROPIC_API_KEY and OPENAI_API_KEY, and the policy in .merge-safely.yml next to this
+# (committed on the default branch: the Action reads the policy from the PR's base branch, never from the PR).
+# Also reports the required check on merge-queue commits and can be re-run by hand for any PR.
 name: merge-safely
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    # `edited` re-reviews a PR retargeted to another base branch, under that branch's policy
+    # (title and body edits are ignored).
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+  merge_group:
+    types: [checks_requested]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: PR number to review
+        required: true
 
 permissions:
   checks: write
@@ -12,8 +23,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: merge-safely-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  group: merge-safely-${{ github.event.pull_request.number || inputs.pr || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   review:
@@ -21,9 +32,13 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: simonstaton/merge-safely@v0
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         with:
           policy: .merge-safely.yml
           fail-on-block: true
+          concurrency: 2
+          pr-number: ${{ inputs.pr }}
           connections: |
             anthropic-main: { provider: anthropic, apiKey: "${{ secrets.ANTHROPIC_API_KEY }}" }
-            openai-main:    { provider: openai,    apiKey: "${{ secrets.OPENAI_API_KEY }}" }
+            openai-main:    { provider: openai,    apiKeyEnv: OPENAI_API_KEY }

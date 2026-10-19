@@ -1,7 +1,7 @@
 {
   "extends": "../../tsconfig.base.json",
-  "compilerOptions": { "rootDir": "src", "outDir": "dist" },
+  "compilerOptions": { "rootDir": "src", "outDir": "lib" },
   "include": ["src/**/*.ts"],
   "exclude": ["src/**/*.test.ts"],
-  "references": [{ "path": "../cli" }, { "path": "../core" }]
+  "references": [{ "path": "../cli" }, { "path": "../core" }, { "path": "../github" }, { "path": "../providers" }]
 }

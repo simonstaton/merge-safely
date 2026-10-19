@@ -15,7 +15,8 @@ Any supported provider works. See [connections.md](connections.md).
 name: merge-safely
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    # `edited` re-reviews a PR retargeted to another base branch (title/body edits are ignored).
+    types: [opened, synchronize, reopened, ready_for_review, edited]
 permissions:
   checks: write
   pull-requests: write
@@ -41,10 +42,18 @@ The `concurrency` block cancels a review when a newer commit arrives. The newer 
 
 | Input | Default | What it does |
 |---|---|---|
-| `connections` | required | YAML map of connection id to connection. Same fields as the connections file. See [connections.md](connections.md#the-actions-connections-input). |
-| `policy` | `.merge-safely.yml` | Path to the policy file in the repo. A missing file means all defaults. |
+| `connections` | required | YAML map of connection id to connection. Same fields as the connections file. See [connections.md](connections.md#the-actions-connections-input). Not used on `merge_group` runs. |
+| `policy` | `.merge-safely.yml` | Path to the policy file in the repo, read from the PR's **base** branch (never the PR head). A missing file means all defaults. |
 | `github-token` | `${{ github.token }}` | Token used to read the PR and write the check run and review. |
-| `fail-on-block` | `true` | Fail the job when the verdict is block. Set `false` if you only want the check run to carry the signal. |
+| `fail-on-block` | `true` | Fail the job when the verdict is block. Set `false` if you only want the check run to carry the signal. Pending, contested, error and budget-blocked always fail the job. |
+| `store` | `checkrun` | Where verdicts live. Only `checkrun` in v0.1. |
+| `slack-webhook` | none | Slack incoming-webhook URL for escalations, from a secret. |
+| `concurrency` | `2` | Reviewer seats run in parallel (1-16). |
+| `pr-number` | none | The PR to review on `workflow_dispatch`. |
+| `head-sha` | PR head | Pin the expected PR head. If the PR has moved, a `workflow_dispatch` run fails. |
+| `verdict-app-slugs` | `github-actions` | App slugs whose verdicts count in merge-queue runs and `check_run` re-runs (plus the token's own app). |
+
+Outputs: `decision`, `tier`, `round`, `cost-usd`, `check-url`, `verdict-json`. The job summary carries the digest and the cost line. Full reference: [packages/action/README.md](../packages/action/README.md).
 
 ## Permissions
 
@@ -54,7 +63,7 @@ The `concurrency` block cancels a review when a newer commit arrives. The newer 
 | `pull-requests: write` | Post the PR review and inline comments. |
 | `contents: read` | Check out the head SHA for reviewers to read. |
 
-Nothing else is needed. The `github-teams` trust provider needs to read organisation team membership, which the default `GITHUB_TOKEN` cannot do. Use the `allowlist` or `codeowners` trust provider with the Action, or the GitHub App.
+Nothing else is needed. The `github-teams` trust provider needs to read organisation team membership, which the default `GITHUB_TOKEN` cannot do. Use the `allowlist` trust provider with the Action. For `github-teams`, pass a token that can read organisation members, or use the GitHub App.
 
 ## Add a policy (optional)
 
@@ -101,7 +110,7 @@ Full workflow: [examples/action-multi-provider/](../examples/action-multi-provid
 
 The verdict check run is the verdict store, so verdicts are kept per head SHA and rounds work without a database. A new push gets a new check run on the new SHA; the old one stays attached to the old SHA.
 
-Budgets: per-seat and per-change ceilings are enforced. The monthly installation ceiling (`budget.perInstallationMonthlyUsd`) is evaluated as advisory only, because a single job cannot see spend across all your repositories. Use the GitHub App for enforced installation-wide budgets. See [budgets.md](budgets.md).
+Budgets: per-seat and per-change ceilings are enforced. The rolling-window (`budget.windowUsd`), all-time (`budget.spendLimitUsd`) and monthly (`budget.perInstallationMonthlyUsd`) ceilings are advisory only. A single job cannot see spend across jobs and repositories, so the Action reports them, never blocks on them, and logs a warning when any of them is set. Use the GitHub App for enforced installation-wide budgets. See [budgets.md](budgets.md).
 
 ## When the key is wrong
 
@@ -109,7 +118,11 @@ The Action validates each connection before seating. A bad or empty key fails th
 
 ## Fork PRs
 
-On `pull_request` events from forks, GitHub does not expose repository secrets, so the review cannot reach a model and will fail validation. Do not switch to `pull_request_target` without reading [security.md](security.md#fork-prs-and-pull_request_target).
+On `pull_request` events from forks, GitHub does not expose repository secrets and the token is read-only, so the Action stops early with an explanation instead of failing validation. To review fork PRs, switch to `pull_request_target`, but read [security.md](security.md#fork-prs-and-pull_request_target) first. On that event the Action reads the policy from the base branch and ignores `runner.allowedCommands` on fork PRs (it warns and runs with none), so the fork's code is read but never executed.
+
+## Merge queue
+
+Add `merge_group: { types: [checks_requested] }` to the triggers. On the queue commit the Action makes no model calls. It checks that each queued PR has a `pass` verdict on its current head and reports `merge-safely/verdict` on the queue commit to match. See [packages/action/README.md](../packages/action/README.md#merge-queue).
 
 ## Limits
 

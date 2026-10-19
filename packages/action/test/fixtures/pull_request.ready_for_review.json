@@ -1,0 +1,83 @@
+{
+  "action": "ready_for_review",
+  "number": 7,
+  "pull_request": {
+    "url": "https://api.github.com/repos/acme/app/pulls/7",
+    "id": 700,
+    "number": 7,
+    "state": "open",
+    "title": "Add retry",
+    "body": "Please merge",
+    "draft": false,
+    "user": {
+      "login": "dev",
+      "id": 12,
+      "type": "User"
+    },
+    "html_url": "https://github.com/acme/app/pull/7",
+    "head": {
+      "label": "x:feature",
+      "ref": "feature",
+      "sha": "1111111111111111111111111111111111111111",
+      "repo": {
+        "id": 1,
+        "name": "app",
+        "full_name": "acme/app",
+        "private": false,
+        "owner": {
+          "login": "acme",
+          "id": 10,
+          "type": "Organization"
+        },
+        "html_url": "https://github.com/acme/app",
+        "default_branch": "main"
+      },
+      "user": {
+        "login": "dev"
+      }
+    },
+    "base": {
+      "label": "acme:main",
+      "ref": "main",
+      "sha": "2222222222222222222222222222222222222222",
+      "repo": {
+        "id": 1,
+        "name": "app",
+        "full_name": "acme/app",
+        "private": false,
+        "owner": {
+          "login": "acme",
+          "id": 10,
+          "type": "Organization"
+        },
+        "html_url": "https://github.com/acme/app",
+        "default_branch": "main"
+      },
+      "user": {
+        "login": "acme"
+      }
+    },
+    "labels": [],
+    "additions": 10,
+    "deletions": 2,
+    "changed_files": 1
+  },
+  "repository": {
+    "id": 1,
+    "name": "app",
+    "full_name": "acme/app",
+    "private": false,
+    "owner": {
+      "login": "acme",
+      "id": 10,
+      "type": "Organization"
+    },
+    "html_url": "https://github.com/acme/app",
+    "default_branch": "main"
+  },
+  "sender": {
+    "login": "dev",
+    "id": 12,
+    "type": "User"
+  }
+}

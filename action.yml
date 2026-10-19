@@ -1,0 +1,75 @@
+name: Merge Safely
+description: >-
+  Adversarial, risk-tiered, model-agnostic AI code review gate. Reviews each PR head with your own model keys and
+  publishes a commit-pinned merge-safely/verdict check run that merge rules and merge queues can require.
+author: Simon Staton
+branding:
+  icon: shield
+  color: green
+
+inputs:
+  connections:
+    description: >-
+      YAML map of connection id to connection, e.g.
+      `anthropic-main: { provider: anthropic, apiKey: "${{ secrets.ANTHROPIC_API_KEY }}" }`.
+      Same fields as the CLI connections file; `apiKeyEnv: NAME` reads a step `env:` value instead.
+      Not used on merge_group runs.
+    required: true
+  policy:
+    description: >-
+      Path of the policy file in the repository. It is read from the PR's base branch, never from the PR head.
+      A missing file means the defaults.
+    required: false
+    default: .merge-safely.yml
+  github-token:
+    description: Token used to read the PR and write the check run and PR review. Needs checks and pull-requests write.
+    required: false
+    default: ${{ github.token }}
+  fail-on-block:
+    description: Fail the job when the verdict is block. With false, only the check run carries the signal.
+    required: false
+    default: "true"
+  store:
+    description: Where verdicts are stored. Only `checkrun` (the verdict lives in the check run) in v0.1.
+    required: false
+    default: checkrun
+  slack-webhook:
+    description: Optional Slack incoming-webhook URL for escalations. Pass it from a secret.
+    required: false
+  concurrency:
+    description: How many reviewer seats run in parallel (1-16).
+    required: false
+    default: "2"
+  pr-number:
+    description: The PR to review on workflow_dispatch runs.
+    required: false
+  head-sha:
+    description: >-
+      Pin the expected PR head (full SHA). The review runs only if it is still the head; on workflow_dispatch a
+      mismatch fails with an explanation. Verdicts are bound to the PR head, so older commits cannot be reviewed.
+    required: false
+  verdict-app-slugs:
+    description: >-
+      Comma-separated GitHub App slugs whose merge-safely check runs count as verdicts in merge-queue runs and as
+      trusted check_run re-runs. The slug of this token's own app is always included. Set it to your App's slug
+      (e.g. merge-safely) when the App reviews PRs and this Action only handles merge_group.
+    required: false
+    default: github-actions
+
+outputs:
+  decision:
+    description: "pass, block, pending, contested, error or budget-blocked; skipped when the event needs no review."
+  tier:
+    description: Risk tier (0-3) the change was reviewed at.
+  round:
+    description: Review round for this PR.
+  cost-usd:
+    description: Model spend for this review in US dollars (empty when unpriced).
+  check-url:
+    description: URL of the merge-safely/verdict check run.
+  verdict-json:
+    description: Compact verdict as JSON (decision, tier, round, findings, quorum, cost, policy hash).
+
+runs:
+  using: node20
+  main: packages/action/dist/index.js
