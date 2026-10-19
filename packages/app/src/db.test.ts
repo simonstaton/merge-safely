@@ -174,8 +174,10 @@ describe("jobs", () => {
     expect(db.claimNext()).toBeUndefined(); // PR 7's newer job waits for the running one
     db.close();
     const reboot = new AppDb({ path, masterKey: TEST_MASTER_KEY });
-    expect(reboot.requeueInterrupted()).toBe(2);
-    expect(reboot.getJob(first?.id ?? 0)?.state).toBe("queued");
+    expect(reboot.requeueInterrupted()).toMatchObject({ requeued: 1, superseded: 1, failed: [] });
+    // PR 7's running job was superseded by sha d: it is not re-reviewed after the reboot.
+    expect(reboot.getJob(first?.id ?? 0)?.state).toBe("superseded");
+    expect(reboot.getJob(second?.id ?? 0)?.state).toBe("queued");
     reboot.close();
   });
 

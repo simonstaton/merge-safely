@@ -4,7 +4,7 @@
  */
 import { createHmac } from "node:crypto";
 import type { HumanDigest, Tier, Verdict } from "@merge-safely/core";
-import type { CheckRunData } from "@merge-safely/github";
+import type { CheckRunData, PullFileData } from "@merge-safely/github";
 import type { AppConfig } from "./config.js";
 import type { Gate, GateDeps, GateFactory, HumanVerdictInput } from "./gate.js";
 import type { AppOctokit } from "./run-job.js";
@@ -27,6 +27,7 @@ export function testConfig(dataDir: string, over: Partial<AppConfig> = {}): AppC
     setupToken: TEST_SETUP_TOKEN,
     concurrency: 2,
     logLevel: "error",
+    shutdownDeadlineMs: 1000,
     publicUrl: "https://gate.example.com",
     ...over,
   };
@@ -42,6 +43,9 @@ export interface FakeOctokitOptions {
   headSha?: string;
   baseRef?: string;
   token?: string;
+  /** PR files (pulls.listFiles) and the unified diff compare returns. */
+  files?: PullFileData[];
+  diff?: string;
 }
 
 export interface Call {
@@ -81,12 +85,14 @@ export function fakeOctokit(opts: FakeOctokitOptions = {}): AppOctokit & { calls
           labels: [],
           head: { sha: opts.headSha ?? HEAD_SHA, ref: "feature", repo: { full_name: "o/r" } },
           base: { sha: BASE_SHA, ref: opts.baseRef ?? "main", repo: { full_name: "o/r" } },
-          additions: 1,
-          deletions: 0,
-          changed_files: 1,
+          additions: (opts.files ?? []).reduce((n, f) => n + f.additions, 0) || 1,
+          deletions: (opts.files ?? []).reduce((n, f) => n + f.deletions, 0),
+          changed_files: (opts.files ?? []).length || 1,
         },
       })),
-      listFiles: rec("pulls.listFiles", () => ({ data: [] })),
+      listFiles: rec("pulls.listFiles", (p: { page?: number }) => ({
+        data: (p.page ?? 1) === 1 ? (opts.files ?? []) : [],
+      })),
       listCommits: rec("pulls.listCommits", () => ({ data: [] })),
       listReviews: rec("pulls.listReviews", () => ({ data: [] })),
       listReviewComments: rec("pulls.listReviewComments", () => ({ data: [] })),
@@ -102,7 +108,11 @@ export function fakeOctokit(opts: FakeOctokitOptions = {}): AppOctokit & { calls
       },
       createCommitStatus: rec("repos.createCommitStatus", () => ok),
       getCombinedStatusForRef: rec("repos.getCombinedStatusForRef", () => ({ data: { statuses: [] } })),
-      compareCommitsWithBasehead: rec("repos.compareCommitsWithBasehead", () => ({ data: { files: [] } })),
+      compareCommitsWithBasehead: rec(
+        "repos.compareCommitsWithBasehead",
+        (p: { mediaType?: { format?: string } }): { data: unknown } =>
+          p.mediaType?.format === "diff" ? { data: opts.diff ?? "" } : { data: { files: opts.files ?? [] } },
+      ),
     },
     checks: {
       listForRef: rec("checks.listForRef", () => ({ data: { total_count: checkRuns.length, check_runs: checkRuns } })),
@@ -190,7 +200,13 @@ export function recordingGate(): RecordingGate {
         async review(ref, opts) {
           g.reviews.push({ ref, opts });
           const verdict = await g.review(g.reviews.length);
-          return { verdict, digest: DIGEST };
+          return { verdict, digest: DIGEST, events: [] };
+        },
+        async reviewChange() {
+          throw new Error("recording gate: reviewChange is not used by the App");
+        },
+        async estimate() {
+          throw new Error("recording gate: estimate is not used by the App");
         },
         async explain() {
           return { verdict: fakeVerdict(), digest: DIGEST, history: [fakeVerdict()] };

@@ -1,6 +1,8 @@
 # Merge Safely self-hosted GitHub App.
 #   cp .env.example .env && $EDITOR .env      # fill in the App id, secrets and master key
 #   cp ~/Downloads/<app>.private-key.pem ./github-app.pem
+#   chmod 0644 github-app.pem   # or: sudo chown 1000 github-app.pem && chmod 0600 github-app.pem
+#                               # (the container runs as uid 1000 and must be able to read the key)
 #   docker compose up -d --build
 #   curl -fsS http://127.0.0.1:8080/healthz
 # Put a TLS-terminating reverse proxy in front. Only /webhooks/github needs to be reachable from GitHub.

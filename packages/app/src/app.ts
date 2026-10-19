@@ -5,7 +5,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { ToolExecutorFactory, Workspace } from "@merge-safely/core";
 import type { FetchLike } from "@merge-safely/escalation-slack";
-import { createAppOctokit } from "@merge-safely/github";
 import type { ProviderRegistry } from "@merge-safely/providers";
 import { type SqliteStores, sqliteStores } from "@merge-safely/store-sqlite";
 import type { LocalWorkspaceOptions } from "@merge-safely/workspace-local";
@@ -15,11 +14,20 @@ import { CatalogCache } from "./catalog-cache.js";
 import { type AppConfig, configSecrets } from "./config.js";
 import { AppDb } from "./db.js";
 import { defaultGateFactory, type GateFactory } from "./gate.js";
+import { installationClient, listAppInstallations } from "./github-client.js";
 import { send, sendJson } from "./http.js";
 import { type AppLogger, createLogger, errText, SecretSet } from "./logger.js";
 import { MetricsRegistry } from "./metrics.js";
 import { Worker, type WorkerOptions } from "./queue.js";
-import { type AppOctokit, failureCheckRun, type PipelineDeps, prepare, runJob, splitRepo } from "./run-job.js";
+import {
+  type AppOctokit,
+  failureCheckRun,
+  type PipelineDeps,
+  prepare,
+  purgeInstallationFiles,
+  runJob,
+  splitRepo,
+} from "./run-job.js";
 import { loadBudgetOverrides } from "./settings.js";
 import { setupHandler } from "./setup.js";
 import { webhookHandler } from "./webhooks.js";
@@ -30,6 +38,11 @@ export interface CreateAppOptions {
   logger?: AppLogger;
   secrets?: SecretSet;
   octokitFor?: (installationId: number) => AppOctokit;
+  /**
+   * Boot-time sync of the App's installations from GitHub (so installs made before this service first ran appear).
+   * Default: on with the real client, off when `octokitFor` is injected. `false` disables it.
+   */
+  syncInstallations?: false | (() => Promise<{ id: number; account: string }[]>);
   gateFactory?: GateFactory;
   registry?: ProviderRegistry;
   workspaceFactory?: (opts: LocalWorkspaceOptions) => Workspace;
@@ -47,7 +60,7 @@ export interface App {
   metrics: MetricsRegistry;
   logger: AppLogger;
   /** Start the worker loop (re-queues interrupted jobs first). Does not listen. */
-  start(): void;
+  start(): Promise<void>;
   listen(port: number, host?: string): Promise<number>;
   /** Graceful shutdown: stop accepting, finish running jobs up to the deadline, close the databases. */
   close(deadlineMs?: number): Promise<number>;
@@ -65,7 +78,7 @@ function githubHost(apiUrl: string | undefined): string {
 export function createApp(opts: CreateAppOptions): App {
   const { config } = opts;
   const secrets = opts.secrets ?? new SecretSet();
-  secrets.add(...configSecrets(config));
+  secrets.addLongLived(...configSecrets(config));
   const logger = opts.logger ?? createLogger({ level: config.logLevel, secrets });
   const now = opts.now ?? (() => new Date());
   const db = new AppDb({ path: config.dbPath, masterKey: config.masterKey, now });
@@ -74,15 +87,17 @@ export function createApp(opts: CreateAppOptions): App {
   const registry = opts.registry ?? defaultRegistry();
   const catalogCache = new CatalogCache(registry);
 
-  const octokitFor =
-    opts.octokitFor ??
-    ((installationId: number) =>
-      createAppOctokit({
-        appId: config.appId,
-        privateKey: config.privateKey,
-        installationId,
-        ...(config.githubApiUrl ? { baseUrl: config.githubApiUrl } : {}),
-      }) as unknown as AppOctokit);
+  const clientOpts = {
+    appId: config.appId,
+    privateKey: config.privateKey,
+    logger,
+    ...(config.githubApiUrl ? { baseUrl: config.githubApiUrl } : {}),
+  };
+  const octokitFor = opts.octokitFor ?? ((installationId: number) => installationClient(clientOpts, installationId));
+  const syncInstallations =
+    opts.syncInstallations === false
+      ? undefined
+      : (opts.syncInstallations ?? (opts.octokitFor ? undefined : () => listAppInstallations(clientOpts)));
 
   const pipeline: PipelineDeps = {
     config: {
@@ -155,6 +170,13 @@ export function createApp(opts: CreateAppOptions): App {
     metrics,
     wake: () => worker.pump(),
     onIntake: (id: number) => evaluateInstallation(alertDeps, id),
+    onUninstall: (id: number) => {
+      catalogCache.invalidate(id);
+      void purgeInstallationFiles(config.dataDir, id, logger);
+    },
+    onReposRemoved: (id: number, repos: string[]) => {
+      void purgeInstallationFiles(config.dataDir, id, logger, repos);
+    },
   };
   const setupDeps = {
     db,
@@ -171,7 +193,7 @@ export function createApp(opts: CreateAppOptions): App {
     setupToken: config.setupToken,
     logger,
     secrets,
-    prepare: (i: number, r: string, n: number, sha?: string) => prepare(pipeline, i, r, n, sha),
+    prepare: (i: number, r: string, n: number, sha?: string) => prepare(pipeline, i, r, n, sha, { light: true }),
   };
 
   async function renderMetrics(): Promise<string> {
@@ -238,8 +260,20 @@ export function createApp(opts: CreateAppOptions): App {
     stores,
     metrics,
     logger,
-    start() {
-      // Survives restarts: validate persisted ceilings and latches up front (bad values are logged, not fatal).
+    async start() {
+      if (syncInstallations) {
+        try {
+          const found = await syncInstallations();
+          let added = 0;
+          for (const i of found) if (db.addInstallationIfUnknown(i.id, i.account)) added++;
+          logger.info("synced installations from GitHub", { found: found.length, added });
+        } catch (err: unknown) {
+          logger.warn("could not list the App's installations; relying on installation webhooks", {
+            error: errText(err),
+          });
+        }
+      }
+      // Survives restarts: validate persisted ceilings up front (bad values are logged, not fatal).
       for (const inst of db.listInstallations()) loadBudgetOverrides(db, inst.id, logger);
       worker.start();
     },

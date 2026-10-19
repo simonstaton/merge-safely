@@ -5,6 +5,7 @@
  * The policy is read from the base ref, never from the head SHA: a PR (especially from a fork, or delivered as
  * pull_request_target) must not be able to loosen its own review by editing `.merge-safely.yml`.
  */
+import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import {
   type ChangeRef,
@@ -133,6 +134,7 @@ export type Prepared =
       baseRef: string;
       policy: Policy;
       policyHash: string;
+      policySource: "file" | "default";
       octokit: AppOctokit;
     }
   | { kind: "invalid-policy"; ref: ChangeRef; headSha: string; baseRef: string; errors: string[]; octokit: AppOctokit };
@@ -147,15 +149,53 @@ async function installationToken(octokit: AppOctokit): Promise<string | undefine
 
 const safeSegment = (s: string) => s.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 80) || "_";
 
-export function detailsUrl(
-  publicUrl: string | undefined,
+export const mirrorDir = (dataDir: string, installationId: number, owner?: string, name?: string): string =>
+  owner && name
+    ? join(dataDir, "repos", String(installationId), `${safeSegment(owner)}__${safeSegment(name)}.git`)
+    : join(dataDir, "repos", String(installationId));
+export const worktreeDir = (dataDir: string, installationId: number): string =>
+  join(dataDir, "worktrees", String(installationId));
+
+/**
+ * Remove cloned source for an uninstalled installation (all of it) or for repositories removed from it. Best effort:
+ * failures are logged, never thrown.
+ */
+export async function purgeInstallationFiles(
+  dataDir: string,
   installationId: number,
-  repo: string,
-  number: number,
-): string | undefined {
-  return publicUrl
-    ? `${publicUrl}/installations/${installationId}/prs/${number}?repo=${encodeURIComponent(repo)}`
-    : undefined;
+  logger: AppLogger,
+  repos?: string[],
+): Promise<string[]> {
+  const targets =
+    repos === undefined
+      ? [mirrorDir(dataDir, installationId), worktreeDir(dataDir, installationId)]
+      : repos.map((r) => {
+          const { owner, name } = splitRepo(r);
+          return mirrorDir(dataDir, installationId, owner, name);
+        });
+  const removed: string[] = [];
+  for (const t of targets) {
+    try {
+      await rm(t, { recursive: true, force: true });
+      removed.push(t);
+    } catch (err: unknown) {
+      logger.warn("could not remove cloned source", {
+        installationId,
+        path: t,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  if (removed.length > 0) logger.info("removed cloned source", { installationId, paths: removed.length });
+  return removed;
+}
+
+export interface PrepareOptions {
+  /**
+   * Read-only use (explain, human verdict): no installation token is minted, no clone is ever made, and the model
+   * catalog is taken from the cache only (no provider calls).
+   */
+  light?: boolean;
 }
 
 /** Build everything a review of one PR needs. `headSha` empty or undefined means "the PR's current head". */
@@ -165,6 +205,7 @@ export async function prepare(
   repoFull: string,
   number: number,
   headSha?: string,
+  opts: PrepareOptions = {},
 ): Promise<Prepared> {
   const { owner, name } = splitRepo(repoFull);
   const ref: ChangeRef = { repo: { host: deps.config.githubHost, owner, name }, number };
@@ -183,28 +224,26 @@ export async function prepare(
   for (const c of connections) deps.secrets.add(...secretValues(c.secret));
   for (const p of problems)
     deps.logger.error("connection unavailable", { installationId, connection: p.id, error: p.message });
-  const catalog = await deps.catalogCache.get(installationId, connections);
+  const catalog = opts.light
+    ? (deps.catalogCache.peek(installationId) ?? { byConnection: new Map(), problems: [] })
+    : await deps.catalogCache.get(installationId, connections);
   for (const p of catalog.problems) {
     deps.logger.warn("connection catalog problem", { installationId, connection: p.connectionId, error: p.message });
   }
 
-  const token = await installationToken(octokit);
+  const token = opts.light ? undefined : await installationToken(octokit);
   deps.secrets.add(token);
   const wsOpts: LocalWorkspaceOptions = {
     cloneUrl: `https://${deps.config.githubHost}/${owner}/${name}.git`,
-    cacheDir: join(
-      deps.config.dataDir,
-      "repos",
-      String(installationId),
-      `${safeSegment(owner)}__${safeSegment(name)}.git`,
-    ),
-    worktreeRoot: join(deps.config.dataDir, "worktrees"),
+    cacheDir: mirrorDir(deps.config.dataDir, installationId, owner, name),
+    worktreeRoot: worktreeDir(deps.config.dataDir, installationId),
   };
   if (token) wsOpts.token = token; // sent as an http.extraheader by the workspace, never in the URL
   const workspace = (deps.workspaceFactory ?? localWorkspace)(wsOpts);
 
-  const link = detailsUrl(deps.config.publicUrl, installationId, repoFull, number);
-  const reporters: Reporter[] = [checkRunReporter({ octokit, policy, ...(link ? { detailsUrl: link } : {}) })];
+  // No detailsUrl: the bearer-protected admin endpoint would 401 for anyone clicking "Details" on GitHub, so the
+  // reporter's default (the PR) is used.
+  const reporters: Reporter[] = [checkRunReporter({ octokit, policy })];
   if (policy.reporting.postPrReview) reporters.push(prReviewReporter({ octokit, policy }));
   const slack = deps.config.slackWebhookUrl;
   if (slack) reporters.push(slackReporter({ webhookUrl: slack, logger: deps.logger }));
@@ -234,7 +273,17 @@ export async function prepare(
     producedBy: PRODUCED_BY,
     ...(deps.config.concurrency ? { concurrency: deps.config.concurrency } : {}),
   });
-  return { kind: "ready", gate, ref, headSha: sha, baseRef, policy, policyHash: hash, octokit };
+  return {
+    kind: "ready",
+    gate,
+    ref,
+    headSha: sha,
+    baseRef,
+    policy,
+    policyHash: hash,
+    policySource: fetched.source,
+    octokit,
+  };
 }
 
 /** Write (or update) a failed `merge-safely/verdict` check run with a message. Used when the gate never ran. */
@@ -295,7 +344,7 @@ export async function runJob(deps: PipelineDeps, job: JobRow): Promise<JobOutcom
   const prep = await prepare(deps, job.installation_id, job.repo, job.number, job.head_sha);
   const { owner, name } = splitRepo(job.repo);
   if (prep.kind === "invalid-policy") {
-    deps.db.annotateJob(job.id, { baseRef: prep.baseRef });
+    deps.db.annotateJob(job.id, { baseRef: prep.baseRef, policySource: "invalid" });
     deps.logger.warn("invalid policy; failing the check without a review", {
       jobId: job.id,
       repo: job.repo,
@@ -315,8 +364,9 @@ export async function runJob(deps: PipelineDeps, job: JobRow): Promise<JobOutcom
     });
     return { outcome: "invalid-policy" };
   }
-  deps.db.annotateJob(job.id, { baseRef: prep.baseRef, policyHash: prep.policyHash });
-  const result = await prep.gate.review(prep.ref, { headSha: prep.headSha, trigger: job.event });
+  deps.db.annotateJob(job.id, { baseRef: prep.baseRef, policyHash: prep.policyHash, policySource: prep.policySource });
+  // A retarget passes trigger "base-changed" so the gate runs a fresh, full review under the new base's policy.
+  const result = await prep.gate.review(prep.ref, { headSha: prep.headSha, trigger: job.trigger ?? job.event });
   const v = result.verdict;
   deps.metrics.inc("merge_safely_verdicts_total", "Verdicts produced, by decision and tier", {
     decision: v.decision,

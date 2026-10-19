@@ -85,7 +85,8 @@ async function boot(policies: Record<string, string> = {}) {
     }),
     worker: { pollMs: 5, backoffBaseMs: 1 },
   });
-  app.start();
+  app.db.upsertInstallation(42, "acme");
+  await app.start();
   const port = await app.listen(0, "127.0.0.1");
   base = `http://127.0.0.1:${port}`;
 }
@@ -253,7 +254,7 @@ describe("run-job pipeline", () => {
     app.db.upsertInstallation(42, "acme");
     app.db.setSetting(42, "budget.windowUsd", 0);
     app.db.setSetting(42, "budget.spendLimitUsd", 50);
-    app.start();
+    await app.start();
     const id = app.db.enqueue({ installationId: 42, repo: "o/r", number: 7, headSha: HEAD_SHA, event: "test" }).id;
     app.worker.pump();
     await until(() => app.db.getJob(id)?.state === "done");
@@ -261,6 +262,7 @@ describe("run-job pipeline", () => {
     expect(wsOpts.cloneUrl).toBe("https://github.com/o/r.git");
     expect(wsOpts.token).toMatch(/^ghs_/);
     expect(String(wsOpts.cacheDir)).toContain(join(dir, "repos", "42"));
+    expect(String(wsOpts.worktreeRoot)).toBe(join(dir, "worktrees", "42"));
   });
 
   it("a failing gate is retried and finally reported on the check run, with secrets scrubbed from logs", async () => {

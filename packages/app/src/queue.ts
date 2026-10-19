@@ -53,13 +53,46 @@ export function classifyError(err: unknown): Classification {
     default:
       break;
   }
-  if (typeof err === "object" && err !== null && "name" in err && err.name === "GateUnavailableError") return "fail";
-  if (typeof err === "object" && err !== null && "status" in err) {
-    const status = (err as { status: unknown }).status;
-    // 4xx from GitHub (other than rate limits) will not get better by retrying.
-    if (typeof status === "number" && status >= 400 && status < 500 && status !== 403 && status !== 429) return "fail";
-  }
+  const status = statusOf(err);
+  if (status === 403) return isRateLimited(err) ? "retry" : "fail"; // permissions / suspended installation
+  // Other 4xx from GitHub (except 429) will not get better by retrying.
+  if (status !== undefined && status >= 400 && status < 500 && status !== 429) return "fail";
   return "retry";
+}
+
+function statusOf(err: unknown): number | undefined {
+  if (typeof err !== "object" || err === null || !("status" in err)) return undefined;
+  const s = (err as { status: unknown }).status;
+  return typeof s === "number" ? s : undefined;
+}
+
+function headersOf(err: unknown): Record<string, unknown> {
+  if (typeof err !== "object" || err === null || !("response" in err)) return {};
+  const r = (err as { response: unknown }).response;
+  if (typeof r !== "object" || r === null || !("headers" in r)) return {};
+  const h = (r as { headers: unknown }).headers;
+  return typeof h === "object" && h !== null ? (h as Record<string, unknown>) : {};
+}
+
+/** A 403 that is really rate limiting: x-ratelimit-remaining 0, a retry-after header, or the secondary limit text. */
+export function isRateLimited(err: unknown): boolean {
+  const h = headersOf(err);
+  if (String(h["x-ratelimit-remaining"] ?? "") === "0") return true;
+  if (h["retry-after"] !== undefined) return true;
+  const msg = err instanceof Error ? err.message : "";
+  return /secondary rate limit|rate limit exceeded|abuse detection/i.test(msg);
+}
+
+/** Delay GitHub asked for (retry-after seconds, or until x-ratelimit-reset), capped at 15 minutes. */
+export function retryAfterMs(err: unknown, now = Date.now()): number | undefined {
+  const h = headersOf(err);
+  const ra = Number(h["retry-after"]);
+  if (Number.isFinite(ra) && ra >= 0) return Math.min(ra * 1000, 15 * 60_000);
+  if (String(h["x-ratelimit-remaining"] ?? "") === "0") {
+    const reset = Number(h["x-ratelimit-reset"]);
+    if (Number.isFinite(reset)) return Math.min(Math.max(reset * 1000 - now, 1000), 15 * 60_000);
+  }
+  return undefined;
 }
 
 export function backoffMs(base: number, attempt: number): number {
@@ -72,6 +105,9 @@ export class Worker {
   private tickTimer: NodeJS.Timeout | undefined;
   private stopping = false;
   private started = false;
+  private ticking = false;
+  private pausedUntil = 0;
+  private pumpFailures = 0;
   private readonly concurrency: number;
   private readonly pollMs: number;
   private readonly backoffBaseMs: number;
@@ -86,12 +122,33 @@ export class Worker {
     this.tickMs = opts.tickMs ?? 60_000;
   }
 
-  /** Boot: re-queue interrupted jobs, then start polling and ticking. */
+  /** Boot: recover interrupted jobs (crash-loop guarded), then start polling and ticking. */
   start(): void {
     if (this.started) return;
     this.started = true;
-    const n = this.opts.db.requeueInterrupted();
-    if (n > 0) this.opts.logger.info("re-queued jobs interrupted by a restart", { count: n });
+    const r = this.opts.db.requeueInterrupted();
+    if (r.requeued + r.superseded + r.failed.length > 0) {
+      this.opts.logger.info("recovered jobs interrupted by a restart", {
+        requeued: r.requeued,
+        superseded: r.superseded,
+        failed: r.failed.length,
+      });
+    }
+    for (const job of r.failed) {
+      this.count("failed");
+      this.opts.logger.error("job crashed the service repeatedly; marked failed", {
+        jobId: job.id,
+        attempts: job.attempts,
+      });
+      this.opts
+        .onFinalFailure?.(
+          job,
+          `the review crashed the service repeatedly (${job.attempts} attempts) and was not retried`,
+        )
+        .catch((err: unknown) =>
+          this.opts.logger.warn("could not report the crash on the check run", { error: errText(err) }),
+        );
+    }
     this.pollTimer = setInterval(() => this.pump(), this.pollMs);
     this.tickTimer = setInterval(() => void this.tick(), this.tickMs);
     this.pump();
@@ -103,8 +160,20 @@ export class Worker {
 
   /** Claim and start as many jobs as capacity allows. Safe to call any time (the webhook calls it on enqueue). */
   pump(): void {
+    if (Date.now() < this.pausedUntil) return;
     while (!this.stopping && this.running.size < this.concurrency) {
-      const job = this.opts.db.claimNext();
+      let job: JobRow | undefined;
+      try {
+        job = this.opts.db.claimNext();
+        this.pumpFailures = 0;
+      } catch (err: unknown) {
+        // SQLITE_BUSY / SQLITE_FULL etc.: back off instead of crashing the process from a timer.
+        this.pumpFailures++;
+        const delay = Math.min(this.pollMs * 2 ** this.pumpFailures, 30_000);
+        this.pausedUntil = Date.now() + delay;
+        this.opts.logger.error("could not claim a job; backing off", { error: errText(err), retryInMs: delay });
+        return;
+      }
       if (!job) return;
       const p = this.execute(job)
         .catch((err: unknown) =>
@@ -121,12 +190,16 @@ export class Worker {
   }
 
   async tick(): Promise<void> {
+    if (this.ticking) return; // a slow tick (Slack, ledger) never overlaps the next one
+    this.ticking = true;
     try {
       this.opts.db.pruneDeliveries(7 * 24 * 60 * 60 * 1000);
       this.opts.db.pruneJobs(30 * 24 * 60 * 60 * 1000);
       await this.opts.onTick?.();
     } catch (err: unknown) {
       this.opts.logger.error("tick failed", { error: errText(err) });
+    } finally {
+      this.ticking = false;
     }
   }
 
@@ -148,7 +221,7 @@ export class Worker {
         this.count("superseded");
         log.info("job superseded", { error: message });
       } else if (cls === "retry" && job.attempts <= this.maxRetries && !this.stopping) {
-        const delay = backoffMs(this.backoffBaseMs, job.attempts);
+        const delay = retryAfterMs(err) ?? backoffMs(this.backoffBaseMs, job.attempts);
         this.opts.db.retryJob(job.id, delay, message);
         this.opts.metrics.inc("merge_safely_job_retries_total", "Job attempts that will be retried");
         log.warn("job failed; will retry", { error: message, retryInMs: delay });

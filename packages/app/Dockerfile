@@ -1,7 +1,9 @@
 # syntax=docker/dockerfile:1.6
 # Merge Safely self-hosted GitHub App. Build from the repository root:
 #   docker build -f packages/app/Dockerfile -t merge-safely-app .
-# (packages/app/Dockerfile.dockerignore keeps host node_modules and build output out of the context.)
+# The root .dockerignore (honoured by every builder) and packages/app/Dockerfile.dockerignore (BuildKit) keep
+# node_modules, build output, .env files and *.pem keys out of the context. The runtime stage additionally copies
+# only each package's package.json and dist/, never sources or anything else that was in the context.
 
 FROM node:20-slim AS build
 WORKDIR /src
@@ -10,7 +12,11 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends python3 make g++ ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 COPY . .
-RUN npm ci && npm run build && npm prune --omit=dev
+RUN npm ci && npm run build && npm prune --omit=dev \
+  && mkdir /out \
+  && for d in packages/*/; do \
+       mkdir -p "/out/$d" && cp "$d/package.json" "/out/$d/" && if [ -d "$d/dist" ]; then cp -r "$d/dist" "/out/$d/"; fi; \
+     done
 
 FROM node:20-slim AS runtime
 # git: reviewers get a disposable checkout of the head SHA. ripgrep: faster read-only search tool.
@@ -23,8 +29,9 @@ ENV NODE_ENV=production \
 WORKDIR /app
 COPY --from=build --chown=root:root /src/package.json /src/package-lock.json ./
 COPY --from=build --chown=root:root /src/node_modules ./node_modules
-COPY --from=build --chown=root:root /src/packages ./packages
+COPY --from=build --chown=root:root /out/packages ./packages
 RUN mkdir -p /data && chown node:node /data && chmod 0700 /data
+# Runs as the image's `node` user (uid 1000): a mounted key file must be readable by uid 1000.
 USER node
 VOLUME ["/data"]
 EXPOSE 8080

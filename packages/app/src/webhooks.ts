@@ -18,6 +18,10 @@ export interface WebhookDeps {
   /** Admission-time budget evaluation for the installation (fire and forget). */
   onIntake?: (installationId: number) => Promise<unknown>;
   triggerLabels?: string[];
+  /** Remove cloned source after an uninstall (best effort, async). */
+  onUninstall?: (installationId: number) => void;
+  /** Remove mirrors of repositories removed from an installation (best effort, async). */
+  onReposRemoved?: (installationId: number, repos: string[]) => void;
 }
 
 export interface WebhookResult {
@@ -34,9 +38,23 @@ function installationOf(payload: Record<string, unknown>): { id: number; account
   return account ? { id: inst.id, account } : { id: inst.id };
 }
 
-function repoOwner(payload: Record<string, unknown>): string | undefined {
+function repoFullNames(x: unknown): string[] {
+  if (!Array.isArray(x)) return [];
+  return x
+    .map((r) => (isObj(r) && typeof r.full_name === "string" ? r.full_name : undefined))
+    .filter((r): r is string => r !== undefined && /^[^/\s]+\/[^/\s]+$/.test(r));
+}
+
+function prBaseRef(payload: Record<string, unknown>): string | undefined {
+  const pr = payload.pull_request;
+  if (!isObj(pr) || !isObj(pr.base)) return undefined;
+  return typeof pr.base.ref === "string" && pr.base.ref !== "" ? pr.base.ref : undefined;
+}
+
+function repoFull(payload: Record<string, unknown>): string | undefined {
   const r = payload.repository;
-  return isObj(r) && isObj(r.owner) && typeof r.owner.login === "string" ? r.owner.login : undefined;
+  if (!isObj(r) || !isObj(r.owner) || typeof r.owner.login !== "string" || typeof r.name !== "string") return undefined;
+  return `${r.owner.login}/${r.name}`;
 }
 
 /** The pure part: everything after the signature check and body read. */
@@ -55,9 +73,16 @@ export function handleEvent(
     if (!inst) return { status: 400, body: { error: "installation event without installation id" } };
     if (action === "deleted") {
       deps.db.deleteInstallation(inst.id);
-      deps.logger.info("installation removed; its connections and settings were purged", { installationId: inst.id });
+      deps.logger.info("installation removed; connections and settings purged", { installationId: inst.id });
+      deps.onUninstall?.(inst.id);
       return { status: 200, body: { ok: true, installation: "deleted" } };
     }
+    if (action === "suspend") {
+      const n = deps.db.failQueued(inst.id, "installation suspended");
+      deps.logger.warn("installation suspended; queued reviews failed", { installationId: inst.id, jobs: n });
+      return { status: 200, body: { ok: true, installation: "suspended" } };
+    }
+    // created / new_permissions_accepted / unsuspend. GitHub never reuses installation ids.
     deps.db.upsertInstallation(inst.id, inst.account ?? "unknown");
     deps.logger.info("installation event", { installationId: inst.id, action });
     return { status: 200, body: { ok: true, installation: action || "updated" } };
@@ -65,8 +90,40 @@ export function handleEvent(
 
   if (event === "installation_repositories") {
     if (!inst) return { status: 400, body: { error: "installation_repositories event without installation id" } };
-    deps.db.upsertInstallation(inst.id, inst.account ?? "unknown");
+    if (!deps.db.isActiveInstallation(inst.id)) {
+      if (deps.db.getInstallation(inst.id)) {
+        deps.logger.warn("event for an uninstalled installation ignored", { installationId: inst.id, event });
+        return { status: 202, body: { ignored: true, reason: "installation was removed" } };
+      }
+      deps.db.addInstallationIfUnknown(inst.id, inst.account ?? "unknown");
+    }
+    const removed = repoFullNames(payload.repositories_removed);
+    if (removed.length > 0) {
+      const n = deps.db.failQueued(inst.id, "repository removed from the installation", removed);
+      deps.logger.info("repositories removed from installation", {
+        installationId: inst.id,
+        repos: removed.length,
+        jobs: n,
+      });
+      deps.onReposRemoved?.(inst.id, removed);
+    }
     return { status: 200, body: { ok: true } };
+  }
+
+  if ((event === "pull_request" || event === "pull_request_target") && action === "closed") {
+    const repo = repoFull(payload);
+    const pr = payload.pull_request;
+    const number = isObj(pr) && typeof pr.number === "number" ? pr.number : undefined;
+    if (!inst || !repo || number === undefined) return { status: 202, body: { ignored: true } };
+    const n = deps.db.cancelForChange(inst.id, repo, number, "pull request closed");
+    if (n > 0)
+      deps.logger.info("pull request closed; queued reviews cancelled", {
+        installationId: inst.id,
+        repo,
+        number,
+        jobs: n,
+      });
+    return { status: 202, body: { ignored: true, reason: "pull request closed", cancelled: n } };
   }
 
   const hit = changeRefFromEvent(event, payload, deps.triggerLabels ? { triggerLabels: deps.triggerLabels } : {});
@@ -76,22 +133,30 @@ export function handleEvent(
   if (hit.draft) return { status: 202, body: { ignored: true, reason: "draft pull request" } };
   if (!inst) return { status: 400, body: { error: "event without installation id" } };
 
-  if (!deps.db.getInstallation(inst.id) || deps.db.getInstallation(inst.id)?.deleted_at) {
-    deps.db.upsertInstallation(inst.id, inst.account ?? repoOwner(payload) ?? "unknown");
+  // Never resurrect an uninstalled installation from a late or redelivered webhook, and do not create one from a
+  // PR event: installations come from `installation` events or the boot-time sync with GitHub.
+  if (!deps.db.isActiveInstallation(inst.id)) {
+    deps.logger.warn("webhook for an unknown or uninstalled installation ignored", { installationId: inst.id, event });
+    return { status: 202, body: { ignored: true, reason: "unknown installation" } };
   }
   const repo = `${hit.ref.repo.owner}/${hit.ref.repo.name}`;
+  const baseRef = prBaseRef(payload);
   const r = deps.db.enqueue({
     installationId: inst.id,
     repo,
     number: hit.ref.number,
     headSha: hit.headSha ?? "",
     event: `${event}.${hit.action}`,
+    ...(baseRef ? { baseRef } : {}),
+    ...(hit.reason ? { reason: hit.reason } : {}),
   });
   deps.logger.info("webhook enqueued", {
     installationId: inst.id,
     repo,
     number: hit.ref.number,
     headSha: hit.headSha,
+    baseRef,
+    reason: hit.reason,
     jobId: r.id,
     coalesced: r.coalesced,
     superseded: [...r.supersededQueued, ...r.supersededRunning],

@@ -35,6 +35,11 @@ export class CatalogCache {
     return catalog;
   }
 
+  /** The cached catalog if one exists (any age), without building one. */
+  peek(installationId: number): Catalog | undefined {
+    return this.entries.get(installationId)?.catalog;
+  }
+
   invalidate(installationId: number): void {
     this.entries.delete(installationId);
   }

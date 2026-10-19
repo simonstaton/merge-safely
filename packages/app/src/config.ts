@@ -22,6 +22,8 @@ export interface AppConfig {
   slackWebhookUrl?: string;
   concurrency: number;
   logLevel: LogLevel;
+  /** How long running reviews get to finish on SIGTERM. */
+  shutdownDeadlineMs: number;
   /** GitHub Enterprise Server API root; unset for github.com. */
   githubApiUrl?: string;
 }
@@ -86,6 +88,10 @@ const envSchema = z.object({
     "LOG_LEVEL must be one of debug, info, warn, error",
   ),
   GITHUB_API_URL: httpUrl("GITHUB_API_URL"),
+  SHUTDOWN_DEADLINE_MS: optionalString.refine(
+    (v) => v === undefined || (/^\d+$/.test(v) && Number(v) <= 600_000),
+    "SHUTDOWN_DEADLINE_MS must be an integer number of milliseconds between 0 and 600000",
+  ),
 });
 
 export type Env = Record<string, string | undefined>;
@@ -144,6 +150,7 @@ export function loadConfig(env: Env, opts: LoadConfigOptions = {}): AppConfig {
     setupToken: e.SETUP_TOKEN,
     concurrency: e.CONCURRENCY ? Number(e.CONCURRENCY) : 2,
     logLevel: (e.LOG_LEVEL?.toLowerCase() as LogLevel | undefined) ?? "info",
+    shutdownDeadlineMs: e.SHUTDOWN_DEADLINE_MS ? Number(e.SHUTDOWN_DEADLINE_MS) : 25_000,
   };
   if (e.PUBLIC_URL) cfg.publicUrl = e.PUBLIC_URL.replace(/\/+$/, "");
   if (e.SLACK_WEBHOOK_URL) cfg.slackWebhookUrl = e.SLACK_WEBHOOK_URL;

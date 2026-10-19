@@ -7,9 +7,10 @@
  * thing to back up and one WAL. Migrations here are idempotent (`CREATE ... IF NOT EXISTS` plus additive,
  * version-gated `ALTER`s).
  */
+import { randomBytes, scryptSync } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import type { Connection, ConnectionRecord } from "@merge-safely/core";
+import type { Connection, ConnectionRecord, ConnectionSecret } from "@merge-safely/core";
 import {
   connectionRecordSchema,
   decryptSecret,
@@ -40,6 +41,10 @@ export interface JobRow {
   superseded_by: number | null;
   base_ref: string | null;
   policy_hash: string | null;
+  /** "file" (read from the base ref) or "default" (no policy file on the base ref). */
+  policy_source: string | null;
+  /** Why the review runs, passed to the gate (e.g. "base-changed" for a retarget). */
+  trigger: string | null;
   outcome: string | null;
 }
 
@@ -51,6 +56,10 @@ export interface EnqueueInput {
   /** Empty string when the event carried no head sha (review the current head). */
   headSha: string;
   event: string;
+  /** Base branch named by the event, when it carries one. Jobs only coalesce when the base matches. */
+  baseRef?: string;
+  /** "base-changed": the PR was retargeted. Never coalesces; supersedes every open job for the PR. */
+  reason?: "base-changed";
 }
 
 export interface EnqueueResult {
@@ -119,6 +128,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   superseded_by INTEGER,
   base_ref TEXT,
   policy_hash TEXT,
+  policy_source TEXT,
+  trigger TEXT,
   outcome TEXT
 );
 CREATE INDEX IF NOT EXISTS jobs_state_run_after ON jobs (state, run_after);
@@ -130,6 +141,42 @@ CREATE TABLE IF NOT EXISTS deliveries (
 CREATE INDEX IF NOT EXISTS deliveries_received ON deliveries (received_at);
 `;
 
+/** Max attempts for a job that keeps killing the process (counted at claim and again when found running at boot). */
+export const CRASH_MAX_ATTEMPTS = 3;
+
+const SCRYPT = { N: 2 ** 15, r: 8, p: 1 };
+
+/** 64 hex chars or `base64:` keys are used as-is by encryptSecret; anything else is a passphrase. */
+export function isRawMasterKey(key: string): boolean {
+  const s = key.trim();
+  return /^[0-9a-fA-F]{64}$/.test(s) || s.startsWith("base64:");
+}
+
+/**
+ * Resolve the master key once: raw keys pass through; a passphrase is stretched with scrypt ONCE (salt stored in
+ * app_meta, random per deployment) into a raw 32-byte key, so no request pays for scrypt per connection.
+ */
+export function deriveMasterKey(key: string, salt: Buffer): string | Buffer {
+  if (isRawMasterKey(key)) return key.trim();
+  const s = key.trim();
+  if (s.length < 12)
+    throw new Error("master key must be 64 hex characters, base64:<32 bytes>, or a passphrase of 12+ characters");
+  return scryptSync(s, salt, 32, { ...SCRYPT, maxmem: 128 * SCRYPT.N * SCRYPT.r + 2 * 1024 * 1024 });
+}
+
+export interface InterruptedResult {
+  requeued: number;
+  superseded: number;
+  /** Jobs that crashed the process too often; the caller reports them on the check run. */
+  failed: JobRow[];
+}
+
+export interface RotateResult {
+  rotated: number;
+  alreadyCurrent: number;
+  failed: { installationId: number; id: string }[];
+}
+
 export interface AppDbOptions {
   path: string;
   masterKey: string;
@@ -138,7 +185,7 @@ export interface AppDbOptions {
 
 export class AppDb {
   readonly db: Database.Database;
-  private readonly masterKey: string;
+  private readonly masterKey: string | Buffer;
   private readonly now: () => Date;
 
   constructor(opts: AppDbOptions) {
@@ -147,9 +194,24 @@ export class AppDb {
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("synchronous = NORMAL");
     this.db.pragma("busy_timeout = 5000");
-    this.masterKey = opts.masterKey;
     this.now = opts.now ?? (() => new Date());
     this.migrate();
+    this.masterKey = this.resolveKey(opts.masterKey);
+  }
+
+  private kdfSalt(): Buffer {
+    const existing = this.db.prepare<[], { value: string }>("SELECT value FROM app_meta WHERE key = 'kdf_salt'").get();
+    if (existing) return Buffer.from(existing.value, "base64");
+    const salt = randomBytes(16);
+    this.db
+      .prepare("INSERT INTO app_meta (key, value) VALUES ('kdf_salt', ?) ON CONFLICT(key) DO NOTHING")
+      .run(salt.toString("base64"));
+    return this.kdfSalt();
+  }
+
+  /** The key material encryptSecret/decryptSecret get for a configured master key (derived once). */
+  resolveKey(masterKey: string): string | Buffer {
+    return deriveMasterKey(masterKey, this.kdfSalt());
   }
 
   private iso(): string {
@@ -158,6 +220,16 @@ export class AppDb {
 
   migrate(): void {
     this.db.exec(SCHEMA);
+    // Additive column migrations for databases created by an earlier build.
+    const cols = new Set(
+      this.db
+        .prepare<[], { name: string }>("PRAGMA table_info(jobs)")
+        .all()
+        .map((c) => c.name),
+    );
+    for (const c of ["policy_source", "trigger"]) {
+      if (!cols.has(c)) this.db.exec(`ALTER TABLE jobs ADD COLUMN ${c} TEXT`);
+    }
     this.db
       .prepare("INSERT INTO app_meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO NOTHING")
       .run(String(APP_SCHEMA_VERSION));
@@ -174,6 +246,21 @@ export class AppDb {
 
   // ---- installations -------------------------------------------------------
 
+  /** Known and not uninstalled. */
+  isActiveInstallation(id: number): boolean {
+    const r = this.getInstallation(id);
+    return r !== undefined && r.deleted_at === null;
+  }
+
+  /** Insert an installation we have never seen; never resurrects one that was uninstalled. */
+  addInstallationIfUnknown(id: number, account: string): boolean {
+    return (
+      this.db
+        .prepare("INSERT INTO installations (id, account, created_at) VALUES (?, ?, ?) ON CONFLICT(id) DO NOTHING")
+        .run(id, account, this.iso()).changes > 0
+    );
+  }
+
   upsertInstallation(id: number, account: string): void {
     this.db
       .prepare(
@@ -183,7 +270,7 @@ export class AppDb {
       .run(id, account, this.iso());
   }
 
-  /** Uninstall: mark deleted and purge its stored secrets and settings (we hold no custody we do not need). */
+  /** Uninstall: mark deleted and purge its stored secrets and settings. Repo mirrors are removed by the caller. */
   deleteInstallation(id: number): void {
     const tx = this.db.transaction(() => {
       this.db.prepare("UPDATE installations SET deleted_at = ? WHERE id = ?").run(this.iso(), id);
@@ -266,6 +353,42 @@ export class AppDb {
     return { connections, problems };
   }
 
+  /**
+   * Re-encrypt every stored connection from `oldKey` to this database's current master key. Each row is its own
+   * atomic UPDATE, so an interrupted rotation can be re-run: rows already under the new key are skipped.
+   */
+  rotateMasterKey(oldKey: string): RotateResult {
+    const old = this.resolveKey(oldKey);
+    const rows = this.db
+      .prepare<[], { installation_id: number; id: string; secret_blob: string }>(
+        "SELECT installation_id, id, secret_blob FROM connections ORDER BY installation_id, id",
+      )
+      .all();
+    const out: RotateResult = { rotated: 0, alreadyCurrent: 0, failed: [] };
+    const update = this.db.prepare(
+      "UPDATE connections SET secret_blob = ? WHERE installation_id = ? AND id = ? AND secret_blob = ?",
+    );
+    for (const r of rows) {
+      const aad = connectionAad(r.installation_id, r.id);
+      let secret: ConnectionSecret;
+      try {
+        secret = decryptSecret(r.secret_blob, old, aad);
+      } catch (_err: unknown) {
+        try {
+          decryptSecret(r.secret_blob, this.masterKey, aad);
+          out.alreadyCurrent++;
+        } catch (_err2: unknown) {
+          out.failed.push({ installationId: r.installation_id, id: r.id });
+        }
+        continue;
+      }
+      const blob = encryptSecret(secret, this.masterKey, aad);
+      if (update.run(blob, r.installation_id, r.id, r.secret_blob).changes > 0) out.rotated++;
+      else out.failed.push({ installationId: r.installation_id, id: r.id });
+    }
+    return out;
+  }
+
   // ---- settings ------------------------------------------------------------
 
   getSetting(installationId: number, key: string): { found: boolean; value: unknown; raw?: string } {
@@ -324,8 +447,9 @@ export class AppDb {
   // ---- jobs ----------------------------------------------------------------
 
   /**
-   * Enqueue with coalescing, keyed (installation, repo, number, head_sha):
-   * - an identical queued or running job absorbs the new one;
+   * Enqueue with coalescing, keyed (installation, repo, number, head_sha, base_ref):
+   * - an identical queued or running job absorbs the new one, unless the base differs or this is a retarget
+   *   (`reason: "base-changed"`): a retarget never coalesces, because the open job read policy from the old base;
    * - queued jobs for other SHAs of the same PR are marked superseded now;
    * - running jobs for other SHAs get `superseded_by` and are marked superseded when they finish.
    */
@@ -336,15 +460,34 @@ export class AppDb {
           "SELECT * FROM jobs WHERE installation_id = ? AND repo = ? AND number = ? AND state IN ('queued', 'running')",
         )
         .all(input.installationId, input.repo, input.number);
-      const same = open.find((j) => j.head_sha === input.headSha && j.superseded_by === null);
+      const same =
+        input.reason === undefined
+          ? open.find(
+              (j) =>
+                j.head_sha === input.headSha &&
+                j.superseded_by === null &&
+                (input.baseRef === undefined || j.base_ref === null || j.base_ref === input.baseRef),
+            )
+          : undefined;
       if (same) return { id: same.id, coalesced: true, supersededQueued: [], supersededRunning: [] };
       const now = this.iso();
       const res = this.db
         .prepare(
-          `INSERT INTO jobs (installation_id, repo, number, head_sha, event, state, attempts, created_at, run_after)
-           VALUES (?, ?, ?, ?, ?, 'queued', 0, ?, ?)`,
+          `INSERT INTO jobs (installation_id, repo, number, head_sha, event, state, attempts, created_at, run_after,
+             base_ref, trigger)
+           VALUES (?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?)`,
         )
-        .run(input.installationId, input.repo, input.number, input.headSha, input.event, now, now);
+        .run(
+          input.installationId,
+          input.repo,
+          input.number,
+          input.headSha,
+          input.event,
+          now,
+          now,
+          input.baseRef ?? null,
+          input.reason ?? null,
+        );
       const id = Number(res.lastInsertRowid);
       const supersededQueued: number[] = [];
       const supersededRunning: number[] = [];
@@ -361,7 +504,7 @@ export class AppDb {
       }
       return { id, coalesced: false, supersededQueued, supersededRunning };
     });
-    return tx();
+    return tx.immediate();
   }
 
   getJob(id: number): JobRow | undefined {
@@ -370,7 +513,8 @@ export class AppDb {
 
   /**
    * Claim the oldest runnable job, skipping PRs that already have a running job (one review per PR at a time).
-   * better-sqlite3 is synchronous, so claim is atomic within this process.
+   * Runs as an IMMEDIATE transaction, so it is atomic even with a second process on the file (one replica is the
+   * supported deployment).
    */
   claimNext(): JobRow | undefined {
     const tx = this.db.transaction((): JobRow | undefined => {
@@ -389,16 +533,57 @@ export class AppDb {
         .run(now, job.id);
       return this.getJob(job.id);
     });
-    return tx();
+    return tx.immediate();
   }
 
   /** Record what the pipeline learned about the job (base ref the policy came from, policy hash). */
-  annotateJob(id: number, fields: { baseRef?: string; policyHash?: string; headSha?: string }): void {
-    if (fields.baseRef !== undefined)
+  annotateJob(id: number, fields: { baseRef?: string; policyHash?: string; policySource?: string }): void {
+    if (fields.baseRef !== undefined) {
       this.db.prepare("UPDATE jobs SET base_ref = ? WHERE id = ?").run(fields.baseRef, id);
+    }
     if (fields.policyHash !== undefined) {
       this.db.prepare("UPDATE jobs SET policy_hash = ? WHERE id = ?").run(fields.policyHash, id);
     }
+    if (fields.policySource !== undefined) {
+      this.db.prepare("UPDATE jobs SET policy_source = ? WHERE id = ?").run(fields.policySource, id);
+    }
+  }
+
+  /** Queued jobs for a PR end `superseded` (PR closed or merged). Running ones finish and are marked superseded. */
+  cancelForChange(installationId: number, repo: string, number: number, reason: string): number {
+    const now = this.iso();
+    const tx = this.db.transaction(() => {
+      const n = this.db
+        .prepare(
+          `UPDATE jobs SET state = 'superseded', finished_at = ?, error = ?
+           WHERE installation_id = ? AND repo = ? AND number = ? AND state = 'queued'`,
+        )
+        .run(now, reason, installationId, repo, number).changes;
+      this.db
+        .prepare(
+          `UPDATE jobs SET superseded_by = 0 WHERE installation_id = ? AND repo = ? AND number = ?
+           AND state = 'running' AND superseded_by IS NULL`,
+        )
+        .run(installationId, repo, number);
+      return n;
+    });
+    return tx.immediate();
+  }
+
+  /** Fail queued jobs of an installation (suspended / uninstalled), optionally only for some repos. */
+  failQueued(installationId: number, reason: string, repos?: string[]): number {
+    const now = this.iso();
+    if (repos === undefined) {
+      return this.db
+        .prepare(
+          "UPDATE jobs SET state = 'failed', finished_at = ?, error = ? WHERE installation_id = ? AND state = 'queued'",
+        )
+        .run(now, reason, installationId).changes;
+    }
+    const stmt = this.db.prepare(
+      "UPDATE jobs SET state = 'failed', finished_at = ?, error = ? WHERE installation_id = ? AND repo = ? AND state = 'queued'",
+    );
+    return repos.reduce((n, r) => n + stmt.run(now, reason, installationId, r).changes, 0);
   }
 
   /** Finish a job. A running job that a newer SHA superseded ends `superseded` whatever its own outcome. */
@@ -425,11 +610,36 @@ export class AppDb {
       .run(runAfter, error, id);
   }
 
-  /** Boot recovery: jobs left `running` by a crash or a shutdown past its deadline go back to the queue. */
-  requeueInterrupted(): number {
-    return this.db
-      .prepare("UPDATE jobs SET state = 'queued', started_at = NULL, run_after = ? WHERE state = 'running'")
-      .run(this.iso()).changes;
+  /**
+   * Boot recovery for jobs left `running` by a crash or a shutdown past its deadline:
+   * - superseded ones (a newer SHA or a retarget arrived) end `superseded`, never re-reviewed;
+   * - the rest get attempts + 1 (the interrupted run) and go back to the queue while attempts < maxAttempts;
+   * - beyond that they end `failed` ("crashed repeatedly") so a poison job cannot crash-loop the service.
+   */
+  requeueInterrupted(maxAttempts = CRASH_MAX_ATTEMPTS): InterruptedResult {
+    const tx = this.db.transaction((): InterruptedResult => {
+      const now = this.iso();
+      const superseded = this.db
+        .prepare(
+          `UPDATE jobs SET state = 'superseded', finished_at = ?, error = COALESCE(error, 'superseded while interrupted')
+           WHERE state = 'running' AND superseded_by IS NOT NULL`,
+        )
+        .run(now).changes;
+      this.db.prepare("UPDATE jobs SET attempts = attempts + 1 WHERE state = 'running'").run();
+      const failed = this.db
+        .prepare<[number], JobRow>("SELECT * FROM jobs WHERE state = 'running' AND attempts >= ?")
+        .all(maxAttempts);
+      for (const j of failed) {
+        this.db
+          .prepare("UPDATE jobs SET state = 'failed', finished_at = ?, error = ? WHERE id = ?")
+          .run(now, `crashed repeatedly (${j.attempts} attempts); not retried`, j.id);
+      }
+      const requeued = this.db
+        .prepare("UPDATE jobs SET state = 'queued', started_at = NULL, run_after = ? WHERE state = 'running'")
+        .run(now).changes;
+      return { requeued, superseded, failed: failed.map((j) => ({ ...j, state: "failed" as const })) };
+    });
+    return tx.immediate();
   }
 
   countByState(): Record<JobState, number> {
