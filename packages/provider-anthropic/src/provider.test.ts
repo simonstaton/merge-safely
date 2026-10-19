@@ -151,3 +151,18 @@ describe("anthropicProvider", () => {
     expect(p.createRunner(sub(), model())).toBeInstanceOf(ClaudeCodeRunner);
   });
 });
+
+describe("anthropic-compatible gateways without /v1/models", () => {
+  it("treat a 404 on models as reachable", async () => {
+    const notFound = new Anthropic.NotFoundError(404, undefined, "not found", new Headers());
+    const c = conn({
+      kind: "anthropic-compatible",
+      secret: { kind: "anthropic-compatible", baseUrl: "https://gw.example", apiKey: "gw-key-1234567890" },
+    });
+    const v = await anthropicProvider({ clientFactory: () => new FakeClient([], notFound) }).validate(c);
+    expect(v.ok).toBe(true);
+    expect(v.models?.length).toBeGreaterThan(0);
+    const direct = await anthropicProvider({ clientFactory: () => new FakeClient([], notFound) }).validate(conn());
+    expect(direct.ok).toBe(false);
+  });
+});

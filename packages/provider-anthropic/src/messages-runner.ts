@@ -19,20 +19,21 @@ import {
 } from "@merge-safely/core";
 import { classifyExit } from "./classify.js";
 import { type AnthropicLike, describeApiError } from "./client.js";
-import { addUsage, priceUsage, ZERO_USAGE } from "./models.js";
+import { addUsage, priceFor, ZERO_USAGE } from "./models.js";
 import { buildRun, outputSchemaFor, type ParsedOutput, parseForSeat } from "./output.js";
-import { scrub, secretValues } from "./secrets.js";
+import { envSecretValues, scrub, secretValues } from "./secrets.js";
 
 export const SUBMIT_REVIEW_TOOL = "submit_review";
 export const MAX_SCHEMA_RETRIES = 2;
 export const MAX_OUTPUT_TOKENS_CAP = 16_000;
+export const NUDGE_TEXT = `You ended your turn without calling ${SUBMIT_REVIEW_TOOL}. Call submit_review now with your final JSON; do not reply in prose.`;
 
 export interface MessagesRunnerConfig {
   /** Retries for 429 / 529 / 5xx / network errors. Default 3. */
   maxRetries?: number;
   /** First backoff step in ms (doubles each retry, with jitter). Default 1000. */
   retryBaseMs?: number;
-  /** Upper bound for a single backoff wait. Default 60s. */
+  /** Upper bound for the exponential backoff (never below a server retry-after; the seat deadline is the hard cap). Default 60s. */
   maxRetryWaitMs?: number;
   /** Injectable for tests. Must reject when the signal aborts. */
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
@@ -86,6 +87,21 @@ function defaultSleep(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+/** Keep exactly one message breakpoint, on the latest user message (the system block keeps its own). */
+function moveCacheBreakpoint(messages: Anthropic.MessageParam[]): void {
+  for (const m of messages) {
+    if (typeof m.content === "string") continue;
+    for (const b of m.content) {
+      if ("cache_control" in b) delete (b as { cache_control?: unknown }).cache_control;
+    }
+  }
+  const last = messages[messages.length - 1];
+  if (last?.role !== "user") return;
+  if (typeof last.content === "string") last.content = [{ type: "text", text: last.content }];
+  const block = last.content[last.content.length - 1];
+  if (block && (block.type === "text" || block.type === "tool_result")) block.cache_control = { type: "ephemeral" };
+}
+
 function usageFrom(u: Anthropic.Usage | undefined): TokenUsage {
   return {
     in: u?.input_tokens ?? 0,
@@ -132,6 +148,7 @@ export class MessagesRunner implements ModelRunner {
   private readonly cfg: Required<Omit<MessagesRunnerConfig, "sleep" | "now">> &
     Pick<Required<MessagesRunnerConfig>, "sleep" | "now">;
   private warnedUnpriced = false;
+  private warnedEffort = false;
 
   constructor(
     private readonly client: AnthropicLike,
@@ -140,7 +157,7 @@ export class MessagesRunner implements ModelRunner {
     private readonly opts: RunnerOptions = {},
     cfg: MessagesRunnerConfig = {},
   ) {
-    this.secrets = secretValues(conn);
+    this.secrets = [...secretValues(conn), ...envSecretValues()];
     this.cfg = {
       maxRetries: cfg.maxRetries ?? 3,
       retryBaseMs: cfg.retryBaseMs ?? 1000,
@@ -154,7 +171,7 @@ export class MessagesRunner implements ModelRunner {
     const startedAt = new Date();
     const t0 = this.cfg.now();
     let tokens: TokenUsage = { ...ZERO_USAGE };
-    let usd: number | undefined = this.model.zeroCost ? 0 : undefined;
+    let usd = 0;
     let turns = 0;
     let executor: ToolExecutor | undefined;
     let parsed: ParsedOutput | undefined;
@@ -180,9 +197,8 @@ export class MessagesRunner implements ModelRunner {
     };
 
     try {
-      if (!this.model.zeroCost && !this.model.pricing && seat.budget.maxUsd !== undefined) {
-        this.warnUnpriced(seat);
-      }
+      if (!this.model.zeroCost && !this.model.pricing) this.warnUnpriced(seat);
+      const effort = this.effortFor(seat);
       executor = this.opts.tools?.(ws, { allowedCommands: input.allowedCommands });
       if (!executor) {
         this.opts.logger?.warn("anthropic: no tool executor configured; the seat can only submit a review", {
@@ -194,13 +210,14 @@ export class MessagesRunner implements ModelRunner {
         { type: "text", text: `${input.prompt.system}\n${TOOL_PREAMBLE}`, cache_control: { type: "ephemeral" } },
       ];
       const messages: Anthropic.MessageParam[] = [
-        { role: "user", content: [{ type: "text", text: input.prompt.user, cache_control: { type: "ephemeral" } }] },
+        { role: "user", content: [{ type: "text", text: input.prompt.user }] },
       ];
       const maxTokens = Math.max(
         1,
         Math.min(this.model.maxOutputTokens || MAX_OUTPUT_TOKENS_CAP, MAX_OUTPUT_TOKENS_CAP),
       );
       let schemaFailures = 0;
+      let nudged = false;
 
       while (!parsed?.ok) {
         if (controller.signal.aborted) stopForAbort();
@@ -208,6 +225,7 @@ export class MessagesRunner implements ModelRunner {
           const c = classifyExit({ budgetHit: "turns", maxTurns: seat.budget.maxTurns });
           throw new StopRun(c.status, c.error ?? "turn budget exhausted");
         }
+        moveCacheBreakpoint(messages);
         const body: Anthropic.MessageCreateParamsNonStreaming = {
           model: this.model.name,
           max_tokens: maxTokens,
@@ -216,66 +234,88 @@ export class MessagesRunner implements ModelRunner {
           tool_choice: { type: "auto" },
           messages,
         };
-        if (seat.model.effort) {
-          (body as unknown as Record<string, unknown>).output_config = { effort: seat.model.effort };
-        }
+        if (effort) (body as unknown as Record<string, unknown>).output_config = { effort };
         const response = await this.createWithRetry(body, controller.signal, deadlineAt, () => timedOut);
         turns++;
 
         const delta = usageFrom(response.usage);
         tokens = addUsage(tokens, delta);
-        const deltaUsd = this.model.zeroCost ? 0 : priceUsage(this.model.pricing, delta);
-        if (deltaUsd !== undefined) usd = (usd ?? 0) + deltaUsd;
-        this.opts.onUsage?.({ tokens: delta, ...(deltaUsd !== undefined ? { usd: deltaUsd } : {}) });
+        // Unknown pricing is charged at the registry's pessimistic rate, so maxUsd always enforces.
+        const deltaUsd = priceFor(this.model, delta).usd;
+        usd += deltaUsd;
+        this.opts.onUsage?.({ tokens: delta, usd: deltaUsd });
 
         messages.push({ role: "assistant", content: toParams(response.content) });
         const toolUses = response.content.filter((b): b is Anthropic.ToolUseBlock => b.type === "tool_use");
 
-        if (seat.budget.maxUsd !== undefined && usd !== undefined && usd >= seat.budget.maxUsd) {
+        if (seat.budget.maxUsd !== undefined && usd >= seat.budget.maxUsd) {
           const c = classifyExit({ budgetHit: "usd", usd, maxUsd: seat.budget.maxUsd });
           throw new StopRun(c.status, c.error ?? "usd budget exhausted");
         }
         if (response.stop_reason === "refusal") throw new StopRun("error", "model declined the request (refusal)");
 
-        if (toolUses.length === 0) {
-          // The model ended without submitting. One salvage attempt from the final text, then schema-invalid.
+        const truncated = response.stop_reason === "max_tokens";
+        if (toolUses.length === 0 || truncated) {
+          // Ended without a (complete) submission. Salvage JSON from the text, else nudge once, else schema-invalid.
           const text = response.content
             .filter((b): b is Anthropic.TextBlock => b.type === "text")
             .map((b) => b.text)
             .join("\n");
-          const raw = extractJson(text);
+          const raw = toolUses.length === 0 ? extractJson(text) : undefined;
           const r = raw === undefined ? undefined : parseForSeat(seat, raw);
           if (r?.ok) {
             parsed = r;
             break;
           }
-          throw new StopRun(
-            "schema-invalid",
-            `model stopped (${response.stop_reason ?? "unknown"}) without calling ${SUBMIT_REVIEW_TOOL}` +
-              (r && !r.ok ? `; final text failed validation: ${r.error}` : "; no JSON found in final text"),
-          );
+          if (nudged) {
+            throw new StopRun(
+              "schema-invalid",
+              `model stopped (${response.stop_reason ?? "unknown"}) without calling ${SUBMIT_REVIEW_TOOL}, after a reminder` +
+                (r && !r.ok ? `; final text failed validation: ${r.error}` : ""),
+            );
+          }
+          nudged = true;
+          // Tool calls cut off by max_tokens may carry partial input: never execute them, but answer each id.
+          const content: Anthropic.ContentBlockParam[] = toolUses.map((tu) => ({
+            type: "tool_result" as const,
+            tool_use_id: tu.id,
+            is_error: true,
+            content: "Not executed: your response was cut off at the output token limit.",
+          }));
+          content.push({ type: "text", text: NUDGE_TEXT });
+          messages.push({ role: "user", content });
+          continue;
         }
 
+        // A valid submission wins: other calls in the same response are neither executed nor counted.
+        const submissions = toolUses.filter((tu) => tu.name === SUBMIT_REVIEW_TOOL);
+        let submitError: string | undefined;
+        for (const tu of submissions) {
+          const r = parseForSeat(seat, tu.input);
+          if (r.ok) {
+            parsed = r;
+            break;
+          }
+          submitError = r.error;
+        }
+        if (parsed?.ok) break;
+
         const results: Anthropic.ToolResultBlockParam[] = [];
+        if (submitError !== undefined) {
+          schemaFailures++;
+          if (schemaFailures > MAX_SCHEMA_RETRIES) {
+            throw new StopRun("schema-invalid", `submit_review input failed validation: ${submitError}`);
+          }
+        }
         for (const tu of toolUses) {
           if (controller.signal.aborted) stopForAbort();
           if (tu.name === SUBMIT_REVIEW_TOOL) {
-            const r = parseForSeat(seat, tu.input);
-            if (r.ok) {
-              parsed = r;
-              results.push({ type: "tool_result", tool_use_id: tu.id, content: "Review received." });
-              continue;
-            }
-            schemaFailures++;
-            if (schemaFailures > MAX_SCHEMA_RETRIES) {
-              throw new StopRun("schema-invalid", `submit_review input failed validation: ${r.error}`);
-            }
             results.push({
               type: "tool_result",
               tool_use_id: tu.id,
               is_error: true,
               content:
-                `Your ${SUBMIT_REVIEW_TOOL} input did not match the schema: ${r.error}. ` +
+                `Your ${SUBMIT_REVIEW_TOOL} input did not match the schema: ${submitError}. ` +
                 `Fix exactly these problems and call ${SUBMIT_REVIEW_TOOL} again ` +
                 `(${MAX_SCHEMA_RETRIES - schemaFailures + 1} attempt(s) left).`,
             });
@@ -283,7 +323,6 @@ export class MessagesRunner implements ModelRunner {
           }
           results.push(await this.execTool(executor, tu, controller.signal));
         }
-        if (parsed?.ok) break;
         messages.push({ role: "user", content: results });
       }
     } catch (err: unknown) {
@@ -304,8 +343,8 @@ export class MessagesRunner implements ModelRunner {
       tokens,
       wallMs: this.cfg.now() - t0,
       turns,
+      costUsd: usd,
     };
-    if (usd !== undefined) audit.costUsd = usd;
     return buildRun({
       seat,
       input,
@@ -316,13 +355,28 @@ export class MessagesRunner implements ModelRunner {
       ...(error !== undefined ? { error } : {}),
       startedAt,
       finishedAt: new Date(),
+      secrets: this.secrets,
     });
+  }
+
+  private effortFor(seat: Seat): string | undefined {
+    const e = seat.model.effort;
+    if (!e) return undefined;
+    if (this.model.effortLevels?.includes(e)) return e;
+    if (!this.warnedEffort) {
+      this.warnedEffort = true;
+      this.opts.logger?.warn("anthropic: effort not supported by this model; omitted", {
+        model: this.model.name,
+        effort: e,
+      });
+    }
+    return undefined;
   }
 
   private warnUnpriced(seat: Seat): void {
     if (this.warnedUnpriced) return;
     this.warnedUnpriced = true;
-    this.opts.logger?.warn("anthropic: model has no pricing; maxUsd cannot be enforced for this seat", {
+    this.opts.logger?.warn("anthropic: model has no pricing; cost is estimated at the registry's pessimistic rate", {
       model: this.model.name,
       seat: seat.id,
     });
@@ -376,7 +430,8 @@ export class MessagesRunner implements ModelRunner {
           throw new StopRun("error", `${info.message}${suffix}`);
         }
         const backoff = this.cfg.retryBaseMs * 2 ** attempt * (0.8 + Math.random() * 0.4);
-        const wait = Math.min(this.cfg.maxRetryWaitMs, Math.max(info.retryAfterMs ?? 0, backoff));
+        // Never retry sooner than the server asked; the seat deadline (below) is the only cap on a long retry-after.
+        const wait = Math.max(info.retryAfterMs ?? 0, Math.min(this.cfg.maxRetryWaitMs, backoff));
         if (this.cfg.now() + wait >= deadlineAt) {
           throw new StopRun(
             "timeout",

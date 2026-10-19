@@ -111,6 +111,15 @@ export function anthropicProvider(opts: AnthropicProviderOptions = {}): ModelPro
         return { ok: true, models, latencyMs: Date.now() - t0 };
       } catch (err: unknown) {
         const info = describeApiError(err);
+        if (info.status === 404 && conn.secret.kind === "anthropic-compatible") {
+          // Many gateways speak the Messages API but do not implement /v1/models: reachable, model list unknown.
+          return {
+            ok: true,
+            message: "gateway reachable but does not list models; using the registry's Anthropic models",
+            models: localModels({ planIncluded: false }),
+            latencyMs: Date.now() - t0,
+          };
+        }
         let message: string;
         if (info.aborted) message = "unreachable (timed out)";
         else if (info.status === 401) message = "invalid key";

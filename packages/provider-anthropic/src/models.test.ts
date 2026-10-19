@@ -1,27 +1,22 @@
 import { describe, expect, it } from "vitest";
-import { guessTier, localModels, lookupKnownModel, priceUsage, toModelInfo } from "./models.js";
+import { model } from "../test/helpers.js";
+import { guessTier, localModels, priceFor, toModelInfo } from "./models.js";
 
 describe("models", () => {
   it("guesses tier from the id", () => {
-    expect(guessTier("claude-opus-5-5")).toBe("frontier");
-    expect(guessTier("claude-fable-5-1")).toBe("frontier");
-    expect(guessTier("claude-sonnet-5-5")).toBe("mid");
-    expect(guessTier("claude-haiku-4-5-20251001")).toBe("small");
+    expect(guessTier("claude-opus-9")).toBe("frontier");
+    expect(guessTier("claude-fable-9")).toBe("frontier");
+    expect(guessTier("claude-sonnet-9")).toBe("mid");
+    expect(guessTier("claude-haiku-9")).toBe("small");
     expect(guessTier("some-gateway-model")).toBe("mid");
   });
 
-  it("matches dated snapshots to the longest known id", () => {
-    expect(lookupKnownModel("claude-haiku-4-5-20251001")?.id).toBe("claude-haiku-4-5");
-    expect(lookupKnownModel("claude-opus-5-5")?.id).toBe("claude-opus-5-5");
-    expect(lookupKnownModel("claude-opus-5")?.id).toBe("claude-opus-5");
-    expect(lookupKnownModel("claude-unknown-9")).toBeUndefined();
-  });
-
-  it("maps runtime models, preferring API capability fields", () => {
+  it("maps runtime models through the registry, preferring API capability fields", () => {
     const m = toModelInfo({ id: "claude-sonnet-5-5", display_name: "Sonnet", max_input_tokens: 500_000 }, "runtime");
     expect(m).toMatchObject({ name: "claude-sonnet-5-5", tier: "mid", supportsTools: true, contextTokens: 500_000 });
-    expect(m.maxOutputTokens).toBe(128_000);
     expect(m.pricing?.inPerMTok).toBe(2);
+    expect(m.effortLevels?.length).toBeGreaterThan(0);
+    expect(toModelInfo({ id: "claude-haiku-4-5-20251001" }, "runtime").pricing?.inPerMTok).toBe(1);
     const unknown = toModelInfo({ id: "mystery" }, "runtime");
     expect(unknown.pricing).toBeUndefined();
     expect(unknown.contextTokens).toBeGreaterThan(0);
@@ -29,18 +24,17 @@ describe("models", () => {
 
   it("marks subscription models as plan-included", () => {
     const all = localModels({ planIncluded: true });
-    expect(all.length).toBeGreaterThan(5);
-    expect(all.every((m) => m.zeroCost === true)).toBe(true);
+    expect(all.length).toBeGreaterThan(3);
+    expect(all.every((m) => m.zeroCost === true && m.provider === "anthropic")).toBe(true);
     expect(localModels({ planIncluded: false }).some((m) => m.zeroCost)).toBe(false);
   });
 
-  it("prices usage including cache reads and writes", () => {
-    const usd = priceUsage(
-      { inPerMTok: 2, outPerMTok: 10, cachedInPerMTok: 0.2, cacheWritePerMTok: 2.5 },
-      { in: 1_000_000, out: 100_000, cachedIn: 1_000_000, cacheWrite: 1_000_000 },
-    );
-    expect(usd).toBeCloseTo(2 + 1 + 0.2 + 2.5, 6);
-    expect(priceUsage({ inPerMTok: 10, outPerMTok: 0 }, { in: 0, out: 0, cachedIn: 1_000_000 })).toBeCloseTo(1, 6);
-    expect(priceUsage(undefined, { in: 5, out: 5 })).toBeUndefined();
+  it("prices known, zero-cost and unknown models (pessimistic, estimated)", () => {
+    const usage = { in: 1_000_000, out: 100_000, cachedIn: 1_000_000, cacheWrite: 1_000_000 };
+    expect(priceFor(model(), usage)).toEqual({ usd: 2 + 1 + 0.2 + 2.5, estimated: false });
+    expect(priceFor(model({ zeroCost: true }), usage)).toEqual({ usd: 0, estimated: false });
+    const unknown = priceFor(model({ pricing: undefined }), { in: 1_000_000, out: 0 });
+    expect(unknown.estimated).toBe(true);
+    expect(unknown.usd).toBeGreaterThanOrEqual(10); // at least the most expensive known input rate
   });
 });

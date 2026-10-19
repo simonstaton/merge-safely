@@ -8,23 +8,27 @@ export {
   ClaudeCodeRunner,
   type ClaudeCodeRunnerConfig,
   cliAllowedTools,
+  GIT_WRAPPER_COMMAND,
+  writeGitLauncher,
 } from "./cli-runner.js";
 export { type AnthropicLike, createAnthropicClient, describeApiError, parseRetryAfter } from "./client.js";
+export { GIT_SUBCOMMANDS, GitGuardError, planGit, runGitWrapper } from "./git-guard.js";
 export {
   MAX_OUTPUT_TOKENS_CAP,
   MAX_SCHEMA_RETRIES,
   MessagesRunner,
   type MessagesRunnerConfig,
+  NUDGE_TEXT,
   SUBMIT_REVIEW_TOOL,
   submitReviewTool,
   toAnthropicToolDefs,
 } from "./messages-runner.js";
-export { guessTier, KNOWN_MODELS, localModels, lookupKnownModel, priceUsage, toModelInfo } from "./models.js";
+export { guessTier, localModels, priceFor, toModelInfo } from "./models.js";
 export {
   ANTHROPIC_CONNECTION_KINDS,
   type AnthropicProviderOptions,
   anthropicProvider,
   usesCliRunner,
 } from "./provider.js";
-export { scrub } from "./secrets.js";
+export { envSecretValues, REDACTED, scrub, scrubDeep } from "./secrets.js";
 export { type CliResult, StreamJsonParser } from "./stream-json.js";

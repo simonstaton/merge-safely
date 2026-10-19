@@ -15,6 +15,8 @@ export interface FakeScenario {
   ignoreTerm?: boolean;
   /** Rewrite this string in replayed lines (e.g. a fixture's /workspace to a real temp dir). */
   replace?: { from: string; to: string };
+  /** Kill itself with this signal after writing output (simulates a crash or a forged-then-killed stream). */
+  selfSignal?: "SIGKILL" | "SIGTERM";
   /** Print this for `--version`. */
   version?: string;
 }
@@ -24,6 +26,8 @@ export interface FakeRecord {
   env: Record<string, string>;
   stdin: string;
   cwd: string;
+  /** Contents of the ms-git launcher found first on PATH, if any. */
+  msGit?: string;
 }
 
 /** Write a node script that behaves like `claude -p` for one scenario. Returns its path and a record reader. */
@@ -42,7 +46,11 @@ let stdin = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (d) => { stdin += d; });
 process.stdin.on("end", () => {
-  fs.writeFileSync(${JSON.stringify(recordPath)}, JSON.stringify({ argv, env: process.env, stdin, cwd: process.cwd() }));
+  let msGit;
+  for (const d of (process.env.PATH || "").split(":")) {
+    try { msGit = fs.readFileSync(d + "/ms-git", "utf8"); break; } catch {}
+  }
+  fs.writeFileSync(${JSON.stringify(recordPath)}, JSON.stringify({ argv, env: process.env, stdin, cwd: process.cwd(), msGit }));
   const lines = s.fixture ? fs.readFileSync(s.fixture, "utf8").split("\\n") : (s.lines || []);
   for (let l of lines) {
     if (!l) continue;
@@ -50,7 +58,7 @@ process.stdin.on("end", () => {
     process.stdout.write(l + "\\n");
   }
   if (s.stderr) process.stderr.write(s.stderr);
-  const finish = () => process.exit(s.exitCode || 0);
+  const finish = () => (s.selfSignal ? process.kill(process.pid, s.selfSignal) : process.exit(s.exitCode || 0));
   if (s.sleepMs) setTimeout(finish, s.sleepMs); else finish();
 });
 `;

@@ -1,9 +1,12 @@
-import { isAbsolute, relative } from "node:path";
+import { isAbsolute, relative, resolve } from "node:path";
 import type { TokenUsage, ToolUseAudit } from "@merge-safely/core";
 
 /**
  * Incremental parser for `claude -p --output-format stream-json --verbose`. Builds the runner-observed audit
- * from assistant tool_use blocks; the model never writes it. Unknown line types are ignored.
+ * from assistant tool_use blocks matched to their tool_result: only calls whose result is not an error count,
+ * and only reads that resolve inside the workspace land in filesRead. The model never writes the audit.
+ * A `result` event is only kept if it is the last event on the stream (anything after it discards it).
+ * Unknown line types are otherwise ignored.
  */
 
 export interface CliResult {
@@ -24,6 +27,8 @@ interface PendingCall {
   substantive: boolean;
   file?: string;
   command?: string;
+  /** Set from the matching tool_result: true only when it arrived and was not an error. */
+  succeeded: boolean;
 }
 
 const SUBSTANTIVE = new Set(["Read", "Grep", "Glob", "Bash"]);
@@ -54,11 +59,12 @@ export function usageFromCli(u: unknown): TokenUsage | undefined {
 export class StreamJsonParser {
   private buffer = "";
   private readonly calls = new Map<string, PendingCall>();
-  private readonly denied = new Set<string>();
   private readonly perMessageUsage = new Map<string, TokenUsage>();
   private assistantTurns = 0;
   private readonly seenMessages = new Set<string>();
   result: CliResult | undefined;
+  /** True when a result event was followed by more events and discarded. */
+  resultSuperseded = false;
   /** Text of the last assistant text block, used when the result event is missing. */
   lastText: string | undefined;
 
@@ -90,8 +96,14 @@ export class StreamJsonParser {
     } catch {
       return;
     }
-    if (!ev) return;
+    if (!ev || typeof ev.type !== "string") return;
+    // A result only counts as the final word: any later event (e.g. a forged result written mid-run) voids it.
+    if (ev.type !== "result" && this.result) {
+      this.result = undefined;
+      this.resultSuperseded = true;
+    }
     if (ev.type === "assistant") this.onAssistant(ev);
+    else if (ev.type === "user") this.onUser(ev);
     else if (ev.type === "result") this.onResult(ev);
   }
 
@@ -131,10 +143,13 @@ export class StreamJsonParser {
       const name = str(block.name) ?? "unknown";
       if (name === STRUCTURED_OUTPUT_TOOL) continue;
       const input = obj(block.input) ?? {};
-      const call: PendingCall = { name, substantive: SUBSTANTIVE.has(name) };
+      const call: PendingCall = { name, substantive: SUBSTANTIVE.has(name), succeeded: false };
       if (name === "Read") {
         const fp = str(input.file_path) ?? str(input.path);
-        if (fp) call.file = this.rel(fp);
+        const rel = fp ? this.inside(fp) : undefined;
+        if (rel) call.file = rel;
+        // A read outside the checkout is not review work (and --restricted should have refused it).
+        else call.substantive = false;
       }
       if (name === "Bash") {
         const cmd = str(input.command);
@@ -144,12 +159,19 @@ export class StreamJsonParser {
     }
   }
 
-  private onResult(ev: Record<string, unknown>): void {
-    const denials = Array.isArray(ev.permission_denials) ? ev.permission_denials : [];
-    for (const d of denials) {
-      const id = str(obj(d)?.tool_use_id);
-      if (id) this.denied.add(id);
+  private onUser(ev: Record<string, unknown>): void {
+    if (ev.parent_tool_use_id) return;
+    const msg = obj(ev.message);
+    const content = msg && Array.isArray(msg.content) ? msg.content : [];
+    for (const c of content) {
+      const block = obj(c);
+      if (block?.type !== "tool_result") continue;
+      const call = this.calls.get(str(block.tool_use_id) ?? "");
+      if (call) call.succeeded = block.is_error !== true;
     }
+  }
+
+  private onResult(ev: Record<string, unknown>): void {
     const r: CliResult = { isError: ev.is_error === true };
     const subtype = str(ev.subtype);
     if (subtype) r.subtype = subtype;
@@ -168,10 +190,10 @@ export class StreamJsonParser {
     this.result = r;
   }
 
-  private rel(p: string): string {
-    if (!isAbsolute(p)) return p;
-    const r = relative(this.cwd, p);
-    return r && !r.startsWith("..") && !isAbsolute(r) ? r : p;
+  /** Workspace-relative path, or undefined when the path resolves outside the workspace. */
+  private inside(p: string): string | undefined {
+    const r = relative(this.cwd, resolve(this.cwd, p));
+    return r && !r.startsWith("..") && !isAbsolute(r) ? r : undefined;
   }
 
   /** Usage summed from per-message events: the fallback when the process dies before its result event. */
@@ -197,8 +219,8 @@ export class StreamJsonParser {
     let totalCalls = 0;
     const files = new Set<string>();
     const commands: string[] = [];
-    for (const [id, c] of this.calls) {
-      if (this.denied.has(id)) continue;
+    for (const c of this.calls.values()) {
+      if (!c.succeeded) continue;
       totalCalls++;
       if (c.substantive) substantiveCalls++;
       if (c.file) files.add(c.file);

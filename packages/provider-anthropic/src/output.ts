@@ -11,6 +11,7 @@ import {
   type Seat,
   type ToolUseAudit,
 } from "@merge-safely/core";
+import { scrub, scrubDeep } from "./secrets.js";
 
 export type ParsedOutput =
   | { ok: true; role: "hunter"; output: ReviewerOutput }
@@ -49,8 +50,12 @@ export function buildRun(args: {
   error?: string;
   startedAt: Date;
   finishedAt: Date;
+  /** Known secret values; every string in the output and the error is scrubbed of them and of credential shapes. */
+  secrets: readonly string[];
 }): ReviewerRun {
-  const { seat, parsed } = args;
+  const { seat, secrets } = args;
+  // Findings get posted publicly: a seat that read a credential must never be able to quote it.
+  const parsed = args.parsed?.ok ? scrubDeep(args.parsed, secrets) : args.parsed;
   const ok = parsed?.ok === true;
   const run: ReviewerRun = {
     seat,
@@ -63,6 +68,6 @@ export function buildRun(args: {
     finishedAt: args.finishedAt.toISOString(),
   };
   if (seat.role === "judge") run.judgeOutput = ok && parsed.role === "judge" ? parsed.judgeOutput : null;
-  if (args.error) run.error = args.error;
+  if (args.error) run.error = scrub(args.error, secrets);
   return run;
 }

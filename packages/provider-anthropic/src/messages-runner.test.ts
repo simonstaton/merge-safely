@@ -15,7 +15,7 @@ import {
   toolUse,
   ws,
 } from "../test/helpers.js";
-import { MessagesRunner, SUBMIT_REVIEW_TOOL } from "./messages-runner.js";
+import { MessagesRunner, NUDGE_TEXT, SUBMIT_REVIEW_TOOL } from "./messages-runner.js";
 
 const noSleep = { sleep: async () => {}, retryBaseMs: 1 };
 
@@ -113,15 +113,79 @@ describe("MessagesRunner", () => {
     expect(run.error).toContain("summary");
   });
 
-  it("salvages JSON from final text once, else schema-invalid", async () => {
+  it("salvages JSON from final text, else nudges once, then schema-invalid", async () => {
     const ok = new FakeClient([
       message([text(`Done:\n\`\`\`json\n${JSON.stringify(PASS_OUTPUT)}\n\`\`\``)], "end_turn"),
     ]);
     expect((await runner(ok).r.run(seat(), input(), ws())).status).toBe("ok");
-    const bad = new FakeClient([message([text("I think it is fine.")], "end_turn")]);
+
+    const recovers = new FakeClient([
+      message([text("I think it is fine.")], "end_turn"),
+      message([toolUse(SUBMIT_REVIEW_TOOL, PASS_OUTPUT)], "tool_use"),
+    ]);
+    const r1 = await runner(recovers).r.run(seat(), input(), ws());
+    expect(r1.status).toBe("ok");
+    const nudge = recovers.bodies[1]?.messages.at(-1)?.content as Anthropic.TextBlockParam[];
+    expect(nudge.at(-1)?.text).toBe(NUDGE_TEXT);
+
+    const bad = new FakeClient([message([text("fine")], "end_turn"), message([text("still fine")], "end_turn")]);
     const run = await runner(bad).r.run(seat(), input(), ws());
     expect(run.status).toBe("schema-invalid");
     expect(run.error).toContain(SUBMIT_REVIEW_TOOL);
+    expect(bad.bodies).toHaveLength(2);
+  });
+
+  it("never executes tool calls truncated by max_tokens; nudges instead", async () => {
+    const client = new FakeClient([
+      message([toolUse("read_file", { pa: "" }), toolUse(SUBMIT_REVIEW_TOOL, { verdict: "pass" })], "max_tokens"),
+      message([toolUse(SUBMIT_REVIEW_TOOL, PASS_OUTPUT)], "tool_use"),
+    ]);
+    const { r, executor } = runner(client);
+    const run = await r.run(seat(), input(), ws());
+    expect(run.status).toBe("ok");
+    expect(executor()?.calls).toHaveLength(0);
+    const reply = client.bodies[1]?.messages.at(-1)?.content as Anthropic.ContentBlockParam[];
+    expect(reply.filter((b) => b.type === "tool_result")).toHaveLength(2);
+    expect(reply.every((b) => b.type !== "tool_result" || b.is_error === true)).toBe(true);
+  });
+
+  it("accepts a valid submission and ignores other calls in the same response", async () => {
+    const client = new FakeClient([
+      message([toolUse("read_file", { path: "late.ts" }), toolUse(SUBMIT_REVIEW_TOOL, PASS_OUTPUT)], "tool_use"),
+    ]);
+    const { r, executor } = runner(client);
+    const run = await r.run(seat(), input(), ws());
+    expect(run.status).toBe("ok");
+    expect(executor()?.calls).toHaveLength(0);
+    expect(run.audit.totalCalls).toBe(0);
+  });
+
+  it("moves the message cache breakpoint to the latest user message", async () => {
+    const client = new FakeClient([
+      message([toolUse("read_file", { path: "a" })], "tool_use"),
+      message([toolUse(SUBMIT_REVIEW_TOOL, PASS_OUTPUT)], "tool_use"),
+    ]);
+    await runner(client).r.run(seat(), input(), ws());
+    const marked = (msgs: Anthropic.MessageParam[]) =>
+      msgs.flatMap((m, i) =>
+        typeof m.content === "string"
+          ? []
+          : m.content.filter((b) => "cache_control" in b && b.cache_control).map(() => i),
+      );
+    expect(marked(client.bodies[0]?.messages ?? [])).toEqual([0]);
+    expect(marked(client.bodies[1]?.messages ?? [])).toEqual([2]);
+    const system = (client.bodies[1]?.system ?? []) as Anthropic.TextBlockParam[];
+    expect(system[0]?.cache_control).toEqual({ type: "ephemeral" });
+  });
+
+  it("sends effort only when the model supports it", async () => {
+    const s = seat({ model: { connectionId: "c", provider: "anthropic", name: "m", effort: "high" } });
+    const supported = new FakeClient([message([toolUse(SUBMIT_REVIEW_TOOL, PASS_OUTPUT)], "tool_use")]);
+    await runner(supported, {}, model({ effortLevels: ["low", "high"] })).r.run(s, input(), ws());
+    expect(supported.bodies[0]).toMatchObject({ output_config: { effort: "high" } });
+    const unsupported = new FakeClient([message([toolUse(SUBMIT_REVIEW_TOOL, PASS_OUTPUT)], "tool_use")]);
+    await runner(unsupported, {}, model({ effortLevels: undefined })).r.run(s, input(), ws());
+    expect(unsupported.bodies[0]).not.toHaveProperty("output_config");
   });
 
   it("stops at maxTurns with a budget-exceeded recovery message", async () => {
@@ -148,18 +212,22 @@ describe("MessagesRunner", () => {
     expect(run.audit.costUsd).toBeCloseTo(2, 6);
   });
 
-  it("warns when maxUsd cannot be enforced for an unpriced model", async () => {
+  it("prices an unpriced model pessimistically so maxUsd still enforces", async () => {
     const warn = vi.fn();
-    const client = new FakeClient([message([toolUse(SUBMIT_REVIEW_TOOL, PASS_OUTPUT)], "tool_use")]);
     const logger = { debug: vi.fn(), info: vi.fn(), warn, error: vi.fn() };
-    const run = await runner(client, { logger }, model({ pricing: undefined })).r.run(
+    const client = new FakeClient([
+      message([toolUse("read_file", { path: "a" })], "tool_use", { input_tokens: 200_000, output_tokens: 0 }),
+      message([toolUse(SUBMIT_REVIEW_TOOL, PASS_OUTPUT)], "tool_use"),
+    ]);
+    const run = await runner(client, { logger }, model({ name: "anthropic/claude-new-9", pricing: undefined })).r.run(
       seat({}, { maxUsd: 1 }),
       input(),
       ws(),
     );
-    expect(run.status).toBe("ok");
-    expect(run.audit.costUsd).toBeUndefined();
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining("maxUsd cannot be enforced"), expect.anything());
+    // 200k input tokens at the most expensive known input rate (>= $10/MTok) is at least $2.
+    expect(run.status).toBe("budget-exceeded");
+    expect(run.audit.costUsd).toBeGreaterThanOrEqual(2);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("pessimistic"), expect.anything());
   });
 
   it("times out at the seat deadline", async () => {
@@ -201,6 +269,31 @@ describe("MessagesRunner", () => {
     expect(run.status).toBe("ok");
     expect(sleeps).toEqual([2000]);
     expect(run.audit.turns).toBe(1);
+  });
+
+  it("never waits less than retry-after, even above the backoff cap", async () => {
+    const sleeps: number[] = [];
+    const e = new Anthropic.RateLimitError(429, undefined, "rl", new Headers({ "retry-after": "90" }));
+    const client = new FakeClient([e, message([toolUse(SUBMIT_REVIEW_TOOL, PASS_OUTPUT)], "tool_use")]);
+    const r = new MessagesRunner(
+      client,
+      conn(),
+      model(),
+      {},
+      { sleep: async (ms) => void sleeps.push(ms), maxRetryWaitMs: 1000 },
+    );
+    expect((await r.run(seat({}, { deadlineMs: 600_000 }), input(), ws())).status).toBe("ok");
+    expect(sleeps).toEqual([90_000]);
+  });
+
+  it("scrubs secrets from the submitted review", async () => {
+    const leaky = { verdict: "pass", summary: `saw ${API_KEY}`, findings: [] };
+    const run = await runner(new FakeClient([message([toolUse(SUBMIT_REVIEW_TOOL, leaky)], "tool_use")])).r.run(
+      seat(),
+      input(),
+      ws(),
+    );
+    expect(run.output?.summary).toBe("saw [REDACTED]");
   });
 
   it("gives up after 3 retries on 5xx / network errors", async () => {
