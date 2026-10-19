@@ -5,9 +5,10 @@ Merge Safely is hexagonal: one pure core, a set of ports, and adapters that impl
 ```
                  ┌─────────────────────────────────────────────┐
   SourceProvider │                  core                       │  Reporter
-  (GitHub,      ─►  intake → tier → triage → seat → budget →    ├─► (check run, PR review,
-   local git)    │  run* → proof of work → judges → aggregate → │    Slack, stdout, JSON)
-                 │  verdict → report → rounds                  │
+  (GitHub,      ─►  intake → tier → rounds plan → triage →      ├─► (check run, commit status,
+   local git)    │  seat → budget → run* → proof of work →      │    PR review, Slack)
+                 │  judges → aggregate → verdict → report →     │
+                 │  escalate                                   │
   ModelProvider ─►                                             ├─► VerdictStore
   (Anthropic,    │  * run is the only stage that calls a port  │    (memory, fs, sqlite,
    OpenAI,       │    during execution; everything else is     │     check run)
@@ -15,12 +16,12 @@ Merge Safely is hexagonal: one pure core, a set of ports, and adapters that impl
    compatible)   │                                             ├─► CostLedger
                  │                                             │
   Workspace     ─►                                             ├─► Escalation (Slack)
-  (local         │                                             │
-   checkout)     │                                             ├─► Metrics
+  (git worktree, │                                             │
+   working tree) │                                             ├─► Metrics
                  └─────────────────────────────────────────────┘
                                     ▲
                               TrustProvider
-                  (GitHub teams, allowlist, CODEOWNERS)
+                       (GitHub teams, allowlist)
 ```
 
 ## Ports
@@ -40,31 +41,32 @@ Defined in [`packages/core/src/ports.ts`](../packages/core/src/ports.ts). Domain
 | `TrustProvider` | Classify an author as trusted, standard or blocked. Used only for bypass and escalation routing. Never changes the tier. |
 | `Escalation` | Hand a verdict and digest to a human; optionally resolve to a SHA-bound human verdict. |
 | `Metrics` | Emit metric events. |
+| `Logger`, `Clock` | Logging and time, injected so the core stays deterministic. |
 
 ## Packages
 
-| Package | Role | Depends on |
+| Package | Role | Depends on (`@merge-safely/*`) |
 |---|---|---|
-| `@merge-safely/core` | Domain types, ports, policy schema, pure stages, budgets, orchestrator. Zero I/O, no vendor SDKs. | – |
+| `@merge-safely/core` | Domain types, ports, policy schema, pure stages, budgets, seating, `createGate`. Zero I/O, no vendor SDKs. | – |
 | `@merge-safely/lenses` | Shipped lenses, rubric, personas, prompt builders, untrusted delimiting. Pure. | core |
-| `@merge-safely/registry` | Model registry data and pricing. Pure. | core |
-| `@merge-safely/providers` | Connection kinds, connections file, envelope encryption, provider registry, catalog, model resolution. No vendor SDKs. | core, registry |
-| `@merge-safely/tools` | Shared read-only tool implementation and runner-observed audit. | core |
+| `@merge-safely/registry` | Model registry data, pricing, pessimistic fallback, cheaper-model lookup. Pure. | core |
+| `@merge-safely/providers` | Connection kinds, connections file, envelope encryption, provider registry, catalog, model resolution. No vendor SDKs. | core |
+| `@merge-safely/tools` | Shared read-only tool set, runner-observed audit, vendor tool-shape converters, shared agentic loop. | core, registry |
 | `@merge-safely/provider-anthropic` | Messages API runner, Claude Code CLI runner. | core, registry, providers, tools |
-| `@merge-safely/provider-openai` | Responses and Chat Completions runners, including OpenAI-compatible endpoints. | core, registry, providers, tools |
-| `@merge-safely/provider-gemini` | Gemini Developer API runner. | core, registry, providers, tools |
-| `@merge-safely/provider-compatible` | OpenAI-compatible and Anthropic-compatible base-URL runners. | core, registry, providers, tools, provider-anthropic, provider-openai |
-| `@merge-safely/github` | Source provider, check run and PR review reporters, team trust, webhook verifier, App auth, check-run-backed store. | core |
-| `@merge-safely/workspace-local` | Local git checkout workspace. | core |
+| `@merge-safely/provider-openai` | Responses and Chat Completions runners, including OpenAI-compatible endpoints. | core, registry, tools |
+| `@merge-safely/provider-gemini` | Gemini Developer API runner. | core, registry, tools |
+| `@merge-safely/provider-compatible` | OpenAI-compatible, Anthropic-compatible, Ollama and LM Studio presets; `allProviders()`. | core, registry, providers, tools, provider-anthropic, provider-openai, provider-gemini |
+| `@merge-safely/github` | Source provider, check run, commit status and PR review reporters, check-run-backed store, trust providers, webhook verifier, App auth. | core |
+| `@merge-safely/workspace-local` | `localWorkspace` (bare mirror plus a worktree per seat) and `currentTreeWorkspace` (the working tree, for `--local`). | core |
 | `@merge-safely/store-memory` | In-memory store and ledger, plus the contract test suites every store runs. | core |
 | `@merge-safely/store-fs` | Filesystem store and ledger. No database, no native modules. | core |
-| `@merge-safely/store-sqlite` | SQLite store and ledger (WAL, compaction). Default for the CLI and App. | core |
+| `@merge-safely/store-sqlite` | SQLite store and ledger (WAL, compaction). Used by the App and by `--store sqlite`. | core |
 | `@merge-safely/escalation-slack` | Slack incoming-webhook escalation and reporter. | core |
-| `@merge-safely/cli` | The `merge-safely` binary. | everything except app, action, evals, testkit |
+| `@merge-safely/evals` | Eval suite format, runner, reports, circuit breakers, starter suite. | core, github, lenses, store-memory, workspace-local |
+| `@merge-safely/cli` | The `merge-safely` binary, and the gate wiring the Action reuses. | every adapter above, plus evals |
 | `@merge-safely/action` | The GitHub Action entry point. | core, cli |
-| `@merge-safely/app` | Self-hosted GitHub App: webhooks, queue, setup page, encrypted connections. | the adapters it runs, store-sqlite |
-| `@merge-safely/evals` | Eval suite format, runner and reports. | core, cli |
-| `@merge-safely/testkit` | Fake providers, sources and fixtures. | core |
+| `@merge-safely/app` | Self-hosted GitHub App: webhooks, durable queue, setup page, encrypted connections, alerts. | core, lenses, registry, providers, tools, workspace-local, the four provider packages, github, store-sqlite, escalation-slack |
+| `@merge-safely/testkit` | Fake providers, sources, workspaces and fixtures. | core |
 
 Rules:
 
@@ -74,65 +76,67 @@ Rules:
 
 ## Pipeline stages
 
-Each stage is an exported function. Every stage except `run` is pure given its inputs. See [design §4.2](design.md#42-pipeline-stages).
+Each stage is an exported function of `@merge-safely/core`. Every stage except running a seat is pure given its inputs. `createGate` runs them in this order (see [`packages/core/src/orchestrator/gate.ts`](../packages/core/src/orchestrator/gate.ts)):
 
-| Stage | In core |
-|---|---|
-| Intake | Normalise the change; quarantine untrusted text. |
-| Tier | Composite score; critical paths and flag removals force tier 3. |
-| Triage | Deterministic auto-pass for tier 0 docs, assets, lockfiles and tiny diffs. |
-| Seat | `seat()`: lenses, seat count, models, decorrelation, fallback. Throws `SeatingError` with a fix hint on a misconfigured policy. |
-| Budget | `admit()`, `evaluateCeilings()`, `downgradeLadder()`. |
-| Run | `ModelRunner.run` per seat, concurrently. |
-| Proof of work | Downgrade passes with too little runner-observed work. |
-| Judges | Vote per finding; drop style classes. |
-| Aggregate | Fingerprint, dedupe, rank, quorum. |
-| Verdict | Compare-and-set into the store. |
-| Report | Digest and cost line to every reporter. |
-| Rounds | Delta diff, known findings, escalation after the cap. |
+| Stage | Function | What it does |
+|---|---|---|
+| Intake | `intake()` | Normalise the change; copy untrusted text out; redact secret shapes. |
+| Tier | `tier()` | Composite score; critical paths, flag removals and truncated file lists force tier 3. |
+| Rounds plan | `planRound()` | Round number, open findings from earlier verdicts, delta-only or full, round cap. |
+| Triage | `triage()` | Deterministic auto-pass for tier 0 docs, assets, lockfiles and small diffs. |
+| Seat | `seat()` | Lenses, seat count, models, decorrelation, fallback. Throws `SeatingError` with a fix hint on a misconfigured policy. |
+| Budget | `evaluateCeilings()`, `admit()`, `downgradeLadder()` | Five ceilings, then the downgrade ladder or a refusal. |
+| Run | `ModelRunner.run` | One run per seat, hunters concurrently (`concurrency`, default 4; the CLI uses 2). |
+| Proof of work | `attest()` | Reject passes and judge votes with too little runner-observed work. |
+| Judges | `applyJudgeVotes()` | Votes per finding; drop style classes; optional second round on split votes. |
+| Rounds reconcile | `reconcileRounds()` | Which known findings were addressed; the rest are carried. |
+| Aggregate | `aggregate()`, `dedupeFindings()`, `rankFindings()` | Fingerprint, dedupe, rank, quorum, decision. |
+| Verdict | `canAcceptVerdict()` + the store's compare-and-set | No-downgrade guards; contested and pending rules. |
+| Report | `renderDigest()` | Digest and cost line to every reporter. |
+| Escalate | the `Escalation` port | Once per commit, after the verdict is stored. |
+
+Every port call is time-bounded (`DEFAULT_PORT_TIMEOUTS`: 120 s for the source and workspace, 30 s for the store, reporters, escalation, trust and ledger reads, 5 s per ledger append). A failing reporter, metrics sink, ledger append or escalation never fails a review. Once the change is known, any other failure reports an `error` event and rejects with a `GateError` whose message is secret-scrubbed.
+
+`review()` loads the change through the `SourceProvider`, pins the head SHA (`head-moved` if it changed) and persists the verdict. `reviewChange()` takes a change you already hold and persists only with `{ persist: true }`; that is what `run --local` and the eval runner use. `estimate()` runs tier, triage, round plan, seating and admission with no model call. `explain()` reads the stored verdict and history. `recordHumanVerdict()` stores a SHA-bound human verdict.
 
 ## Composing your own pipeline
 
-The orchestrator takes ports and a policy and returns a gate. The shape below follows [design §6.4](design.md#64-programmatic) with this repository's package names. Exports from packages that are still being built (`github`, `workspace-local`, the `createGate` orchestrator) are illustrative; check each package's README for the exact names.
+The orchestrator takes ports and a policy and returns a gate. [examples/programmatic/gate.ts](../examples/programmatic/gate.ts) is a complete, type-checked program that reviews one pull request with the same wiring as `merge-safely run --repo … --pr … --report github --store checkrun`. Its core:
 
 ```ts
-import { readFile } from "node:fs/promises";
-import { createGate, loadPolicy } from "@merge-safely/core";
-import { github } from "@merge-safely/github";
-import { anthropicProvider } from "@merge-safely/provider-anthropic";
-import { openaiProvider } from "@merge-safely/provider-openai";
-import { createProviderRegistry, loadConnectionsFile } from "@merge-safely/providers";
-import { sqliteStores } from "@merge-safely/store-sqlite";
-import { slackEscalation } from "@merge-safely/escalation-slack";
-import { localWorkspace } from "@merge-safely/workspace-local";
-import { parse } from "yaml";
-
-const policy = loadPolicy(parse(await readFile(".merge-safely.yml", "utf8")));
-const connections = await loadConnectionsFile(); // $MERGE_SAFELY_HOME/connections.json, decrypted with MERGE_SAFELY_MASTER_KEY
-const { verdicts, ledger } = sqliteStores({ path: ".merge-safely/store.db" });
+const registry = createProviderRegistry(allProviders());
+const catalog = catalogLookup(await buildCatalog(registry, connections));
+const octokit = octokitFromToken(token);
 
 const gate = createGate({
-  source: github({ token: process.env.GITHUB_TOKEN }),
-  providers: createProviderRegistry([anthropicProvider(), openaiProvider()]),
+  source: githubSource({ octokit }),
+  workspace: localWorkspace({ cloneUrl: `https://github.com/${repo.owner}/${repo.name}.git`, token }),
+  providers: (conn) => registry.forConnection(conn),
   connections,
-  workspace: localWorkspace(),
-  store: verdicts,
+  catalog,
+  store: checkRunStore({ octokit, policy }),
   ledger,
-  reporters: [github.checkRun(), github.prReview()],
-  escalation: slackEscalation({ webhookUrl: process.env.SLACK_WEBHOOK_URL! }),
-  trust: github.teams(),
+  reporters: [checkRunReporter({ octokit, policy }), prReviewReporter({ octokit, policy })],
+  trust: trustFromPolicy(policy, octokit),
   policy,
+  tools: createReadOnlyTools,
+  prompts,   // buildHunterPrompt / buildJudgePrompt from @merge-safely/lenses
+  pricing,   // withPricing / priceUsage / cheaperModel from @merge-safely/registry
+  installationId: `${repo.owner}/${repo.name}`,
 });
 
-const verdict = await gate.review({ repo: { host: "github.com", owner: "my-org", name: "my-repo" }, number: 1234 });
+const result = await gate.review({ repo, number });
+console.log(result.digest.text);
 ```
 
-You can also call the stages directly, for example to compute a tier and seating for a dashboard without running any model, or to plug in your own `Workspace` that runs each seat in a container.
+Core takes `prompts` and `pricing` as injected functions because it depends on neither the lenses nor the registry; the example shows both in full. Check it compiles with `npx tsc --noEmit -p examples/programmatic/tsconfig.json`.
+
+You can also call the stages directly, for example to compute a tier and seating for a dashboard without running any model, or plug in your own `Workspace` that runs each seat in a container. `@merge-safely/testkit` has fakes for every port.
 
 ## Writing an adapter
 
 - **A provider.** Implement `ModelProvider` and a `ModelRunner`. Use the shared `ToolExecutor` from `RunnerOptions.tools` so proof-of-work semantics match every other provider. Stream usage through `onUsage`. Never throw from `validate` or `run`: return `ok: false` or a `ReviewerRun` with a status. Classify budget stops as `budget-exceeded`. Scrub secrets from every string you return.
-- **A store.** Implement `VerdictStore` and `CostLedger`, then run the contract suites from `@merge-safely/store-memory` against your implementation.
+- **A store.** Implement `VerdictStore` and `CostLedger`, then run the contract suites from `@merge-safely/store-memory` against your implementation. Compare-and-set must be atomic, and repository keys compare case-insensitively.
 - **A lens.** See [lenses.md](lenses.md#writing-a-third-party-lens).
 - **A reporter or escalation.** Implement `Reporter` or `Escalation`. Treat every string from the verdict as untrusted when rendering. A reporter must not throw in a way that breaks the review.
 

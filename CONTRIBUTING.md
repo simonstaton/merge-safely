@@ -9,21 +9,49 @@ Node 20 or later (see `.nvmrc`).
 ```bash
 git clone https://github.com/simonstaton/merge-safely.git
 cd merge-safely
-npm install
+npm ci
+npm run build
 ```
+
+`git` must be on your `PATH` (the workspace, tools and eval tests use it). `ripgrep` is used when installed.
 
 ## Commands
 
 ```bash
-npm run lint           # biome
-npm run lint:fix
+npm run lint           # biome check (format + lint)
+npm run lint:fix       # apply biome fixes
 npm run typecheck      # whole repo including tests, from source
 npm run build          # tsc -b (project references) -> packages/*/dist
 npm test               # vitest; resolves @merge-safely/* to source
+npm run check          # lint + typecheck + test
+npm run clean          # remove every dist/ and tsbuildinfo
 npx vitest run packages/core   # one package
 ```
 
-All four (`lint`, `typecheck`, `build`, `test`) must pass before you open a PR. CI runs the same.
+All four (`lint`, `typecheck`, `build`, `test`) must pass before you open a PR. CI (`.github/workflows/ci.yml`) runs exactly these on Node 20 for every pull request and every push to `main`.
+
+To try your change end to end:
+
+```bash
+node packages/cli/dist/bin.js --home /tmp/ms-home --help        # the CLI, with a scratch state directory
+node packages/cli/dist/bin.js eval --suite packages/evals/suites/starter --dry
+npx tsc --noEmit -p examples/programmatic/tsconfig.json          # the programmatic example still compiles
+```
+
+`npm link -w packages/cli` puts your build on the `PATH` as `merge-safely`. The App runs with `node packages/app/dist/main.js` (see [docs/quickstart-app.md](docs/quickstart-app.md)).
+
+## Packages
+
+| Directory | Package |
+|---|---|
+| `packages/core` | Domain types, ports, policy schema, pure stages, budgets, orchestrator. |
+| `packages/lenses`, `registry`, `providers`, `tools` | Pure or near-pure building blocks. |
+| `packages/provider-anthropic`, `provider-openai`, `provider-gemini`, `provider-compatible` | Model provider adapters. |
+| `packages/github`, `workspace-local`, `store-memory`, `store-fs`, `store-sqlite`, `escalation-slack` | Port adapters. |
+| `packages/cli`, `action`, `app` | Entry points. |
+| `packages/evals`, `testkit` | The eval runner and suites; fakes for tests. |
+
+Each package has a README; read it before you change the package. The architecture is in [docs/architecture.md](docs/architecture.md).
 
 ## Package rules
 
@@ -40,7 +68,7 @@ All four (`lint`, `typecheck`, `build`, `test`) must pass before you open a PR. 
 - Biome: 2-space indent, double quotes, semicolons, 120 columns. Run `npm run lint:fix` before committing.
 - `catch (err: unknown)`, never `any`. Prefer `unknown` plus type guards.
 - `node:` prefix for built-ins.
-- Tests live next to source as `*.test.ts`. Every pure function gets a test. Adapters get tests with fakes. Tests never call a real network.
+- Tests live next to source as `*.test.ts`. Every pure function gets a test. Adapters get tests with fakes (`@merge-safely/testkit` has one for every port). Tests never call a real network.
 - No telemetry, no phone-home.
 - Secrets never appear in logs, prompts, verdicts or error messages. Test that they do not.
 
@@ -58,11 +86,17 @@ If you find a way to break it, report it privately (see [SECURITY.md](SECURITY.m
 
 ## Pull requests
 
-- Title: `<package>: <what>`, for example `store-sqlite: index cost_entries by connection`.
+- Branch from `main`. Title: `<package>: <what>`, for example `store-sqlite: index cost_entries by connection` (`docs: …` for documentation).
 - Describe what changed and why, and how you tested it.
 - Call out any change to a port, a domain type, the policy schema or a default. Policy defaults change the policy hash on every verdict.
-- Add a line to `CHANGELOG.md` under "Unreleased" for anything user-visible.
+- Add a line to `CHANGELOG.md` under the unreleased version for anything user-visible, and update the docs that describe it.
 - Keep PRs small. One concern per PR.
+
+`main` is protected:
+
+- The CI check must pass.
+- The branch must be up to date with `main` before it merges; rebase or merge `main` in when it moves.
+- PRs are squash-merged, so the PR title becomes the commit subject on `main`. Write it accordingly.
 
 ## Adding a provider
 
@@ -73,7 +107,8 @@ If you find a way to break it, report it privately (see [SECURITY.md](SECURITY.m
 5. `validate` and `run` never throw. Set every SDK option explicitly so no environment variable can redirect the key or the PR.
 6. Scrub connection secrets and secret-shaped strings from every string you return.
 7. Add the provider's models to the registry if they are not there.
-8. Tests with a fake client. Write a README with the connection kinds, runner behaviour and known gaps, following `packages/provider-openai/README.md`.
+8. Add it to `allProviders()` in `packages/provider-compatible` so the CLI, Action and App can serve it, and teach `@merge-safely/providers` its connection kinds if they are new.
+9. Tests with a fake client. Write a README with the connection kinds, runner behaviour and known gaps, following `packages/provider-openai/README.md`.
 
 ## Adding a lens
 
@@ -100,6 +135,13 @@ Compare-and-set must be atomic: two writers must never both win. Money is intege
 ## Eval cases
 
 The eval suite and incident cases are the project's most valuable asset. If Merge Safely missed something real, or blocked something clean, an anonymised case for `merge-safely eval` is one of the most useful contributions you can make. Strip names, secrets and anything that identifies your organisation.
+
+```bash
+node packages/cli/dist/bin.js eval init packages/evals/suites/starter --case my-incident --kind incident --title "What went wrong"
+node packages/cli/dist/bin.js eval --suite packages/evals/suites/starter --ids my-incident --dry
+```
+
+`eval init` writes a commented `case.yml` and empty `base/` and `head/` trees; the case fails validation until you fill them in. The case format is in [packages/evals/README.md](packages/evals/README.md).
 
 ## Licence
 

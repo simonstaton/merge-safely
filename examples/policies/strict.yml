@@ -79,6 +79,7 @@ rounds:
   max: 3
 
 trust:
+  # Team lookups need organisation Members: read (the App). Without it every author is standard.
   provider: github-teams
   trusted: ["my-org/platform"]
   trustedBypassMaxTier: 1
@@ -92,7 +93,9 @@ reporting:
 budget:
   perSeatUsd: 5
   perChangeUsd: 40
-  perInstallationMonthlyUsd: 1500
+  perInstallationMonthlyUsd: 1500   # enforced by the App; reported but never blocking in the Action and CLI
+  # windowUsd needs a persistent cost ledger: the App, or the CLI on one machine. The Action's ledger starts
+  # empty on every job, so there it only ever sees the current review.
   windowUsd: 600
   windowDays: 7
   onOverBudget: block            # never run a cheaper panel than the policy asks for

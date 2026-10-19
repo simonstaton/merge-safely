@@ -20,13 +20,16 @@ Anything that breaks the runner contract in [docs/security.md](docs/security.md)
 - PR content (title, body, comments, paths, file contents, diff) being treated as instructions outside the delimited data blocks, or escaping them.
 - A forged or inflated proof-of-work audit.
 - A pass verdict overwriting an unresolved block, or a verdict attaching to the wrong head SHA.
+- A pull request changing the policy that governs its own review (the policy is read from the base branch).
+- A forged or replayed verdict: a check run, commit status, round-history comment or review marker that the gate accepts although its own identity did not write it.
 - A connection secret appearing in a prompt, log, verdict, check run, PR review, error message or API response.
-- Webhook signature bypass, or unauthenticated access to stored connections in the App.
+- Webhook signature bypass, or access to the App's setup page, admin API or stored connections without `SETUP_TOKEN`.
 - Budget ceilings that can be bypassed.
 
 ## Out of scope
 
 - Code that a policy-allowed command runs. Allowing commands executes PR code by design; see [docs/security.md](docs/security.md#what-allowedcommands-exposes).
+- Check runs written by other workflows in the same repository when the gate runs as the Action with the default `GITHUB_TOKEN`; see [docs/security.md](docs/security.md#non-guarantees). Use the App and pin the check's source app.
 - A model reaching a wrong verdict without any contract being broken. Report those as eval cases instead.
 - Vulnerabilities in model providers or in GitHub.
 
