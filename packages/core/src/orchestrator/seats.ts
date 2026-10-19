@@ -185,7 +185,7 @@ export function sanitiseRun(run: ReviewerRun): ReviewerRun {
       redactFinding({ ...f, lenses: [...new Set([...(f.lenses ?? []), run.seat.lens])] }),
     );
     out.output = { ...run.output, summary: redactText(run.output.summary), findings };
-    if (run.output.confidenceRefuted) out.output.confidenceRefuted = run.output.confidenceRefuted.map(redactText);
+    if (run.output.confidenceRefuted) out.output.confidenceRefuted = run.output.confidenceRefuted.map((s) => redactText(s));
   }
   if (run.judgeOutput) {
     out.judgeOutput = {
