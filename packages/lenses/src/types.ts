@@ -1,8 +1,16 @@
-import type { ChangedFile, LensId, ModelTierClass, PersonaId, Tier } from "@merge-safely/core";
+import type { ChangedFile, LensId, ModelTierClass, PersonaId, ReviewerInput, Tier } from "@merge-safely/core";
 
-/** A changed file as a lens sees it: trusted metadata, path already flattened to one safe line. */
+/** What the prompt builders read. The `prompt` field is their output, so it is not required as input. */
+export type ReviewerPromptInput = Omit<ReviewerInput, "prompt">;
+
+/**
+ * A changed file as a lens sees it. Paths are author-controlled, so `path` is hard-sanitised to
+ * `[A-Za-z0-9._/@+-]` (anything else becomes `?`) and `exact` says whether that left it unchanged.
+ * Lens hints should only name files where `exact` is true; the exact list lives in the changed-files block.
+ */
 export interface LensFileInfo {
   path: string;
+  exact: boolean;
   previousPath?: string;
   status: ChangedFile["status"];
   additions: number;
@@ -10,8 +18,8 @@ export interface LensFileInfo {
 }
 
 /**
- * What a lens's `focus` may look at. Deliberately excludes every untrusted field (title, body,
- * comments, diff text) so a lens checklist can never interpolate attacker-controlled prose.
+ * What a lens's `focus` may look at. Excludes every free-text untrusted field (title, body, comments, diff, ticket)
+ * and carries file paths only in sanitised form, so a lens checklist cannot interpolate attacker-written prose.
  */
 export interface LensPromptInput {
   files: readonly LensFileInfo[];
@@ -19,6 +27,7 @@ export interface LensPromptInput {
   round: number;
   diffIsDelta: boolean;
   allowedCommands: readonly string[];
+  /** True only when ticket text is actually rendered in the prompt. */
   hasLinkedTicket: boolean;
   knownFindingCount: number;
 }
@@ -53,9 +62,19 @@ export interface PromptOptions {
   maxRounds?: number;
   /** In delta mode, the previously reviewed SHA the delta is computed from. */
   deltaSinceSha?: string;
+  /** Untrusted-block nonce, `[a-z0-9]{6,32}`. Defaults to a crypto-random value per prompt; pin it in tests. */
+  nonce?: string;
+  /** Diff size cap in chars (default 200k). Longer diffs are cut with a [truncated N chars] note. */
+  maxDiffChars?: number;
 }
 
 export interface BuiltPrompt {
   system: string;
   user: string;
+  /** The nonce used for this prompt's untrusted blocks, for leak checks. */
+  nonce: string;
+  /** Finding ids exactly as rendered (judges: the candidates to vote on, after dropping unsafe ids and duplicates). */
+  findingIds: string[];
+  /** Non-fatal problems, e.g. candidates dropped for unsafe or duplicate ids. */
+  warnings: string[];
 }

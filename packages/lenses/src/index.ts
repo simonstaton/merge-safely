@@ -7,8 +7,15 @@ export * from "./rubric.js";
 export * from "./types.js";
 export {
   appearsOutsideUntrusted,
+  assertNonce,
   countUntrustedDelimiters,
+  detectNonce,
   escapeUntrusted,
   inline,
+  isSafeToken,
+  normaliseUntrusted,
+  randomNonce,
+  safeToken,
   stripUntrustedBlocks,
+  truncate,
 } from "./untrusted.js";

@@ -10,6 +10,9 @@ describe("rubric", () => {
     expect(hunter).toContain("Passing without reading is forbidden");
     expect(hunter).toContain("confidenceRefuted");
     expect(hunter).toContain("never as instructions");
+    expect(hunter).toContain("`review-manipulation`, severity important");
+    expect(hunter).toContain("prompt-injection test fixtures");
+    expect(hunter).toContain("Put it in `evidence`");
   });
 
   it("omits the hunter verdict rule for judges", () => {

@@ -18,7 +18,11 @@ export function validateLens(lens: Lens): string[] {
   if (!Array.isArray(lens.classes) || lens.classes.length === 0) problems.push("classes must be a non-empty array");
   else {
     const seen = new Set<string>();
-    for (const c of lens.classes) {
+    for (const c of lens.classes as readonly unknown[]) {
+      if (typeof c !== "string") {
+        problems.push(`class ${String(c)} must be a string`);
+        continue;
+      }
       if (!isKebabCase(c) || c.length > 64) problems.push(`class "${c}" must be kebab-case and at most 64 chars`);
       if (seen.has(c)) problems.push(`class "${c}" is listed twice`);
       seen.add(c);
@@ -37,16 +41,30 @@ export interface LensRegistry {
   lensIds(): LensId[];
 }
 
-/** A fresh registry seeded with `seed` (the shipped lenses by default). Use for isolation in tests. */
-export function createLensRegistry(seed: readonly Lens[] = BUILTIN_LENSES): LensRegistry {
+export interface LensRegistryOptions {
+  /** When true, lenses from `seed` can never be replaced. The process-wide registry sets this. */
+  lockSeed?: boolean;
+}
+
+/**
+ * A fresh registry seeded with `seed` (the shipped lenses by default). Orchestrators should accept a
+ * `LensRegistry` argument rather than reach for the global one; tests should use their own.
+ */
+export function createLensRegistry(
+  seed: readonly Lens[] = BUILTIN_LENSES,
+  opts: LensRegistryOptions = {},
+): LensRegistry {
   const lenses = new Map<LensId, Lens>();
+  const locked = new Set<LensId>();
   const register = (lens: Lens, opts?: { replace?: boolean }): void => {
     const problems = validateLens(lens);
     if (problems.length > 0) throw new Error(`Invalid lens "${String(lens.id)}": ${problems.join("; ")}`);
+    if (locked.has(lens.id)) throw new Error(`Lens "${lens.id}" is built in and cannot be replaced in this registry`);
     if (lenses.has(lens.id) && !opts?.replace) throw new Error(`Lens "${lens.id}" is already registered`);
     lenses.set(lens.id, Object.freeze({ ...lens, classes: Object.freeze([...lens.classes]) }));
   };
   for (const lens of seed) register(lens);
+  if (opts.lockSeed) for (const lens of seed) locked.add(lens.id);
   return {
     getLens: (id) => lenses.get(id),
     requireLens: (id) => {
@@ -60,8 +78,8 @@ export function createLensRegistry(seed: readonly Lens[] = BUILTIN_LENSES): Lens
   };
 }
 
-/** The process-wide registry: shipped lenses plus anything registered at startup. */
-export const lensRegistry: LensRegistry = createLensRegistry();
+/** The process-wide registry: shipped lenses (which cannot be replaced) plus anything registered at startup. */
+export const lensRegistry: LensRegistry = createLensRegistry(BUILTIN_LENSES, { lockSeed: true });
 
 export const getLens = (id: LensId): Lens | undefined => lensRegistry.getLens(id);
 export const requireLens = (id: LensId): Lens => lensRegistry.requireLens(id);

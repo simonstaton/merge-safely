@@ -1,4 +1,7 @@
-import { type Finding, REVIEWER_OUTPUT_JSON_SCHEMA, type ReviewerInput } from "@merge-safely/core";
+import { type Finding, REVIEWER_OUTPUT_JSON_SCHEMA } from "@merge-safely/core";
+import type { ReviewerPromptInput } from "../src/types.js";
+
+export const NONCE = "n0nce0test";
 
 export function makeFinding(overrides: Partial<Finding> = {}): Finding {
   return {
@@ -14,7 +17,7 @@ export function makeFinding(overrides: Partial<Finding> = {}): Finding {
   };
 }
 
-export function makeInput(overrides: Partial<ReviewerInput> = {}): ReviewerInput {
+export function makeInput(overrides: Partial<ReviewerPromptInput> = {}): ReviewerPromptInput {
   return {
     change: {
       repo: { host: "github.com", owner: "acme", name: "shop" },
@@ -49,7 +52,6 @@ export function makeInput(overrides: Partial<ReviewerInput> = {}): ReviewerInput
     untrusted: { title: "Fix double discount", body: "Fixes the double discount bug." },
     knownFindings: [],
     allowedCommands: ["npm test -- src/billing"],
-    prompt: { system: "", user: "" },
     outputSchema: REVIEWER_OUTPUT_JSON_SCHEMA as unknown as Record<string, unknown>,
     ...overrides,
   };

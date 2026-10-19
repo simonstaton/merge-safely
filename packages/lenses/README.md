@@ -58,8 +58,11 @@ export const i18nLens: Lens = {
     ].join("\n"),
 };
 
-registerLens(i18nLens); // throws if invalid or the id is taken; pass { replace: true } to override deliberately
+registerLens(i18nLens); // throws if invalid or the id is taken
 ```
+
+The process-wide `lensRegistry` never lets a built-in lens be replaced. To customise a built-in, build your own with
+`createLensRegistry(seed)` and pass that registry to the orchestrator.
 
 Then list the id in the policy's lens set for the tiers that should run it.
 
@@ -67,10 +70,11 @@ Rules for `focus`:
 
 - **Pure and fast.** No I/O, no randomness, no clock. It runs once per seat and its output is part of a prompt that
   should be reproducible from the input.
-- **Trusted input only.** `focus` receives a `LensPromptInput`: changed-file metadata (paths already flattened to a
-  single safe line), tier, round, delta flag, allowed commands. It deliberately cannot see the PR title, body,
-  comments or diff, so a lens can never interpolate attacker-written text outside an untrusted block. Do not work
-  around this.
+- **Sanitised input only.** `focus` receives a `LensPromptInput`: changed-file metadata, tier, round, delta flag and
+  allowed commands. It cannot see the PR title, body, comments, ticket or diff. File paths are author-controlled, so
+  they arrive hard-sanitised to `[A-Za-z0-9._/@+-]` with an `exact` flag. Only name files where `exact` is true (the
+  `pathsMatching`/`removedPaths` helpers do this); the exact list is rendered to the model inside the
+  `changed-files` untrusted block. Do not work around this.
 - **Say which tools to use.** Reviewers do better when told how to investigate: which files to read, what to grep
   for, when git log or blame helps, which allowed command settles the question. `input.allowedCommands` may be
   empty; say what to do instead.
@@ -86,10 +90,19 @@ isolated registry for tests.
 
 ## Untrusted text
 
-All PR text, commit messages, comments, ticket text, the diff and prior model findings are rendered only through
-`wrapUntrusted(source, text)`, which emits `<untrusted source="...">` ... `</untrusted>` and escapes any tag
-lookalike in the content, preceded by `UNTRUSTED_NOTICE`. Other packages can assert there is no leakage with
-`appearsOutsideUntrusted(prompt, needle)` and `countUntrustedDelimiters(prompt)`.
+Every prompt gets a random nonce (`PromptOptions.nonce` pins it for tests). All PR text, commit messages, comments,
+ticket text, changed-file paths, tier reasons, the diff and prior model findings are rendered only through
+`wrapUntrusted(source, text, nonce)`, which emits `<untrusted-<nonce> source="...">` ... `</untrusted-<nonce>>`.
+Content is NFKC-normalised, stripped of Unicode format characters (zero-width, soft hyphen, bidi), and any remaining
+`<untrusted` lookalike is escaped. Each field is capped (`UNTRUSTED_LIMITS`; the diff via `PromptOptions.maxDiffChars`)
+with a `[truncated N chars]` note. The prompt opens with `untrustedNotice(nonce)`. Author-controlled identifiers
+outside blocks (refs, labels, ticket ids) go through `safeToken`.
+
+Finding ids are rendered exactly. Candidates with an id outside `FINDING_ID_PATTERN` or a duplicate id are dropped and
+reported in `BuiltPrompt.warnings`; `BuiltPrompt.findingIds` lists what the model saw.
+
+Other packages can assert no leakage with `appearsOutsideUntrusted(prompt, needle, nonce?)` (fails closed on an
+unterminated block) and `countUntrustedDelimiters(prompt, nonce?)` (`stray` must be 0).
 
 ## Prompt drift
 

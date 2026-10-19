@@ -44,12 +44,42 @@ describe("registry", () => {
     expect(getLens("i18n")).toBeUndefined();
   });
 
+  it("refuses to replace built-ins in the global registry", () => {
+    expect(() => lensRegistry.registerLens({ ...thirdParty, id: "security" }, { replace: true })).toThrow(/built in/);
+    expect(getLens("security")?.title).toBe("Security");
+  });
+
   it("rejects malformed lenses", () => {
     const reg = createLensRegistry([]);
     expect(() => reg.registerLens({ ...thirdParty, id: "Bad Id" })).toThrow(/kebab-case/);
     expect(() => reg.registerLens({ ...thirdParty, classes: ["ok", "ok"] })).toThrow(/listed twice/);
     expect(() => reg.registerLens({ ...thirdParty, classes: ["NotKebab"] })).toThrow(/kebab-case/);
     expect(() => reg.registerLens({ ...thirdParty, classes: [] })).toThrow(/non-empty/);
+    expect(() => reg.registerLens({ ...thirdParty, classes: [123] as unknown as string[] })).toThrow(
+      /must be a string/,
+    );
+  });
+});
+
+describe("security path hint", () => {
+  it("matches whole auth segments only", () => {
+    const files = [
+      "src/auth/login.ts",
+      "src/auth-service/x.ts",
+      "src/author/bio.ts",
+      "docs/authors.md",
+      "ui/tokens/color.ts",
+    ];
+    const input = toLensPromptInput(
+      makeInput({
+        change: {
+          ...makeInput().change,
+          files: files.map((path) => ({ path, status: "modified", additions: 1, deletions: 0 })),
+        },
+      }),
+    );
+    const focus = getLens("security")?.focus(input) ?? "";
+    expect(focus).toContain("Security-sensitive paths changed: src/auth/login.ts, src/auth-service/x.ts.");
   });
 });
 
@@ -80,6 +110,7 @@ describe("shipped lenses", () => {
     const input = toLensPromptInput(makeInput());
     expect(getLens("rollout")?.focus(input)).toContain("Migrations changed: db/migrations/0042_add_coupon_index.sql.");
     expect(getLens("blast-radius")?.focus(input)).toContain("src/billing/legacy.ts");
+    expect(getLens("security")?.focus(input)).toContain("class review-manipulation, severity important");
     const noCmd = toLensPromptInput(makeInput({ allowedCommands: [] }));
     expect(getLens("repro")?.focus(noCmd)).toContain("no commands may be run");
     expect(getLens("correctness")?.focus(noCmd)).toContain("No commands may be run");
