@@ -34,6 +34,8 @@ export interface CaseActual {
   /** Distinct model names that served (or would serve) a seat. */
   models: string[];
   status: CaseStatus;
+  /** Set when the verdict was contested (a stored unresolved block for this SHA). Counts as unresolved. */
+  contested?: boolean;
   error?: string;
   /** Seat runs that did not finish ok, e.g. "hunter:perf:1=timeout". */
   seatFailures?: string[];

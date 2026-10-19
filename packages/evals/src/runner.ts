@@ -5,11 +5,21 @@
  * state (stored blocks, spend, rounds) leaks between cases. `estimate` always runs first and records tier, triage and
  * seating; `dry` stops there and never calls `reviewChange`, so no model is contacted.
  */
-import { type Change, loadPolicy, type Policy, type PolicyInput, type Verdict } from "@merge-safely/core";
+import {
+  type Change,
+  type Finding,
+  loadPolicy,
+  type Policy,
+  type PolicyInput,
+  type ReviewerRun,
+  type Verdict,
+  type Workspace,
+} from "@merge-safely/core";
 import type { OctokitLike } from "@merge-safely/github";
 import { memoryCostLedger, memoryVerdictStore } from "@merge-safely/store-memory";
+import { localWorkspace } from "@merge-safely/workspace-local";
 import { type EvalGate, estimateOnlyGateFactory, type GateEstimate, type GateFactory } from "./gate.js";
-import { materializeCase } from "./materialize.js";
+import { type CaseRepo, type MaterializedCase, materializeCase } from "./materialize.js";
 import { summarize } from "./report.js";
 import { evaluateCase } from "./score.js";
 import { type CaseKind, casePolicyInput, type LoadedCase, type LoadedSuite, loadSuite } from "./suite.js";
@@ -30,20 +40,33 @@ export interface RunSuiteOptions {
   dry?: boolean;
   onCase?: (result: CaseResult) => void;
   github?: { octokit: OctokitLike };
+  /**
+   * Workspace for a case's reviewers. Default: `localWorkspace({ repoPath })` over the fixture's throwaway repository
+   * (alive until the case finishes); diff and github cases get none unless this returns one.
+   */
+  workspace?: (repo: CaseRepo | undefined, caseId: string) => Workspace | undefined;
   /** Wall clock for durations; injectable for deterministic tests. */
   now?: () => number;
 }
 
+/**
+ * The seats that raised an aggregated finding. Among hunter seats whose lens is in `finding.lenses`, prefer those
+ * whose own output carries the finding (same fingerprint id, or same class and file); fall back to every seat on
+ * those lenses when no seat output matches (e.g. the runner dropped outputs).
+ */
+export function seatsRaising(v: Verdict, f: Finding): ReviewerRun[] {
+  const lenses = f.lenses ?? [];
+  const onLens = v.seats.filter((r) => r.seat.role === "hunter" && lenses.includes(r.seat.lens));
+  const raised = onLens.filter((r) =>
+    (r.output?.findings ?? []).some((x) => x.id === f.id || (x.class === f.class && x.file === f.file)),
+  );
+  return raised.length > 0 ? raised : onLens;
+}
+
 function findingsFromVerdict(v: Verdict): ActualFinding[] {
-  const hunterModels = new Map<string, Set<string>>();
-  for (const run of v.seats) {
-    const set = hunterModels.get(run.seat.lens) ?? new Set<string>();
-    set.add(run.seat.model.name);
-    hunterModels.set(run.seat.lens, set);
-  }
   return v.findings.map((f) => {
     const lenses = f.lenses ?? [];
-    const models = [...new Set(lenses.flatMap((l) => [...(hunterModels.get(l) ?? [])]))];
+    const models = [...new Set(seatsRaising(v, f).map((r) => r.seat.model.name))];
     const out: ActualFinding = { class: f.class, severity: f.severity, lenses, models };
     if (f.file !== undefined) out.file = f.file;
     if (f.line !== undefined) out.line = f.line;
@@ -82,6 +105,7 @@ function withVerdict(actual: CaseActual, v: Verdict): CaseActual {
     models: v.seats.length > 0 ? [...new Set(v.seats.map((r) => r.seat.model.name))] : actual.models,
     status: "ok",
   };
+  if (v.contested) out.contested = true;
   if (v.seats.length > 0) out.lenses = v.seats.filter((r) => r.seat.role === "hunter").map((r) => r.seat.lens);
   if (v.triaged) {
     out.triage = "auto-pass";
@@ -113,14 +137,22 @@ async function runCase(
   const started = now();
   const spec = lc.spec;
   let actual: CaseActual | undefined;
+  let m: MaterializedCase | undefined;
   try {
     const policy: Policy = loadPolicy(casePolicyInput(suite.manifest, spec, opts.policyOverride));
-    const m = await materializeCase(lc, index, opts.github ? { github: opts.github } : {});
+    m = await materializeCase(lc, index, opts.github ? { github: opts.github } : {});
     const change: Change = m.change;
+    const workspace = opts.workspace
+      ? opts.workspace(m.repo, spec.id)
+      : m.repo
+        ? localWorkspace({ repoPath: m.repo.repoPath })
+        : undefined;
     const gate: EvalGate = await factory(policy, {
       caseId: spec.id,
       store: memoryVerdictStore(),
       ledger: memoryCostLedger(),
+      ...(m.repo ? { repo: m.repo } : {}),
+      ...(workspace ? { workspace } : {}),
     });
     actual = fromEstimate(await gate.estimate(change), opts.dry === true);
     if (!opts.dry) {
@@ -129,6 +161,9 @@ async function runCase(
     }
   } catch (err: unknown) {
     actual = errorActual(errorMessage(err), actual);
+  } finally {
+    // Only after the review: the workspace checks out headSha from this repository.
+    await m?.dispose();
   }
   const { passed, reasons } = evaluateCase(spec, actual);
   return {

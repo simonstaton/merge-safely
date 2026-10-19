@@ -5,13 +5,24 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Change, ChangedFile, ChangeRef, Principal, UntrustedText } from "@merge-safely/core";
 import { githubSource, type OctokitLike } from "@merge-safely/github";
-import { diffTrees, parseUnifiedDiff } from "./diff.js";
+import { confinedPath, FixtureError, materializeTrees, parseUnifiedDiff } from "./diff.js";
 import type { LoadedCase } from "./suite.js";
+
+/** A git repository holding the case's base and head commits, alive until the case finishes. */
+export interface CaseRepo {
+  repoPath: string;
+  headSha: string;
+  baseSha: string;
+}
 
 export interface MaterializedCase {
   change: Change;
   diff: string;
   untrusted: UntrustedText;
+  /** Fixture cases only: the throwaway repository reviewers can check out. Diff and github cases have none. */
+  repo?: CaseRepo;
+  /** Release anything the case holds (the fixture repository). Idempotent. */
+  dispose(): Promise<void>;
 }
 
 export interface MaterializeOptions {
@@ -81,13 +92,26 @@ export async function materializeCase(
   opts: MaterializeOptions = {},
 ): Promise<MaterializedCase> {
   const src = lc.spec.source;
+  const noop = async () => {};
   if (src.type === "fixture") {
-    const d = await diffTrees(join(lc.dir, src.base), join(lc.dir, src.head));
+    const d = await materializeTrees(join(lc.dir, src.base), join(lc.dir, src.head), { confine: lc.dir });
+    if (d.files.length === 0) {
+      await d.dispose();
+      throw new FixtureError(`case ${lc.spec.id}: base/ and head/ are identical; the fixture has no change to review`);
+    }
     const change = buildChange(lc, d.files, d.baseSha, d.headSha, index);
-    return { change, diff: d.diff, untrusted: { title: change.title, body: change.body } };
+    return {
+      change,
+      diff: d.diff,
+      untrusted: { title: change.title, body: change.body },
+      repo: { repoPath: d.repoPath, headSha: d.headSha, baseSha: d.baseSha },
+      dispose: d.dispose,
+    };
   }
   if (src.type === "diff") {
-    const diff = await readFile(join(lc.dir, src.diff), "utf8");
+    const diffPath = await confinedPath(join(lc.dir, src.diff), lc.dir, `source.diff ${src.diff}`);
+    if (!diffPath) throw new FixtureError(`case ${lc.spec.id}: source.diff ${src.diff} not found`);
+    const diff = await readFile(diffPath, "utf8");
     const parsed = parseUnifiedDiff(diff);
     const files = src.files ? mergeListedFiles(src.files, parsed) : parsed;
     const change = buildChange(
@@ -97,7 +121,8 @@ export async function materializeCase(
       syntheticSha(`${lc.spec.id}:head`),
       index,
     );
-    return { change, diff, untrusted: { title: change.title, body: change.body } };
+    if (files.length === 0) throw new FixtureError(`case ${lc.spec.id}: source.diff ${src.diff} has no file changes`);
+    return { change, diff, untrusted: { title: change.title, body: change.body }, dispose: noop };
   }
   if (!opts.github) throw new GithubTokenRequiredError(lc.spec.id);
   const [owner, name] = src.repo.split("/") as [string, string];
@@ -117,14 +142,80 @@ export async function materializeCase(
     stats: pinnedElsewhere ? stats(files) : fetched.stats,
     ...(lc.spec.change ? { title: lc.spec.change.title, body: lc.spec.change.body } : {}),
   };
-  const ctx = source.getUntrustedContext ? await source.getUntrustedContext(ref) : undefined;
+  const ctx = await contextUpToHead(opts.github.octokit, ref, headSha, src.includeComments);
   return {
     change,
     diff,
-    untrusted: {
-      title: change.title,
-      body: change.body,
-      ...(ctx ? { commitMessages: ctx.commitMessages, comments: ctx.comments } : {}),
-    },
+    untrusted: { title: change.title, body: change.body, commitMessages: ctx.commitMessages, comments: ctx.comments },
+    dispose: noop,
   };
+}
+
+const MAX_PAGES = 10;
+
+async function allPages<T>(fetch: (page: number) => Promise<{ data: T[] }>): Promise<T[]> {
+  const out: T[] = [];
+  for (let page = 1; page <= MAX_PAGES; page++) {
+    const { data } = await fetch(page);
+    out.push(...data);
+    if (data.length < 100) break;
+  }
+  return out;
+}
+
+function field(obj: unknown, ...path: string[]): unknown {
+  let cur: unknown = obj;
+  for (const k of path) {
+    if (typeof cur !== "object" || cur === null) return undefined;
+    cur = (cur as Record<string, unknown>)[k];
+  }
+  return cur;
+}
+
+const asTime = (v: unknown): number | undefined => {
+  if (typeof v !== "string") return undefined;
+  const t = Date.parse(v);
+  return Number.isNaN(t) ? undefined : t;
+};
+
+const ITEM_CHARS = 4000;
+const clip = (s: string): string => (s.length > ITEM_CHARS ? `${s.slice(0, ITEM_CHARS)}…` : s);
+
+/**
+ * Untrusted context as it stood at the incident: commit messages of the PR's commits up to and including
+ * `headSha` (none if headSha is not among them), and, only when `includeComments`, comments created no later than
+ * the head commit's committer date (none when that date is unknown). Post-incident discussion never leaks in.
+ */
+export async function contextUpToHead(
+  octokit: OctokitLike,
+  ref: ChangeRef,
+  headSha: string,
+  includeComments: boolean,
+): Promise<{ commitMessages: string[]; comments: string[] }> {
+  const repo = { owner: ref.repo.owner, repo: ref.repo.name };
+  const commits = await allPages((page) =>
+    octokit.pulls.listCommits({ ...repo, pull_number: ref.number, per_page: 100, page }),
+  );
+  const idx = commits.findIndex((c) => c.sha.toLowerCase() === headSha.toLowerCase());
+  const upTo = idx >= 0 ? commits.slice(0, idx + 1) : [];
+  const commitMessages = upTo.slice(-50).map((c) => clip(c.commit.message));
+  if (!includeComments) return { commitMessages, comments: [] };
+  const head = upTo[upTo.length - 1];
+  const cutoff = asTime(field(head, "commit", "committer", "date")) ?? asTime(field(head, "commit", "author", "date"));
+  if (cutoff === undefined) return { commitMessages, comments: [] };
+  const [issueComments, reviewComments] = await Promise.all([
+    allPages((page) => octokit.issues.listComments({ ...repo, issue_number: ref.number, per_page: 100, page })),
+    allPages((page) => octokit.pulls.listReviewComments({ ...repo, pull_number: ref.number, per_page: 100, page })),
+  ]);
+  const before = (c: unknown) => {
+    const t = asTime(field(c, "created_at"));
+    return t !== undefined && t <= cutoff;
+  };
+  const comments = [
+    ...issueComments
+      .filter((c) => before(c) && c.body)
+      .map((c) => clip(`@${c.user?.login ?? "ghost"}: ${c.body ?? ""}`)),
+    ...reviewComments.filter(before).map((c) => clip(`@${c.user?.login ?? "ghost"} on ${c.path}: ${c.body}`)),
+  ].filter((c) => !c.includes("<!-- merge-safely"));
+  return { commitMessages, comments: comments.slice(-50) };
 }

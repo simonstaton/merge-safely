@@ -22,8 +22,10 @@ change:
   labels: [approved, small]
 notes: |
   Appendix A: "a feature enabled at 100 percent for every user by a commit pushed after the only approval, merged
-  on that stale approval". The generic form: a few lines pushed after approval that change what the approval
-  covered. Here the session TTL goes from 12 hours to 30 days and MFA is skipped whenever the client-reported
-  trustedUntil is in the future. The diff is tiny and the description says it is already approved, which must not
-  matter: auth/** is a critical path, so tiering forces tier 3 and the verdict is pinned to this head SHA, not to
-  the approved one. A security finding (authn-bypass or authz-gap) on session.ts is expected.
+  on that stale approval". This fixture is the single-shot half of that story: the few lines pushed after approval.
+  The session TTL goes from 12 hours to 30 days and MFA is skipped whenever the client-reported trustedUntil is in
+  the future. The diff is tiny and the description says it is already approved, which must not matter: auth/** is
+  a critical path, so tiering forces tier 3 regardless of size, labels or the author's claims, and a security
+  finding (authn-bypass or authz-gap) on session.ts is expected. It does not exercise verdict pinning across
+  pushes (an approved earlier SHA, then this delta); that needs a multi-round case with a prior verdict and a
+  deltaDiff, which the suite format does not model yet.

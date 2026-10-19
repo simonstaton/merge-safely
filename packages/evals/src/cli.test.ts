@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -66,6 +66,55 @@ describe("evalCommand", () => {
     expect(t.err.join("")).toMatch(/suite.yml not found/);
     expect(await evalCommand(["--suite", STARTER, "--dry", "--kinds", "bogus"], t.io)).toBe(2);
     expect(await evalCommand(["--help"], t.io)).toBe(0);
+  });
+
+  it("parses flags strictly", async () => {
+    const t = io();
+    expect(await evalCommand(["--suite", STARTER, "--dry", "--kind", "incident"], t.io)).toBe(2);
+    expect(t.err.join("")).toMatch(/unknown flag --kind/);
+    expect(await evalCommand(["--suite", STARTER, "-d"], t.io)).toBe(2);
+    expect(await evalCommand(["--suite", STARTER, "--dry", "--format", "json", "--format", "text"], t.io)).toBe(2);
+    // --dry=true is dry (no gate needed); --dry=false is a full run, which needs a gate.
+    expect(await evalCommand(["--suite", STARTER, "--dry=true"], io().io)).toBe(0);
+    expect(await evalCommand(["--suite", STARTER, "--dry=yes"], io().io)).toBe(0);
+    const full = io();
+    expect(await evalCommand(["--suite", STARTER, "--dry=false"], full.io)).toBe(2);
+    expect(full.err.join("")).toMatch(/use --dry/);
+    expect(await evalCommand(["init", dir, "--suite", "x"], io().io)).toBe(2);
+  });
+
+  it("validates --compare and --policy before running, and compares in json too", async () => {
+    await writeSuite(dir, SUITE_YML, STANDARD_CASES);
+    let reviews = 0;
+    const { factory } = scriptedGateFactory({});
+    const counting: typeof factory = async (policy, ctx) => {
+      const g = await factory(policy, ctx);
+      return { estimate: g.estimate, reviewChange: (c, i) => (reviews++, g.reviewChange(c, i)) };
+    };
+    await writeFile(join(dir, "bad.json"), "{}");
+    const bad = io({ gateFactory: counting });
+    expect(await evalCommand(["--suite", dir, "--compare", join(dir, "bad.json")], bad.io)).toBe(2);
+    expect(bad.err.join("")).toMatch(/not a JSON eval report/);
+    await writeFile(join(dir, "policy.yml"), "triage: { maxLines: -1 }\n");
+    expect(await evalCommand(["--suite", dir, "--policy", join(dir, "policy.yml")], bad.io)).toBe(2);
+    expect(bad.err.join("")).toMatch(/not a valid policy/);
+    expect(reviews).toBe(0);
+
+    const base = join(dir, "base.json");
+    expect(await evalCommand(["--suite", dir, "--dry", "--out", base], io().io)).toBe(0);
+    const j = io();
+    expect(await evalCommand(["--suite", dir, "--dry", "--format", "json", "--compare", base], j.io)).toBe(0);
+    const parsed = JSON.parse(j.out.join("")) as { comparison?: { flips: unknown[] }; breakers?: unknown };
+    expect(parsed.comparison?.flips).toEqual([]);
+    expect(parsed.breakers).toBeDefined();
+
+    // --policy feeds the run: with a huge triage limit the clean-code case auto-passes and so fails its expectation.
+    await writeFile(join(dir, "policy.yml"), "triage: { maxLines: 5000 }\n");
+    const p = io();
+    expect(
+      await evalCommand(["--suite", dir, "--dry", "--policy", join(dir, "policy.yml"), "--compare", base], p.io),
+    ).toBe(1);
+    expect(p.out.join("")).toContain("REGRESSED clean-code");
   });
 
   it("init creates a suite and a case", async () => {

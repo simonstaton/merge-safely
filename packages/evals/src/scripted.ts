@@ -31,6 +31,8 @@ export interface CaseScript {
   costUsd?: number;
   /** Model name per lens; default "scripted-model". */
   models?: Record<string, string>;
+  /** Mark the verdict contested. */
+  contested?: boolean;
   /** Throw this message from reviewChange. */
   throws?: string;
   /** Replace the estimate entirely. */
@@ -121,6 +123,7 @@ export function scriptedVerdict(
     findings,
     quorum: { required: 1, passed: seats.filter((s) => s.output?.verdict === "pass").length, blocked: 0, invalid: 0 },
     cost: { ...(script.costUsd !== undefined ? { usd: script.costUsd } : {}), tokens: { in: 0, out: 0 }, bySeat: {} },
+    ...(script.contested ? { contested: true } : {}),
     createdAt: "2026-01-01T00:00:00.000Z",
     policyHash,
   };

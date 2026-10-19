@@ -13,6 +13,23 @@ export function matchingFindings(expected: CaseExpected, findings: ActualFinding
   );
 }
 
+/** True when the gate reached no usable decision: errored, pending, contested, or never ran a full review. */
+export function isUnresolved(actual: CaseActual): boolean {
+  if (actual.status === "error") return true;
+  if (actual.status === "dry") return false;
+  return actual.decision === "pending" || actual.decision === "not-run" || actual.contested === true;
+}
+
+/**
+ * An incident counts as caught only when it blocked and, if the case names expected classes or files, a finding
+ * with that class/file was raised. Blocking on noise is not recall.
+ */
+export function isCaught(expected: CaseExpected, actual: CaseActual): boolean {
+  if (actual.status !== "ok" || actual.decision !== "block" || actual.contested === true) return false;
+  if (!expected.findingClasses && !expected.files) return true;
+  return matchingFindings(expected, actual.findings).length > 0;
+}
+
 /** Score one case. Pure. `reasons` lists every failed check, or what matched when the case passed. */
 export function evaluateCase(spec: CaseSpec, actual: CaseActual): { passed: boolean; reasons: string[] } {
   const exp = spec.expected;
@@ -45,6 +62,10 @@ export function evaluateCase(spec: CaseSpec, actual: CaseActual): { passed: bool
     } else if (actual.decision === "pass") {
       ok.push("auto-passed by triage");
     }
+  } else if (actual.contested === true) {
+    fail.push(`unresolved: verdict ${actual.decision} is contested (an unresolved stored block for this SHA)`);
+  } else if (actual.decision === "pending" || actual.decision === "not-run") {
+    fail.push(`unresolved: the gate returned ${actual.decision} instead of a decision`);
   } else if (actual.decision !== exp.decision) {
     fail.push(`expected ${exp.decision}, got ${actual.decision}`);
   } else {

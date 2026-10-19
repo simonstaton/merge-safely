@@ -48,6 +48,19 @@ describe("evaluateBreakers", () => {
     expect(r.raiseQuorumTier).toBeUndefined();
   });
 
+  it("suggests fixing tiering for incidents that landed below their expected tier", () => {
+    const low = makeCaseResult({
+      id: "low",
+      expected: { decision: "block", tier: 3 },
+      actual: { decision: "pass", tier: 1 },
+      passed: false,
+    });
+    const r = evaluateBreakers(makeSuiteResult([low, caught("b", 3)]));
+    expect(r.fixTiering).toEqual(["low (expected tier 3, got 1)"]);
+    // Keyed by the actual tier: the miss is attributed to tier 1, not tier 3.
+    expect(r.raiseQuorumTiers).toEqual([1]);
+  });
+
   it("respects the minimum evidence per tier and never runs on dry results", () => {
     const thin = evaluateBreakers(makeSuiteResult([missed("a", 2)]), { minIncidentsPerTier: 2 });
     expect(thin.raiseQuorumTier).toBeUndefined();

@@ -1,4 +1,4 @@
-import { readFile, stat } from "node:fs/promises";
+import { readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { tempDir } from "../test/helpers.js";
@@ -33,15 +33,30 @@ describe("template", () => {
     expect((await stat(join(r.dir, "base"))).isDirectory()).toBe(true);
     expect((await stat(join(r.dir, "head"))).isDirectory()).toBe(true);
 
+    // An unfilled scaffold is never green: the placeholder class fails validation...
+    await expect(loadSuite(dir)).rejects.toThrow(/"replace-me" is the template placeholder/);
+    await writeFile(join(r.dir, "case.yml"), yml.replace("[replace-me]", "[lock-risk]"));
     const suite = await loadSuite(dir);
     expect(suite.cases[0]?.spec).toMatchObject({
       id: "prod-incident-42",
       kind: "incident",
       title: "Backfill locked orders",
     });
-    // Empty trees: nothing changed, so the gate refuses to triage it away and a dry run still completes.
+    // ...and empty base/ and head/ trees fail the case: there is nothing to review.
     const result = await runSuite(dir, { dry: true });
-    expect(result.cases[0]?.actual.status).toBe("dry");
+    expect(result.cases[0]?.passed).toBe(false);
+    expect(result.cases[0]?.actual.error).toMatch(/base\/ and head\/ are identical/);
+    expect(result.summary.ok).toBe(false);
+  });
+
+  it("quotes ids that YAML would read as numbers or booleans", async () => {
+    for (const id of ["1e5", "true", "null", "0x10", "1.0"]) {
+      const r = await scaffoldCase(dir, { id, kind: "clean", title: id });
+      expect(await readFile(join(r.dir, "case.yml"), "utf8")).toContain(`id: "${id}"`);
+    }
+    await initSuite(dir);
+    const suite = await loadSuite(dir);
+    expect(suite.cases.map((c) => c.spec.id).sort()).toEqual(["0x10", "1.0", "1e5", "null", "true"]);
   });
 
   it("scaffolds clean cases expecting pass without block-only fields", async () => {

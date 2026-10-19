@@ -25,7 +25,9 @@
   "dependencies": {
     "@merge-safely/core": "0.1.0",
     "@merge-safely/github": "0.1.0",
+    "@merge-safely/lenses": "0.1.0",
     "@merge-safely/store-memory": "0.1.0",
+    "@merge-safely/workspace-local": "0.1.0",
     "yaml": "^2.5.0",
     "zod": "^3.23.8"
   }

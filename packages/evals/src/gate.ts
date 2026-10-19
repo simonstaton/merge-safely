@@ -24,6 +24,7 @@ import {
   type UntrustedText,
   type Verdict,
   type VerdictStore,
+  type Workspace,
 } from "@merge-safely/core";
 
 export interface GateReviewInput {
@@ -63,6 +64,16 @@ export interface GateFactoryContext {
   caseId: string;
   store: VerdictStore;
   ledger: CostLedger;
+  /**
+   * Fixture cases: the throwaway repository holding baseSha and headSha. It stays alive until the case's review
+   * has finished, then it is deleted, so handles acquired from it must be disposed by then.
+   */
+  repo?: { repoPath: string; headSha: string; baseSha: string };
+  /**
+   * Reviewer workspace for the case: by default `localWorkspace({ repoPath })` over `repo`. Absent for diff and
+   * github cases unless the runner's `workspace` option supplies one (those are diff-only otherwise).
+   */
+  workspace?: Workspace;
 }
 
 export type GateFactory = (policy: Policy, ctx: GateFactoryContext) => EvalGate | Promise<EvalGate>;

@@ -1,3 +1,4 @@
+import { symlink } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { STANDARD_CASES, SUITE_YML, tempDir, writeSuite, writeTree } from "../test/helpers.js";
@@ -46,8 +47,14 @@ describe("parseCase", () => {
 
   it("parses diff and github sources", () => {
     expect(parseCase({ ...baseCase, source: { type: "diff", diff: "change.diff" } }).source.type).toBe("diff");
-    const gh = parseCase({ ...baseCase, source: { type: "github", repo: "acme/web", pr: 12, headSha: "abc1234" } });
-    expect(gh.source).toMatchObject({ repo: "acme/web", pr: 12 });
+    const gh = parseCase({
+      ...baseCase,
+      source: { type: "github", repo: "acme/web", pr: 12, headSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+    });
+    expect(gh.source).toMatchObject({ repo: "acme/web", pr: 12, includeComments: false });
+    expect(() =>
+      parseCase({ ...baseCase, source: { type: "github", repo: "acme/web", pr: 12, headSha: "abc1234" } }),
+    ).toThrow(/full commit SHA/);
   });
 
   it("enforces kind/decision consistency", () => {
@@ -118,6 +125,46 @@ describe("loadSuite", () => {
         "id: x\ntitle: x\nkind: clean\nexpected: { decision: pass }\nsource: { type: fixture, head: tree/ }\n",
     });
     await expect(loadSuite(dir)).rejects.toThrow(/source.base: directory base\/ not found/);
+  });
+});
+
+describe("load-time registry and path checks", () => {
+  let dir: string;
+  let cleanup: () => Promise<void>;
+  beforeEach(async () => {
+    ({ dir, cleanup } = await tempDir());
+  });
+  afterEach(() => cleanup());
+
+  it("rejects finding classes and lenses no registered lens knows, unless the suite declares them", async () => {
+    const yaml =
+      "id: x\ntitle: x\nkind: incident\nexpected: { decision: block, lenses: [perff], findingClasses: [lock-rsik, my-class] }\nsource: { type: fixture }\n";
+    await writeSuite(dir, SUITE_YML, [{ id: "x", yaml, head: { "a.ts": "1\n" } }]);
+    const err = (await loadSuite(dir).catch((e: unknown) => e)) as SuiteValidationError;
+    expect(err.issues).toEqual([
+      expect.stringMatching(/x\/case.yml: expected.findingClasses: unknown class "lock-rsik"/),
+      expect.stringMatching(/unknown class "my-class"/),
+      'x/case.yml: expected.lenses: unknown lens "perff"',
+    ]);
+    await writeTree(dir, {
+      "suite.yml": `${SUITE_YML}extraFindingClasses: [lock-rsik, my-class]\nextraLenses: [perff]\n`,
+    });
+    await expect(loadSuite(dir)).resolves.toBeDefined();
+  });
+
+  it("rejects symlinked fixture roots and diff files that leave the case directory", async () => {
+    await writeTree(dir, { "secret/creds.env": "TOP_SECRET=hunter2\n", "suite.yml": SUITE_YML });
+    await writeTree(dir, {
+      "a/case.yml": "id: a\ntitle: a\nkind: clean\nexpected: { decision: pass }\nsource: { type: fixture }\n",
+      "a/head/x.ts": "1\n",
+      "b/case.yml":
+        "id: b\ntitle: b\nkind: clean\nexpected: { decision: pass }\nsource: { type: diff, diff: change.diff }\n",
+    });
+    await symlink(join(dir, "secret"), join(dir, "a", "base"));
+    await symlink(join(dir, "secret", "creds.env"), join(dir, "b", "change.diff"));
+    const err = (await loadSuite(dir).catch((e: unknown) => e)) as SuiteValidationError;
+    expect(err.issues.join("\n")).toMatch(/a\/case.yml: source.base: source.base base\/ is a symlink/);
+    expect(err.issues.join("\n")).toMatch(/b\/case.yml: source.diff: source.diff change.diff is a symlink/);
   });
 });
 

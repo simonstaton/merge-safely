@@ -39,6 +39,7 @@ export function caseTemplate(opts: ScaffoldCaseOptions): string {
   const blockOnly =
     d.decision === "block"
       ? `  # At least one finding must carry one of these classes (see the lens table in docs/design.md section 9).
+  # The case fails validation until the placeholder is replaced with a class a lens emits.
   findingClasses: [replace-me]
   # ...and point at one of these files (paths relative to the repo root of the fixture).
   # files: [src/path/to/the/bug.ts]
@@ -46,7 +47,7 @@ export function caseTemplate(opts: ScaffoldCaseOptions): string {
       : "";
   return `# Eval case: ${opts.title}
 # Kind "${opts.kind}": ${d.hint}.
-id: ${opts.id}
+id: ${JSON.stringify(opts.id)}
 title: ${JSON.stringify(opts.title)}
 kind: ${opts.kind}
 

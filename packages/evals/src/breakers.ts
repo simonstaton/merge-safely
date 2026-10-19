@@ -4,8 +4,10 @@
  *
  * - False-block rate on known-clean cases above the threshold: suggest widening triage (the panel is spending
  *   reviews and blocking changes that evidence says are fine).
- * - Incident recall below the threshold at a tier: suggest raising that tier's quorum. When the missed incidents
- *   never reached a reviewer because triage auto-passed them, quorum cannot help, so suggest narrowing triage.
+ * - Incident recall below the threshold at a tier (the tier the gate actually assigned): suggest raising that tier's
+ *   quorum. When the missed incidents never reached a reviewer because triage auto-passed them, quorum cannot help,
+ *   so suggest narrowing triage. Incidents tiered below their expected tier get a separate "fix tiering" suggestion:
+ *   raising quorum at the wrong tier would not have caught them.
  */
 import type { TierLevel } from "@merge-safely/core";
 import type { SuiteResult } from "./types.js";
@@ -26,6 +28,8 @@ export interface BreakerSuggestions {
   /** Every tier below threshold, highest first. */
   raiseQuorumTiers?: TierLevel[];
   narrowTriage?: boolean;
+  /** Incident cases that landed below their expected tier: add a critical path or tiering rule, not quorum. */
+  fixTiering?: string[];
   reasons: string[];
 }
 
@@ -51,6 +55,22 @@ export function evaluateBreakers(result: SuiteResult, policy?: Partial<BreakerPo
       .map((c) => `${c.id} (tier ${c.actual.tier ?? "?"})`);
     out.reasons.push(
       `false-block rate ${pct(s.falseBlockRate)} on ${s.clean} clean case(s) exceeds ${pct(p.maxFalseBlock)}: widen triage (triage.maxLines / maxFiles or patterns) and review the blocking lenses; blocked: ${blocked.join(", ")}`,
+    );
+  }
+
+  const underTiered = result.cases
+    .filter(
+      (c) =>
+        c.kind === "incident" &&
+        c.expected.tier !== undefined &&
+        c.actual.tier !== undefined &&
+        c.actual.tier < c.expected.tier,
+    )
+    .map((c) => `${c.id} (expected tier ${c.expected.tier}, got ${c.actual.tier})`);
+  if (underTiered.length > 0) {
+    out.fixTiering = underTiered;
+    out.reasons.push(
+      `${underTiered.length} incident(s) tiered too low: add a critical path or tiering rule (raising quorum at the assigned tier would not target them): ${underTiered.join(", ")}`,
     );
   }
 

@@ -1,10 +1,11 @@
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
+import { type Finding, makeChange, type Workspace } from "@merge-safely/core";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { STANDARD_CASES, SUITE_YML, tempDir, writeSuite, writeTree } from "../test/helpers.js";
 import { type EvalGate, estimateWithStages, type GateFactory } from "./gate.js";
-import { evaluateCase, runSuite } from "./runner.js";
-import { type CaseScript, scriptedGateFactory } from "./scripted.js";
+import { evaluateCase, runSuite, seatsRaising } from "./runner.js";
+import { type CaseScript, scriptedGateFactory, scriptedVerdict } from "./scripted.js";
 import { parseCase } from "./suite.js";
 
 const GOOD: Record<string, CaseScript> = {
@@ -228,5 +229,155 @@ describe("evaluateCase", () => {
       findings: [{ class: "lock-risk", severity: "important", file: "a.ts", lenses: ["perf"], models: [] }],
     });
     expect(hit.passed).toBe(true);
+  });
+});
+
+describe("reviewer workspace for fixture cases", () => {
+  let dir: string;
+  let cleanup: () => Promise<void>;
+  beforeEach(async () => {
+    ({ dir, cleanup } = await tempDir());
+    await writeSuite(dir, SUITE_YML, STANDARD_CASES);
+  });
+  afterEach(() => cleanup());
+
+  it("gives the gate a localWorkspace over the live fixture repo, then deletes the repo", async () => {
+    const seenRepos: string[] = [];
+    const contents: Record<string, string> = {};
+    const factory: GateFactory = (policy, ctx) => {
+      const gate: EvalGate = {
+        estimate: (change) => estimateWithStages(change, policy),
+        async reviewChange(change) {
+          if (!ctx.workspace || !ctx.repo) throw new Error("no workspace");
+          expect(ctx.repo.headSha).toBe(change.headSha);
+          seenRepos.push(ctx.repo.repoPath);
+          const handle = await ctx.workspace.acquire(change, { seatId: "hunter:test:1" });
+          try {
+            expect(handle.headSha).toBe(change.headSha);
+            const file = change.files[0]?.path ?? "";
+            contents[ctx.caseId] = await readFile(join(handle.cwd, file), "utf8");
+          } finally {
+            await handle.dispose();
+          }
+          const est = estimateWithStages(change, policy);
+          return {
+            verdict: scriptedVerdict(change, est, { decision: ctx.caseId.startsWith("incident") ? "block" : "pass" }),
+            digest: { headline: "", markdown: "", text: "" },
+            events: [],
+          };
+        },
+      };
+      return gate;
+    };
+    const r = await runSuite(dir, { gateFactory: factory, filter: { ids: ["incident-auth", "clean-code"] } });
+    expect(r.cases.map((c) => c.actual.status)).toEqual(["ok", "ok"]);
+    // The reviewer saw the head tree, not the base tree.
+    expect(contents["incident-auth"]).toBe("export const check = (_ok: boolean) => true;\n");
+    expect(contents["clean-code"]).toContain("export const v39 = 39;");
+    for (const repo of seenRepos) await expect(stat(repo)).rejects.toThrow();
+  });
+
+  it("lets the caller supply its own workspace", async () => {
+    const supplied: Array<string | undefined> = [];
+    const { factory } = scriptedGateFactory(GOOD);
+    await runSuite(dir, {
+      gateFactory: (policy, ctx) => {
+        supplied.push(ctx.workspace === CUSTOM ? ctx.caseId : undefined);
+        return factory(policy, ctx);
+      },
+      workspace: (repo) => (repo ? CUSTOM : undefined),
+      dry: true,
+    });
+    expect(supplied.sort()).toEqual(["clean-code", "clean-docs", "incident-auth"]);
+  });
+});
+
+const CUSTOM: Workspace = {
+  async acquire() {
+    throw new Error("unused");
+  },
+};
+
+describe("unresolved and wrong-reason outcomes", () => {
+  let dir: string;
+  let cleanup: () => Promise<void>;
+  beforeEach(async () => {
+    ({ dir, cleanup } = await tempDir());
+    await writeSuite(dir, SUITE_YML, STANDARD_CASES);
+  });
+  afterEach(() => cleanup());
+
+  it("does not count a block for the wrong reason as recall and fails pending clean cases", async () => {
+    const { factory } = scriptedGateFactory({
+      "incident-auth": { decision: "block", findings: [{ class: "logic-error", lens: "correctness" }] },
+      "clean-docs": { decision: "pass" },
+      "clean-code": { decision: "pending" },
+    });
+    const r = await runSuite(dir, { gateFactory: factory });
+    expect(r.summary).toMatchObject({ incidentsBlocked: 1, incidentsCaught: 0, recall: 0, unresolved: 1 });
+    expect(r.cases.find((c) => c.id === "clean-code")?.reasons).toEqual([
+      "unresolved: the gate returned pending instead of a decision",
+    ]);
+    expect(r.summary.falseBlockRate).toBe(0);
+    expect(r.summary.gateFailures).toContain("1 case(s) unresolved (pending or contested verdict)");
+    expect(r.summary.ok).toBe(false);
+  });
+
+  it("treats a contested verdict as unresolved", async () => {
+    const { factory } = scriptedGateFactory({
+      ...GOOD,
+      "clean-code": { decision: "pass", contested: true },
+    });
+    const r = await runSuite(dir, { gateFactory: factory });
+    const c = r.cases.find((x) => x.id === "clean-code");
+    expect(c?.passed).toBe(false);
+    expect(c?.reasons[0]).toMatch(/contested/);
+    expect(r.summary.unresolved).toBe(1);
+  });
+
+  it("fails the suite on any failed case even when the rates hold", async () => {
+    await writeSuite(dir, "version: 1\nname: s\ngates: { minRecall: 0, maxFalseBlock: 1 }\n", STANDARD_CASES);
+    const { factory } = scriptedGateFactory({
+      ...GOOD,
+      "clean-code": { decision: "block", findings: [{ class: "logic-error", lens: "correctness" }] },
+    });
+    const r = await runSuite(dir, { gateFactory: factory });
+    expect(r.summary.gateFailures).toEqual(["1 case(s) failed: clean-code"]);
+  });
+});
+
+describe("per-seat model attribution", () => {
+  it("credits the seat whose output carried the finding", () => {
+    const change = makeChange();
+    const est = {
+      tier: {
+        level: 2 as const,
+        score: 50,
+        factors: { loc: 1, files: 1, modules: 1, criticalPathHits: [] },
+        reasons: [],
+      },
+      seats: [],
+    };
+    const v = scriptedVerdict(change, est, {
+      decision: "block",
+      findings: [{ class: "lock-risk", lens: "perf", file: "a.ts" }],
+    });
+    const raiser = v.seats[0];
+    if (!raiser?.output) throw new Error("seat missing");
+    const other = {
+      ...raiser,
+      seat: { ...raiser.seat, id: "hunter:perf:2", model: { ...raiser.seat.model, name: "model-quiet" } },
+      output: { verdict: "pass" as const, summary: "", findings: [] },
+    };
+    raiser.seat.model.name = "model-loud";
+    raiser.output.findings = [{ ...(v.findings[0] as Finding) }];
+    v.seats.push(other);
+    expect(seatsRaising(v, v.findings[0] as Finding).map((r) => r.seat.model.name)).toEqual(["model-loud"]);
+    // Without per-seat output, every seat on the lens is credited.
+    raiser.output.findings = [];
+    expect(seatsRaising(v, v.findings[0] as Finding).map((r) => r.seat.model.name)).toEqual([
+      "model-loud",
+      "model-quiet",
+    ]);
   });
 });

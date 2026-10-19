@@ -4,69 +4,115 @@
  *
  * Fixture diffs are produced by a throwaway git repository: base/ is committed, head/ replaces the tree and is
  * committed, and `git diff base head` is taken. Commits use fixed identities and dates so the SHAs are stable for a
- * given pair of trees, which keeps eval verdicts reproducible.
+ * given pair of trees, which keeps eval verdicts reproducible. `materializeTrees` keeps that repository alive so a
+ * reviewer workspace can check out the head commit; `diffTrees` disposes it immediately.
+ *
+ * Every git command runs through workspace-local's hardened `git` helper: a scrubbed environment (no inherited
+ * GIT_* variables, so GIT_DIR / GIT_INDEX_FILE from a surrounding hook cannot redirect it), an empty private HOME,
+ * no system config and no hooks.
+ *
+ * Symlinks: the trees must be real directories inside the case directory, and a symlink inside a tree must be a
+ * relative link that resolves inside that same tree. Links are copied verbatim (never dereferenced), so nothing
+ * from outside the case can reach a prompt and fixture SHAs do not depend on the host path.
  */
-import { execFile } from "node:child_process";
-import { cp, mkdtemp, readdir, rm, stat } from "node:fs/promises";
+import { cp, lstat, mkdtemp, readdir, readlink, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { promisify } from "node:util";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { ChangedFile, FileStatus } from "@merge-safely/core";
+import { git as hardenedGit } from "@merge-safely/workspace-local";
 
-const exec = promisify(execFile);
-
-const GIT_ENV: Record<string, string> = {
+const COMMIT_ENV: Record<string, string> = {
   GIT_AUTHOR_NAME: "merge-safely-evals",
   GIT_AUTHOR_EMAIL: "evals@merge-safely.invalid",
   GIT_COMMITTER_NAME: "merge-safely-evals",
   GIT_COMMITTER_EMAIL: "evals@merge-safely.invalid",
   GIT_AUTHOR_DATE: "2026-01-01T00:00:00Z",
   GIT_COMMITTER_DATE: "2026-01-01T00:00:00Z",
-  GIT_CONFIG_NOSYSTEM: "1",
-  GIT_TERMINAL_PROMPT: "0",
 };
 
-const GIT_FLAGS = [
-  "-c",
-  "core.autocrlf=false",
-  "-c",
-  "core.safecrlf=false",
-  "-c",
-  "commit.gpgsign=false",
-  "-c",
-  "init.defaultBranch=main",
-  "-c",
-  "core.hooksPath=/dev/null",
+const COMMIT_CONFIG: Array<[string, string]> = [
+  ["core.autocrlf", "false"],
+  ["core.safecrlf", "false"],
+  ["core.symlinks", "true"],
+  ["commit.gpgsign", "false"],
+  ["init.defaultBranch", "main"],
+  ["user.name", "merge-safely-evals"],
+  ["user.email", "evals@merge-safely.invalid"],
 ];
 
 /** Files kept only so that git preserves an otherwise empty directory; never part of a fixture's change. */
 const PLACEHOLDERS = new Set([".gitkeep"]);
 
-async function git(cwd: string, args: string[]): Promise<string> {
-  const { stdout } = await exec("git", [...GIT_FLAGS, ...args], {
-    cwd,
-    env: { ...process.env, ...GIT_ENV, HOME: cwd, XDG_CONFIG_HOME: cwd },
-    maxBuffer: 64 * 1024 * 1024,
-  });
-  return stdout;
-}
-
-async function isDir(path: string): Promise<boolean> {
-  try {
-    return (await stat(path)).isDirectory();
-  } catch (err: unknown) {
-    void err;
-    return false;
+export class FixtureError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "FixtureError";
   }
 }
 
-async function copyTree(from: string, to: string): Promise<void> {
-  if (!(await isDir(from))) return;
+async function git(cwd: string, args: string[]): Promise<string> {
+  const r = await hardenedGit(args, { cwd, env: COMMIT_ENV, config: COMMIT_CONFIG, timeoutMs: 120_000 });
+  if (r.code !== 0) throw new Error(`git ${args[0] ?? ""} failed (exit ${r.code}): ${r.stderr.trim()}`);
+  return r.stdout;
+}
+
+const within = (root: string, p: string): boolean => p === root || p.startsWith(root.endsWith(sep) ? root : root + sep);
+
+async function lstatOrNull(path: string) {
+  try {
+    return await lstat(path);
+  } catch (err: unknown) {
+    void err;
+    return null;
+  }
+}
+
+/**
+ * Resolve `path` and require it to be inside `confine` (both through realpath). `path` itself must not be a
+ * symlink. Returns null when it does not exist.
+ */
+export async function confinedPath(rawPath: string, confine: string, label: string): Promise<string | null> {
+  // resolve() drops a trailing slash, which would otherwise make lstat follow a symlinked directory.
+  const path = resolve(rawPath);
+  const st = await lstatOrNull(path);
+  if (!st) return null;
+  if (st.isSymbolicLink()) throw new FixtureError(`${label} is a symlink; fixture trees and diffs must be real files`);
+  const real = await realpath(path);
+  const root = await realpath(confine);
+  if (!within(root, real)) throw new FixtureError(`${label} resolves outside the case directory`);
+  return real;
+}
+
+/** Reject symlinks inside `root` that are absolute or resolve outside `root`. */
+async function checkSymlinks(root: string, label: string, dir = root): Promise<void> {
+  for (const entry of await readdir(dir, { withFileTypes: true })) {
+    const p = join(dir, entry.name);
+    const rel = relative(root, p);
+    if (entry.isSymbolicLink()) {
+      const target = await readlink(p);
+      if (isAbsolute(target)) {
+        throw new FixtureError(`${label}/${rel} is a symlink to an absolute path; use a relative link inside the tree`);
+      }
+      if (!within(root, resolve(dirname(p), target))) {
+        throw new FixtureError(`${label}/${rel} is a symlink whose target resolves outside the tree`);
+      }
+    } else if (entry.isDirectory() && entry.name !== ".git") {
+      await checkSymlinks(root, label, p);
+    }
+  }
+}
+
+async function copyTree(from: string | null, to: string): Promise<void> {
+  if (!from) return;
   for (const entry of await readdir(from)) {
     if (entry === ".git" || PLACEHOLDERS.has(entry)) continue;
     await cp(join(from, entry), join(to, entry), {
       recursive: true,
-      filter: (src) => !src.split(/[\\/]/).some((seg) => seg === ".git" || PLACEHOLDERS.has(seg)),
+      verbatimSymlinks: true,
+      filter: (src) =>
+        !relative(from, src)
+          .split(/[\\/]/)
+          .some((seg) => seg === ".git" || PLACEHOLDERS.has(seg)),
     });
   }
 }
@@ -86,25 +132,57 @@ export interface TreeDiff {
   headSha: string;
 }
 
-/** Compute the diff that turns the `baseDir` tree into the `headDir` tree. A missing directory is an empty tree. */
-export async function diffTrees(baseDir: string, headDir: string): Promise<TreeDiff> {
+export interface MaterializedRepo extends TreeDiff {
+  /** A git repository whose history holds baseSha and headSha (head checked out). */
+  repoPath: string;
+  /** Remove the repository. Idempotent. */
+  dispose(): Promise<void>;
+}
+
+/**
+ * Build a throwaway repository with base and head commits and keep it until `dispose`. A missing tree is an empty
+ * tree. `confine` (default: the parent of each tree) bounds where the trees may resolve to.
+ */
+export async function materializeTrees(
+  baseDir: string,
+  headDir: string,
+  opts: { confine?: string } = {},
+): Promise<MaterializedRepo> {
+  const base = await confinedPath(baseDir, opts.confine ?? dirname(resolve(baseDir)), "base/");
+  const head = await confinedPath(headDir, opts.confine ?? dirname(resolve(headDir)), "head/");
+  if (base) await checkSymlinks(base, "base");
+  if (head) await checkSymlinks(head, "head");
   const work = await mkdtemp(join(tmpdir(), "merge-safely-evals-"));
+  let disposed = false;
+  const dispose = async () => {
+    if (disposed) return;
+    disposed = true;
+    await rm(work, { recursive: true, force: true });
+  };
   try {
     await git(work, ["init", "-q"]);
-    await copyTree(baseDir, work);
+    await copyTree(base, work);
     await git(work, ["add", "-A"]);
-    await git(work, ["commit", "-q", "--allow-empty", "-m", "base"]);
+    await git(work, ["commit", "-q", "--allow-empty", "--no-verify", "-m", "base"]);
     const baseSha = (await git(work, ["rev-parse", "HEAD"])).trim();
     await clearTree(work);
-    await copyTree(headDir, work);
+    await copyTree(head, work);
     await git(work, ["add", "-A"]);
-    await git(work, ["commit", "-q", "--allow-empty", "-m", "head"]);
+    await git(work, ["commit", "-q", "--allow-empty", "--no-verify", "-m", "head"]);
     const headSha = (await git(work, ["rev-parse", "HEAD"])).trim();
     const diff = await git(work, ["diff", "--no-color", "--no-ext-diff", "-M", "--binary", baseSha, headSha]);
-    return { diff, files: parseUnifiedDiff(diff), baseSha, headSha };
-  } finally {
-    await rm(work, { recursive: true, force: true });
+    return { diff, files: parseUnifiedDiff(diff), baseSha, headSha, repoPath: work, dispose };
+  } catch (err: unknown) {
+    await dispose();
+    throw err;
   }
+}
+
+/** Compute the diff that turns the `baseDir` tree into the `headDir` tree, then discard the repository. */
+export async function diffTrees(baseDir: string, headDir: string, opts: { confine?: string } = {}): Promise<TreeDiff> {
+  const repo = await materializeTrees(baseDir, headDir, opts);
+  await repo.dispose();
+  return { diff: repo.diff, files: repo.files, baseSha: repo.baseSha, headSha: repo.headSha };
 }
 
 function unquote(path: string): string {

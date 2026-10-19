@@ -1,10 +1,10 @@
 import { execFile } from "node:child_process";
-import { cp, readFile, stat, writeFile } from "node:fs/promises";
+import { cp, mkdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { tempDir, writeTree } from "../test/helpers.js";
-import { diffTrees, parseUnifiedDiff } from "./diff.js";
+import { diffTrees, materializeTrees, parseUnifiedDiff } from "./diff.js";
 
 const exec = promisify(execFile);
 
@@ -112,5 +112,96 @@ describe("parseUnifiedDiff", () => {
 
   it("returns nothing for an empty diff", () => {
     expect(parseUnifiedDiff("")).toEqual([]);
+  });
+});
+
+describe("git isolation", () => {
+  let dir: string;
+  let cleanup: () => Promise<void>;
+  const saved: Record<string, string | undefined> = {};
+  const VARS = ["GIT_DIR", "GIT_INDEX_FILE", "GIT_WORK_TREE", "GIT_AUTHOR_NAME", "GIT_CONFIG_GLOBAL"];
+  beforeEach(async () => {
+    ({ dir, cleanup } = await tempDir());
+    for (const k of VARS) saved[k] = process.env[k];
+  });
+  afterEach(async () => {
+    for (const k of VARS) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+    await cleanup();
+  });
+
+  it("ignores GIT_DIR, GIT_INDEX_FILE and GIT_WORK_TREE from the surrounding environment", async () => {
+    const victim = join(dir, "victim");
+    await writeTree(victim, { "keep.txt": "mine\n" });
+    const env = { ...process.env, GIT_CONFIG_NOSYSTEM: "1", HOME: dir };
+    const run = (args: string[]) =>
+      exec("git", ["-c", "user.name=v", "-c", "user.email=v@v", "-c", "commit.gpgsign=false", ...args], {
+        cwd: victim,
+        env,
+      });
+    await run(["init", "-q"]);
+    await run(["add", "-A"]);
+    await run(["commit", "-q", "-m", "victim"]);
+    const head = (await run(["rev-parse", "HEAD"])).stdout.trim();
+    const index = await readFile(join(victim, ".git", "index"));
+
+    process.env.GIT_DIR = join(victim, ".git");
+    process.env.GIT_INDEX_FILE = join(victim, ".git", "index");
+    process.env.GIT_WORK_TREE = victim;
+    process.env.GIT_AUTHOR_NAME = "intruder";
+    await writeTree(join(dir, "base"), { "a.ts": "1\n" });
+    await writeTree(join(dir, "head"), { "a.ts": "2\n" });
+    const d = await diffTrees(join(dir, "base"), join(dir, "head"));
+    expect(d.files).toEqual([expect.objectContaining({ path: "a.ts", additions: 1, deletions: 1 })]);
+
+    for (const k of ["GIT_DIR", "GIT_INDEX_FILE", "GIT_WORK_TREE", "GIT_AUTHOR_NAME"]) delete process.env[k];
+    expect((await run(["rev-parse", "HEAD"])).stdout.trim()).toBe(head);
+    expect(await readFile(join(victim, ".git", "index"))).toEqual(index);
+    expect((await run(["status", "--porcelain"])).stdout).toBe("");
+  });
+});
+
+describe("symlinks", () => {
+  let dir: string;
+  let cleanup: () => Promise<void>;
+  beforeEach(async () => {
+    ({ dir, cleanup } = await tempDir());
+  });
+  afterEach(() => cleanup());
+
+  it("refuses a symlinked tree root", async () => {
+    await writeTree(join(dir, "secret"), { "creds.env": "TOP_SECRET=hunter2\n" });
+    await mkdir(join(dir, "case", "head"), { recursive: true });
+    await symlink(join(dir, "secret"), join(dir, "case", "base"));
+    await expect(
+      materializeTrees(join(dir, "case", "base"), join(dir, "case", "head"), { confine: join(dir, "case") }),
+    ).rejects.toThrow(/base\/ is a symlink/);
+  });
+
+  it("refuses links inside a tree that point outside it or at absolute paths", async () => {
+    await writeTree(join(dir, "secret"), { "creds.env": "TOP_SECRET=hunter2\n" });
+    await writeTree(join(dir, "case", "head"), { "a.ts": "x\n" });
+    await mkdir(join(dir, "case", "base"), { recursive: true });
+    await symlink("../../secret/creds.env", join(dir, "case", "head", "leak.env"));
+    await expect(diffTrees(join(dir, "case", "base"), join(dir, "case", "head"))).rejects.toThrow(
+      /head\/leak.env is a symlink whose target resolves outside the tree/,
+    );
+    await rm(join(dir, "case", "head", "leak.env"));
+    await symlink(join(dir, "secret", "creds.env"), join(dir, "case", "head", "abs.env"));
+    await expect(diffTrees(join(dir, "case", "base"), join(dir, "case", "head"))).rejects.toThrow(
+      /head\/abs.env is a symlink to an absolute path/,
+    );
+  });
+
+  it("records in-tree relative links verbatim as symlinks", async () => {
+    await writeTree(join(dir, "head"), { "src/real.ts": "export const real = 1;\n" });
+    await mkdir(join(dir, "base"), { recursive: true });
+    await symlink("real.ts", join(dir, "head", "src", "alias.ts"));
+    const d = await diffTrees(join(dir, "base"), join(dir, "head"));
+    expect(d.diff).toMatch(/diff --git a\/src\/alias.ts b\/src\/alias.ts\nnew file mode 120000/);
+    expect(d.diff).toContain("+real.ts");
+    expect(d.diff).not.toContain(dir);
   });
 });

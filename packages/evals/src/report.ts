@@ -3,7 +3,7 @@
  * tier accuracy, attribution per lens and per model, cost and duration, plus before/after comparison.
  */
 import type { TierLevel } from "@merge-safely/core";
-import { matchingFindings } from "./score.js";
+import { isCaught, isUnresolved, matchingFindings } from "./score.js";
 import type { CaseKind, SuiteGates } from "./suite.js";
 import type { CaseResult, SuiteResult } from "./types.js";
 
@@ -26,7 +26,10 @@ export interface AttributionStats {
 
 export interface TierStats {
   incidents: number;
+  /** Incidents caught: blocked with the expected class/file when the case names one. */
   blocked: number;
+  /** Incidents whose actual tier is below the expected tier (a tiering rule is missing, not quorum). */
+  underTiered: number;
   recall: number | null;
   /** Missed incidents that triage auto-passed (no reviewer saw them). */
   missedByTriage: number;
@@ -40,17 +43,22 @@ export interface SuiteSummary {
   errors: number;
   byKind: Record<CaseKind, { total: number; passed: number }>;
   incidents: number;
+  /** Incidents that blocked for any reason (raw block rate numerator). */
   incidentsBlocked: number;
-  /** incidentsBlocked / incidents; null in dry mode or without incident cases. */
+  /** Incidents that blocked with the expected class/file (when the case names one). */
+  incidentsCaught: number;
+  /** incidentsCaught / incidents; null in dry mode or without incident cases. */
   recall: number | null;
   clean: number;
   cleanBlocked: number;
-  /** cleanBlocked / clean; null in dry mode or without clean cases. */
+  /** cleanBlocked / clean (all clean cases, resolved or not); null in dry mode or without clean cases. */
   falseBlockRate: number | null;
+  /** Cases with no usable decision: errored, pending, contested. Each one is a case failure. */
+  unresolved: number;
   tierChecked: number;
   tierCorrect: number;
   tierAccuracy: number | null;
-  /** Keyed by expected tier, falling back to the actual tier. */
+  /** Keyed by the actual tier the gate assigned (falling back to the expected tier when it never ran). */
   perTier: Partial<Record<`${TierLevel}`, TierStats>>;
   perLens: Record<string, AttributionStats>;
   perModel: Record<string, AttributionStats>;
@@ -103,7 +111,7 @@ function attribute(
       if (c.kind === "clean") s.cleanSeated++;
     }
     for (const f of c.actual.findings) for (const k of new Set(keysOf(f))) get(k).findings++;
-    if (c.kind === "incident" && c.actual.decision === "block") {
+    if (c.kind === "incident" && isCaught(c.expected, c.actual)) {
       const caught = new Set(matchingFindings(c.expected, c.actual.findings).flatMap(keysOf));
       for (const k of caught) get(k).incidentsCaught++;
     }
@@ -133,20 +141,25 @@ export function summarize(cases: CaseResult[], opts: { gates: SuiteGates; dry: b
   }
   const incidents = cases.filter((c) => c.kind === "incident");
   const clean = cases.filter((c) => c.kind === "clean");
-  const incidentsBlocked = incidents.filter((c) => c.actual.decision === "block").length;
-  const cleanBlocked = clean.filter((c) => c.actual.decision === "block").length;
+  const incidentsBlocked = incidents.filter((c) => c.actual.status === "ok" && c.actual.decision === "block").length;
+  const incidentsCaught = incidents.filter((c) => isCaught(c.expected, c.actual)).length;
+  const unresolved = cases.filter((c) => isUnresolved(c.actual)).length;
+  const cleanBlocked = clean.filter((c) => c.actual.status === "ok" && c.actual.decision === "block").length;
   const tierCases = cases.filter((c) => c.expected.tier !== undefined && c.actual.status !== "error");
   const tierCorrect = tierCases.filter((c) => c.actual.tier === c.expected.tier).length;
 
   const perTier: SuiteSummary["perTier"] = {};
   for (const c of incidents) {
-    const level = c.expected.tier ?? c.actual.tier;
+    const level = c.actual.tier ?? c.expected.tier;
     if (level === undefined) continue;
     const key = `${level}` as const;
-    const t = perTier[key] ?? { incidents: 0, blocked: 0, recall: null, missedByTriage: 0 };
+    const t = perTier[key] ?? { incidents: 0, blocked: 0, underTiered: 0, recall: null, missedByTriage: 0 };
     perTier[key] = t;
     t.incidents++;
-    if (c.actual.decision === "block") t.blocked++;
+    if (c.expected.tier !== undefined && c.actual.tier !== undefined && c.actual.tier < c.expected.tier) {
+      t.underTiered++;
+    }
+    if (isCaught(c.expected, c.actual)) t.blocked++;
     else if (c.actual.triage === "auto-pass") t.missedByTriage++;
   }
   for (const t of Object.values(perTier)) t.recall = dry ? null : ratio(t.blocked, t.incidents);
@@ -164,25 +177,28 @@ export function summarize(cases: CaseResult[], opts: { gates: SuiteGates; dry: b
   }
   const durations = cases.map((c) => c.durationMs);
 
-  const recall = dry ? null : ratio(incidentsBlocked, incidents.length);
+  const recall = dry ? null : ratio(incidentsCaught, incidents.length);
   const falseBlockRate = dry ? null : ratio(cleanBlocked, clean.length);
   const errors = cases.filter((c) => c.actual.status === "error").length;
   const gateFailures: string[] = [];
   if (errors > 0) gateFailures.push(`${errors} case(s) errored; an eval that cannot run is not evidence`);
-  if (dry) {
-    const failed = cases.filter((c) => !c.passed && c.actual.status !== "error");
-    if (failed.length > 0)
-      gateFailures.push(`${failed.length} case(s) failed dry-run checks: ${failed.map((c) => c.id).join(", ")}`);
-  } else {
+  const pendingOrContested = unresolved - errors;
+  if (!dry && pendingOrContested > 0) {
+    gateFailures.push(`${pendingOrContested} case(s) unresolved (pending or contested verdict)`);
+  }
+  // Every failed case fails the suite: rates summarise, they do not excuse individual misses.
+  const failedCases = cases.filter((c) => !c.passed && !isUnresolved(c.actual));
+  if (failedCases.length > 0) {
+    gateFailures.push(
+      `${failedCases.length} case(s) failed${dry ? " dry-run checks" : ""}: ${failedCases.map((c) => c.id).join(", ")}`,
+    );
+  }
+  if (!dry) {
     if (recall !== null && recall < gates.minRecall) {
       gateFailures.push(`recall ${pct(recall)} is below minRecall ${pct(gates.minRecall)}`);
     }
     if (falseBlockRate !== null && falseBlockRate > gates.maxFalseBlock) {
       gateFailures.push(`false-block rate ${pct(falseBlockRate)} is above maxFalseBlock ${pct(gates.maxFalseBlock)}`);
-    }
-    const regressions = cases.filter((c) => c.kind === "regression" && !c.passed && c.actual.status !== "error");
-    if (regressions.length > 0) {
-      gateFailures.push(`regression case(s) failed: ${regressions.map((c) => c.id).join(", ")}`);
     }
   }
 
@@ -195,10 +211,12 @@ export function summarize(cases: CaseResult[], opts: { gates: SuiteGates; dry: b
     byKind,
     incidents: incidents.length,
     incidentsBlocked,
+    incidentsCaught,
     recall,
     clean: clean.length,
     cleanBlocked,
     falseBlockRate,
+    unresolved,
     tierChecked: tierCases.length,
     tierCorrect,
     tierAccuracy: ratio(tierCorrect, tierCases.length),
@@ -297,7 +315,7 @@ function caseRows(result: SuiteResult): string[][] {
     `${caseDecision(c)}${c.actual.tier !== undefined ? ` t${c.actual.tier}` : ""}`,
     c.actual.triage ?? "-",
     String(c.actual.seats),
-    usd(result.suite.dry ? c.actual.cost.estimateUsd : c.actual.cost.usd),
+    result.suite.dry ? "-" : usd(c.actual.cost.usd),
     ms(c.durationMs),
   ]);
 }
@@ -311,13 +329,16 @@ function headlineLines(r: SuiteResult): string[] {
   ];
   if (!s.dry) {
     lines.push(
-      `Recall (incidents blocked): ${s.incidentsBlocked}/${s.incidents} = ${pct(s.recall)} (min ${pct(s.gates.minRecall)})`,
+      `Recall (incidents caught for the expected reason): ${s.incidentsCaught}/${s.incidents} = ${pct(s.recall)} (min ${pct(s.gates.minRecall)}); ${s.incidentsBlocked} blocked for any reason`,
       `False-block rate (clean blocked): ${s.cleanBlocked}/${s.clean} = ${pct(s.falseBlockRate)} (max ${pct(s.gates.maxFalseBlock)})`,
+      `Unresolved (error, pending or contested): ${s.unresolved}`,
     );
   }
   lines.push(`Tier accuracy: ${s.tierCorrect}/${s.tierChecked} = ${pct(s.tierAccuracy)}`);
   lines.push(
-    `Cost: ${usd(s.cost.totalUsd)} total, ${usd(s.cost.meanUsd)} mean per priced case${s.cost.unpriced > 0 ? `, ${s.cost.unpriced} unpriced` : ""}`,
+    s.dry
+      ? "Cost: not estimated (dry)"
+      : `Cost: ${usd(s.cost.totalUsd)} total, ${usd(s.cost.meanUsd)} mean per priced case${s.cost.unpriced > 0 ? `, ${s.cost.unpriced} unpriced` : ""}`,
     `Duration: p50 ${ms(s.durationMs.p50)}, p95 ${ms(s.durationMs.p95)}, total ${ms(s.durationMs.total)}`,
   );
   return lines;

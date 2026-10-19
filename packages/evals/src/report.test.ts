@@ -70,9 +70,15 @@ describe("summarize", () => {
     expect(s.tierAccuracy).toBeCloseTo(2 / 3);
     expect(s.cost).toMatchObject({ totalUsd: 3.5, unpriced: 1, perCase: { "clean-1": null, "inc-1": 2 } });
     expect(s.durationMs).toEqual({ total: 1410, p50: 100, p95: 1000 });
-    expect(s.perTier["3"]).toEqual({ incidents: 2, blocked: 1, recall: 0.5, missedByTriage: 0 });
+    // Keyed by the actual tier: inc-2 was tiered 2 although it expected 3.
+    expect(s.perTier["3"]).toEqual({ incidents: 1, blocked: 1, underTiered: 0, recall: 1, missedByTriage: 0 });
+    expect(s.perTier["2"]).toEqual({ incidents: 1, blocked: 0, underTiered: 1, recall: 0, missedByTriage: 0 });
     expect(s.ok).toBe(false);
-    expect(s.gateFailures).toHaveLength(2);
+    expect(s.gateFailures).toEqual([
+      "2 case(s) failed: inc-2, clean-2",
+      "recall 50% is below minRecall 80%",
+      "false-block rate 50% is above maxFalseBlock 10%",
+    ]);
     expect(exitCodeFor(result)).toBe(1);
   });
 
@@ -91,7 +97,7 @@ describe("summarize", () => {
     expect(ok.summary.ok).toBe(true);
     expect(exitCodeFor(ok)).toBe(0);
     const reg = makeSuiteResult([incidentCaught, makeCaseResult({ id: "r", kind: "regression", passed: false })]);
-    expect(reg.summary.gateFailures).toEqual(["regression case(s) failed: r"]);
+    expect(reg.summary.gateFailures).toEqual(["1 case(s) failed: r"]);
   });
 
   it("nulls rates in dry mode and fails on any failed case", () => {
@@ -114,7 +120,10 @@ describe("renderReport", () => {
   it("renders text with headline, cases, failures and attribution", () => {
     const text = renderReport(result, "text");
     expect(text).toContain("FAILED: 2/4 cases passed");
-    expect(text).toContain("Recall (incidents blocked): 1/2 = 50% (min 80%)");
+    expect(text).toContain(
+      "Recall (incidents caught for the expected reason): 1/2 = 50% (min 80%); 1 blocked for any reason",
+    );
+    expect(text).toContain("Unresolved (error, pending or contested): 0");
     expect(text).toContain("False-block rate (clean blocked): 1/2 = 50% (max 10%)");
     expect(text).toMatch(/FAIL\s+inc-2\s+incident\s+block t3\s+pass t2/);
     expect(text).toContain("    - expected block, got pass");

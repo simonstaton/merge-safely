@@ -11,8 +11,10 @@
 import { readdir, readFile, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { PolicyInput } from "@merge-safely/core";
+import { lensIds, listLenses } from "@merge-safely/lenses";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
+import { confinedPath, FixtureError } from "./diff.js";
 
 export const CASE_KINDS = ["incident", "clean", "regression"] as const;
 export type CaseKind = (typeof CASE_KINDS)[number];
@@ -52,6 +54,10 @@ export const suiteSchema = z
       .strict()
       .optional(),
     gates: gatesSchema.default({}),
+    /** Finding classes beyond the built-in lens registry (for third-party lenses). */
+    extraFindingClasses: z.array(z.string().min(1)).default([]),
+    /** Lens ids beyond the built-in lens registry. */
+    extraLenses: z.array(z.string().min(1)).default([]),
   })
   .strict();
 export type SuiteManifest = z.infer<typeof suiteSchema>;
@@ -74,10 +80,16 @@ export const sourceSchema = z.discriminatedUnion("type", [
       type: z.literal("github"),
       repo: z.string().regex(/^[\w.-]+\/[\w.-]+$/, "must be owner/name"),
       pr: z.number().int().positive(),
+      /** Full commit SHA (40 or 64 hex) the incident merged at; the verdict is pinned to it. */
       headSha: z
         .string()
-        .regex(/^[0-9a-f]{7,40}$/i, "must be a commit SHA")
+        .regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i, "must be a full commit SHA (40 or 64 hex characters)")
         .optional(),
+      /**
+       * Include PR comments (only those created before the head commit). Off by default: post-incident discussion
+       * ("this caused the outage") hands the reviewer the answer.
+       */
+      includeComments: z.boolean().default(false),
     })
     .strict(),
 ]);
@@ -200,6 +212,32 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
+/** Placeholder written by the incident template; a case still carrying it has not been filled in. */
+export const PLACEHOLDER_CLASS = "replace-me";
+
+/**
+ * Check `expected.findingClasses` and `expected.lenses` against the lens registry (plus the suite's extras), so a typo
+ * fails at load time and in --dry instead of as "blocked for the wrong reason" in a paid run.
+ */
+export function registryIssues(spec: CaseSpec, file: string, manifest?: SuiteManifest): string[] {
+  const issues: string[] = [];
+  const classes = new Set([...listLenses().flatMap((l) => l.classes), ...(manifest?.extraFindingClasses ?? [])]);
+  const lenses = new Set([...lensIds(), ...(manifest?.extraLenses ?? [])]);
+  for (const c of spec.expected.findingClasses ?? []) {
+    if (c === PLACEHOLDER_CLASS) {
+      issues.push(`${file}: expected.findingClasses: "${PLACEHOLDER_CLASS}" is the template placeholder; fill it in`);
+    } else if (!classes.has(c)) {
+      issues.push(
+        `${file}: expected.findingClasses: unknown class "${c}" (not emitted by any registered lens; add it to suite.yml extraFindingClasses if a custom lens raises it)`,
+      );
+    }
+  }
+  for (const l of spec.expected.lenses ?? []) {
+    if (!lenses.has(l)) issues.push(`${file}: expected.lenses: unknown lens "${l}"`);
+  }
+  return issues;
+}
+
 export function parseSuiteManifest(input: unknown, file = "suite.yml"): SuiteManifest {
   const r = suiteSchema.safeParse(input);
   if (!r.success) throw new SuiteValidationError(`Invalid suite manifest ${file}`, formatIssues(file, r.error));
@@ -250,17 +288,28 @@ export async function loadSuite(suiteDir: string): Promise<LoadedSuite> {
       }
       throw err;
     }
+    issues.push(...registryIssues(spec, rel, manifest));
     const dup = seen.get(spec.id);
     if (dup) issues.push(`${rel}: id: duplicate case id "${spec.id}" (also in ${dup})`);
     seen.set(spec.id, rel);
-    if (spec.source.type === "fixture") {
-      for (const key of ["base", "head"] as const) {
-        if (!(await exists(join(caseDir, spec.source[key])))) {
-          issues.push(`${rel}: source.${key}: directory ${spec.source[key]} not found`);
+    const paths =
+      spec.source.type === "fixture"
+        ? ([
+            ["base", spec.source.base, "directory"],
+            ["head", spec.source.head, "directory"],
+          ] as const)
+        : spec.source.type === "diff"
+          ? ([["diff", spec.source.diff, "file"]] as const)
+          : [];
+    for (const [key, p, what] of paths) {
+      try {
+        if ((await confinedPath(join(caseDir, p), caseDir, `source.${key} ${p}`)) === null) {
+          issues.push(`${rel}: source.${key}: ${what} ${p} not found`);
         }
+      } catch (err: unknown) {
+        if (!(err instanceof FixtureError)) throw err;
+        issues.push(`${rel}: source.${key}: ${err.message}`);
       }
-    } else if (spec.source.type === "diff" && !(await exists(join(caseDir, spec.source.diff)))) {
-      issues.push(`${rel}: source.diff: file ${spec.source.diff} not found`);
     }
     cases.push({ spec, dir: caseDir });
   }
