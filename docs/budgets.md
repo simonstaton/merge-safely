@@ -16,13 +16,17 @@ Five ceilings are evaluated against a proposed panel before anything runs:
 
 "The installation" is the App installation in the App. In the Action and the CLI's PR mode it is the repository (`owner/name`), and `run --local` uses one scope called `local`.
 
+### In the GitHub Action
+
+The Action enforces the per-seat and per-change ceilings. It treats the rolling-window, all-time and monthly ceilings as **advisory**: they are reported on the verdict and never block. Each Actions job starts with an empty ledger and cannot see spend from other jobs or repositories. Enforcing those ceilings there would compare one job's spend against an installation-wide limit, which fails open without saying so. When any of `budget.windowUsd`, `budget.spendLimitUsd` or `budget.perInstallationMonthlyUsd` is set, the Action logs one warning: "not enforceable in the Action: spend across jobs is not visible; use the App". For enforced installation-wide budgets, use the GitHub App, which keeps a shared ledger.
+
 ### Semantics
 
 - `null` (or absent) means never configured. `0` means explicitly disabled. Neither ever breaches.
 - A ceiling breaches when projected spend is strictly greater than the limit. Projected spend is what has already been spent in that scope plus the estimate for the panel about to run.
 - Per-change spend is the larger of the ledger's figure and the sum of the costs on the change's stored verdicts, so the per-change ceiling holds across rounds even where the ledger is not persistent.
 - **Fail closed.** If a ceiling is configured but its spend cannot be read (an embedder passed no ledger, or a ledger read failed or timed out), it counts as breached, and the message says a ledger is required.
-- **Where the ledger lives.** The App's ledger is its SQLite database. The CLI's is `$MERGE_SAFELY_HOME/store` (or the SQLite database with `--store sqlite`), so window and all-time ceilings count what that machine spent. The Action uses the same file ledger on the runner, which on a GitHub-hosted runner starts empty on every job: window and all-time ceilings there only ever see the current review. Use the App for installation-wide ceilings.
+- **Where the ledger lives.** The App's ledger is its SQLite database. The CLI's is `$MERGE_SAFELY_HOME/store` (or the SQLite database with `--store sqlite`), so window and all-time ceilings count what that machine spent. The Action uses the same file ledger on the runner, which on a GitHub-hosted runner starts empty on every job. That is why the Action treats window, all-time and monthly ceilings as advisory (see [In the GitHub Action](#in-the-github-action)). Use the App for installation-wide ceilings.
 - When several ceilings breach, the binding one is reported in this order: all-time, window, monthly, per change, per seat.
 - Installation-wide ceilings (window, all-time, monthly) refuse new reviews outright. A cheaper panel does not help the next PR.
 - A budget refusal is not a review. It is never stored, uses no round, and does not replace a verdict already decided for the commit: the check stays pending (or keeps its earlier decision) until you raise the ceiling and re-run. The CLI exits 3.
@@ -31,7 +35,7 @@ Five ceilings are evaluated against a proposed panel before anything runs:
 
 Every ceiling is checked at admission, when a review is about to be seated, on every surface. `merge-safely estimate` runs the same check without calling a model.
 
-- The App also re-evaluates the installation ceilings at webhook intake, after each job and every minute, and alerts (see below). Its setup page and alerts measure the monthly figure over the calendar month (UTC); admission uses the last 30 days.
+- The App also re-evaluates the installation ceilings at webhook intake, after each job and every minute, and alerts (see below). Its setup page, alerts and admission all measure the monthly figure over the same rolling 30 days.
 
 ## The downgrade ladder
 

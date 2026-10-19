@@ -83,7 +83,7 @@ If a key appears anywhere it should not, rotate it, then report it as a vulnerab
 
 ## Fork PRs and `pull_request_target`
 
-On the `pull_request` event, GitHub gives workflows from forks no secrets and a read-only token. The Action detects a fork PR and fails early with instructions. That is the safe default.
+On the `pull_request` event, GitHub gives workflows from forks no secrets and a read-only token. The gate can neither reach a model nor write the verdict check run. The Action therefore detects a fork PR (head repository differs from the base) and stops at once with a `FORK_PULL_REQUEST` error that explains `pull_request_target`. It does not try a review that would fail validation later. That is the safe default.
 
 `pull_request_target` runs in the context of the base repository, with secrets and a write token. It is safe only if nothing from the fork is executed. Merge Safely reads the fork's code and sends it to a model; it does not execute it unless `allowedCommands` is set. If you use `pull_request_target` for fork PRs:
 

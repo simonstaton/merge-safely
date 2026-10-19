@@ -1,0 +1,41 @@
+{
+  "action": "checks_requested",
+  "merge_group": {
+    "head_sha": "3333333333333333333333333333333333333333",
+    "head_ref": "refs/heads/gh-readonly-queue/main/pr-7-2222222222222222222222222222222222222222",
+    "base_sha": "2222222222222222222222222222222222222222",
+    "base_ref": "refs/heads/main",
+    "head_commit": {
+      "id": "3333333333333333333333333333333333333333",
+      "tree_id": "5555555555555555555555555555555555555555",
+      "message": "Merge pull request #7 from x/feature\n\nAdd retry",
+      "timestamp": "2026-10-19T00:00:00Z",
+      "author": {
+        "name": "dev",
+        "email": "dev@example.com"
+      },
+      "committer": {
+        "name": "GitHub",
+        "email": "noreply@github.com"
+      }
+    }
+  },
+  "repository": {
+    "id": 1,
+    "name": "app",
+    "full_name": "acme/app",
+    "private": false,
+    "owner": {
+      "login": "acme",
+      "id": 10,
+      "type": "Organization"
+    },
+    "html_url": "https://github.com/acme/app",
+    "default_branch": "main"
+  },
+  "sender": {
+    "login": "dev",
+    "id": 12,
+    "type": "User"
+  }
+}

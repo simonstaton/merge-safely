@@ -1,0 +1,27 @@
+{
+  "action": "rerequested",
+  "check_run": {
+    "id": 902,
+    "name": "merge-safely/verdict",
+    "head_sha": "1111111111111111111111111111111111111111",
+    "pull_requests": []
+  },
+  "repository": {
+    "id": 1,
+    "name": "app",
+    "full_name": "acme/app",
+    "private": false,
+    "owner": {
+      "login": "acme",
+      "id": 10,
+      "type": "Organization"
+    },
+    "html_url": "https://github.com/acme/app",
+    "default_branch": "main"
+  },
+  "sender": {
+    "login": "dev",
+    "id": 12,
+    "type": "User"
+  }
+}

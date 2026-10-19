@@ -1,0 +1,3 @@
+lib/
+# dist/ holds the committed esbuild bundle that GitHub runs (action.yml -> dist/index.js).
+!dist/

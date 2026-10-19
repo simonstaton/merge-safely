@@ -419,10 +419,10 @@ export async function buildGateDeps(
     pricing: registryPricing(),
     installationId,
     // The CLI cannot see installation-wide monthly spend across machines; report it, never block on it.
-    advisoryCeilings: ["monthly"],
+    advisoryCeilings: setup.advisoryCeilings ?? ["monthly"],
     concurrency: setup.concurrency ?? DEFAULT_CONCURRENCY,
     logger,
-    producedBy: `merge-safely-cli@${CLI_VERSION}`,
+    producedBy: setup.producedBy ?? `merge-safely-cli@${CLI_VERSION}`,
   };
   return { deps, reporters, abort };
 }
@@ -501,7 +501,10 @@ export function adaptGate(
     async review(ref, opts) {
       const gate = await pick(ref);
       return toCliResult(
-        await gate.review(ref, opts.headSha ? { headSha: opts.headSha, trigger: "cli" } : { trigger: "cli" }),
+        await gate.review(ref, {
+          ...(opts.headSha ? { headSha: opts.headSha } : {}),
+          trigger: opts.trigger ?? "cli",
+        }),
       );
     },
     async reviewChange(input) {
