@@ -1,10 +1,10 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_POLICY, type ModelInfo } from "@merge-safely/core";
+import { type CostLedger, DEFAULT_POLICY, MONTH_MS, type ModelInfo } from "@merge-safely/core";
 import { sqliteStores } from "@merge-safely/store-sqlite";
 import { describe, expect, it } from "vitest";
-import { alertText, evaluateInstallation, startOfUtcMonth } from "./alerts.js";
+import { alertText, evaluateInstallation, installationSpend } from "./alerts.js";
 import { AppDb } from "./db.js";
 import { estimateTiers, pickEstimateModel } from "./estimate.js";
 import { safeEqual } from "./http.js";
@@ -230,9 +230,27 @@ describe("budget alerts", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it("formats alerts and month starts", () => {
+  it("formats alerts", () => {
     expect(alertText(1, { ceiling: "window", threshold: 0.8, fraction: 0.85 }, undefined)).toMatch(/crossed 80%/);
-    expect(startOfUtcMonth(now).toISOString()).toBe("2026-10-01T00:00:00.000Z");
+  });
+
+  it("measures the monthly figure over a rolling 30 days, the window the gate uses (not the calendar month)", async () => {
+    const asked: number[] = [];
+    const sum = (usd: number) => ({ usd, tokens: { in: 0, out: 0 }, entries: 1 });
+    const ledger: CostLedger = {
+      append: async () => undefined,
+      forChange: async () => sum(0),
+      forWindow: async (_id, ms) => {
+        asked.push(ms);
+        return sum(ms === MONTH_MS ? 42 : 7);
+      },
+      allTime: async () => sum(100),
+    };
+    // 2026-10-02: a calendar-month window would be one day long.
+    const spend = await installationSpend(ledger, 5, new Date("2026-10-02T00:00:00Z"), 7);
+    expect(MONTH_MS).toBe(30 * 24 * 60 * 60 * 1000);
+    expect(asked).toEqual([7 * 24 * 60 * 60 * 1000, MONTH_MS]);
+    expect(spend).toEqual({ windowUsd: 7, allTimeUsd: 100, monthlyUsd: 42, windowDays: 7 });
   });
 });
 

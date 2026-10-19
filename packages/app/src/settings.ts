@@ -19,7 +19,7 @@ export const BUDGET_LABELS: Record<BudgetKey, string> = {
   perChangeUsd: "Per change (one PR, all rounds)",
   windowUsd: "Rolling window (installation)",
   spendLimitUsd: "All-time (installation, this gate's ledger)",
-  perInstallationMonthlyUsd: "Monthly (installation, calendar month)",
+  perInstallationMonthlyUsd: "Monthly (installation, rolling 30 days)",
 };
 
 const settingKey = (k: BudgetKey) => `budget.${k}`;

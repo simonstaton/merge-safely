@@ -217,14 +217,13 @@ export const policySchema = z
       .object({
         max: z.number().int().min(1).default(3),
         diffOnlyAfterRound: z.number().int().min(0).default(1),
-        neverRepeatFindings: z.boolean().default(true),
       })
       .strict()
       .default({}),
 
     trust: z
       .object({
-        provider: z.enum(["none", "github-teams", "allowlist", "codeowners"]).default("none"),
+        provider: z.enum(["none", "github-teams", "allowlist"]).default("none"),
         trusted: z.array(z.string()).default([]),
         blocked: z.array(z.string()).default([]),
         trustedBypassMaxTier: z.number().int().min(0).max(3).default(2),

@@ -341,7 +341,6 @@ proofOfWork:
 rounds:
   max: 3
   diffOnlyAfterRound: 1
-  neverRepeatFindings: true
 
 trust:
   provider: github-teams

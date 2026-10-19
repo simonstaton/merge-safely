@@ -160,7 +160,7 @@ curl -fsS -X POST "https://<your-host>/installations/<id>/verdict" \
   -d '{"repo":"my-org/my-repo","number":1234,"headSha":"<full 40-char sha>","decision":"pass","reason":"verified the migration by hand","signedBy":"alice"}'
 ```
 
-`headSha` must be a full SHA, `reason` at least 3 characters and `signedBy` a GitHub login. The response is `201` with the recorded verdict. Unlike the CLI's `verdict` command, the API takes `signedBy` as given and does not check that `headSha` is the PR's current head or that the signer is not the PR's author, so anyone holding `SETUP_TOKEN` can sign as anyone. Keep the token to the people allowed to sign, and sign the current head.
+`headSha` must be a full SHA (40 or 64 hex characters), `reason` at least 3 characters and `signedBy` a GitHub login. The response is `201` with the recorded verdict. The App checks the PR on GitHub first: a `headSha` that is not the PR's current head gets `409` (`stale-head-sha`, with `currentHeadSha`), unless the body adds `"allowStaleSha": true`, which records it against the older commit with a warning appended to the reason; a `signedBy` equal to the PR author's login gets `403` (`signer-is-author`). The API still takes `signedBy` as given, so anyone holding `SETUP_TOKEN` can sign as anyone else. Keep the token to the people allowed to sign.
 
 ## Budgets
 

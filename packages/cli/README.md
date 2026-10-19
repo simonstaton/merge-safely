@@ -106,9 +106,10 @@ merge-safely run --repo my-org/my-repo --pr 1234 --report json > verdict.json
 - **Workspace:** a disposable clone of the PR head under `$MERGE_SAFELY_HOME/repos`.
 - **Escalation:** `--slack-webhook <url>` or `MERGE_SAFELY_SLACK_WEBHOOK` sends escalations to Slack.
 - `--head <sha>` reviews that head SHA; if the PR head has moved since, the run refuses with `head-moved` (exit 2).
-- **Fail fast:** connections are validated before seating (15 s each). A dead connection the policy names stops the
+- **Fail fast:** triage runs first; a change it auto-passes validates no connection at all. Otherwise the connections
+  the seated panel uses are validated before any model call (15 s each). A dead connection the policy names stops the
   run with `error [CONNECTION_UNREACHABLE]`, naming it and the fix; under automatic model choice it is skipped with
-  a warning.
+  a warning and the panel is re-seated without it.
 - **Ctrl-C / SIGTERM** cancels cleanly: an in-progress check run (or status) is completed as an interrupted
   failure, checkouts are removed, and the command exits 130.
 - `--dry-run` runs the review but writes nothing to GitHub or the store.

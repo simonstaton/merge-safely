@@ -263,9 +263,8 @@ A pass that fails proof of work is excluded from quorum. A block is never discar
 |---|---|---|---|
 | `rounds.max` | integer ≥ 1 | `3` | Distinct commits reviewed by a panel before the PR goes to a human. Triaged, pending and contested results, and re-runs of the same commit, do not use up a round. Once the cap is reached, the next commit is not reviewed: it keeps any open blocker as a block (otherwise it is pending) and is escalated. |
 | `rounds.diffOnlyAfterRound` | integer ≥ 0 | `1` | Rounds after this one review only the delta since the last reviewed commit, when that commit's review actually reached a model. Otherwise the round reviews the full diff from the base. |
-| `rounds.neverRepeatFindings` | boolean | `true` | Accepted, but currently has no effect: reviewers are always given the open findings from earlier rounds as known, told not to repeat them, and asked whether each was addressed. |
 
-A known finding counts as addressed only when no hunter raised it again and an attested hunter says it was addressed; for a `blocker` or `important` finding, a strict majority of attested hunters must say so. Everything else is carried into the verdict and keeps blocking. A human `pass` clears every open finding.
+Reviewers are always given the open findings from earlier rounds as known, told not to repeat them, and asked whether each was addressed. A known finding counts as addressed only when no hunter raised it again and an attested hunter says it was addressed; for a `blocker` or `important` finding, a strict majority of attested hunters must say so. Everything else is carried into the verdict and keeps blocking. A human `pass` clears every open finding.
 
 ## `trust`
 
@@ -273,8 +272,8 @@ Trust never changes the tier. It decides who may bypass and where escalations go
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `trust.provider` | `none` \| `github-teams` \| `allowlist` \| `codeowners` | `none` | How authors are classified. `allowlist` matches logins. `github-teams` also matches `org/team` slugs and needs organisation members read access (the App with Members: Read, not the Action's default token); a lookup error classifies the author as standard. `codeowners` is accepted but is not implemented yet: it behaves like `none`. |
-| `trust.trusted` | string[] | `[]` | Trusted principals: logins (`alice` or `@alice`), or `org/team` slugs with `github-teams`. Ignored with `none` and `codeowners`. |
+| `trust.provider` | `none` \| `github-teams` \| `allowlist` | `none` | How authors are classified. `allowlist` matches logins. `github-teams` also matches `org/team` slugs and needs organisation members read access (the App with Members: Read, not the Action's default token); a lookup error classifies the author as standard. |
+| `trust.trusted` | string[] | `[]` | Trusted principals: logins (`alice` or `@alice`), or `org/team` slugs with `github-teams`. Ignored with `none`. |
 | `trust.blocked` | string[] | `[]` | Principals classified as blocked. Applies with every provider, and wins over `trusted`. |
 | `trust.trustedBypassMaxTier` | integer 0–3 | `2` | Highest tier at which a trusted author's PR takes the light path: still fully reviewed, never escalated. Mirror it with bypass actors in your ruleset. |
 | `trust.escalateTier3ForStandardAuthors` | boolean | `true` | When a non-trusted author's tier 3 change blocks, escalate it to a human. |

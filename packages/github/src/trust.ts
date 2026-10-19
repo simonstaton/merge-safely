@@ -134,7 +134,7 @@ export function allowlistTrust(opts: {
  * Build the TrustProvider named by `policy.trust.provider`.
  * - `github-teams` needs an octokit (with `members: read`); throws without one.
  * - `allowlist` uses bare logins only.
- * - `none` and `codeowners` (not implemented here) trust nobody; `blocked` logins still apply.
+ * - `none` trusts nobody; `blocked` logins still apply.
  */
 export function trustFromPolicy(policy: Pick<Policy, "trust">, octokit?: OctokitLike, logger?: Logger): TrustProvider {
   const t = policy.trust;

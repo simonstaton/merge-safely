@@ -252,7 +252,7 @@ A keyless compatible connection sends a placeholder key. It never falls back to 
 
 `merge-safely connect` and `merge-safely connections test` (CLI), each run (Action) and the setup page (App) validate each connection with a cheap call and list the models it can reach. A compatible endpoint that has no `/models` route is treated as reachable with no model list; name the model yourself with `--model` or in the policy. In the CLI, an entry that cannot even be loaded (its env variable is not set, or it is encrypted and the master key is missing or wrong) is reported as a `FAIL` with the reason, and the command exits 2.
 
-`merge-safely run` validates connections before seating (15 s each). A dead connection the policy names stops the run with `error [CONNECTION_UNREACHABLE]` naming it and the fix; under automatic model choice a dead connection is skipped with a warning, and the run stops only when none is left. A connection that fails mid-run marks its seats `error` and the check run names the connection. It is never skipped silently.
+`merge-safely run` triages the change first and validates nothing when triage auto-passes it. Otherwise it validates the connections the seated panel uses (15 s each) before any model call. A dead connection the policy names stops the run with `error [CONNECTION_UNREACHABLE]` naming it and the fix; under automatic model choice a dead connection is skipped with a warning and the panel is re-seated without it, and the run stops only when none is left. A connection that fails mid-run marks its seats `error` and the check run names the connection. It is never skipped silently.
 
 ## Fallback and decorrelation
 

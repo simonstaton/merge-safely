@@ -1,6 +1,9 @@
 /**
- * Fixture builders for tests. Pure and dependency-free so any package can reuse them in its own tests:
- * `import { makeChange, makeRun } from "@merge-safely/core"`.
+ * TEST-ONLY fixture builders. Not part of the supported API: never call them from production code, and expect them
+ * to change without notice. They stay exported from `@merge-safely/core` only because other packages' tests import
+ * them (`import { makeChange } from "@merge-safely/core"`); new tests should prefer `@merge-safely/testkit`.
+ *
+ * @internal
  */
 import { loadPolicy } from "../policy/index.js";
 import type { Policy, PolicyInput } from "../policy/schema.js";

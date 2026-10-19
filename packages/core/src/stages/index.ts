@@ -7,6 +7,7 @@ export * from "./glob.js";
 export * from "./intake.js";
 export * from "./judge.js";
 export * from "./rounds.js";
+// Test-only fixture builders (see the module comment); exported because other packages' tests import them.
 export * from "./test-helpers.js";
 export * from "./tiering.js";
 export * from "./triage.js";

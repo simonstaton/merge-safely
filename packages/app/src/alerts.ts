@@ -13,6 +13,7 @@ import {
   DEFAULT_POLICY,
   evaluateCeilings,
   isInstallationCeiling,
+  MONTH_MS,
 } from "@merge-safely/core";
 import { type FetchLike, postToWebhook } from "@merge-safely/escalation-slack";
 import type { AppDb } from "./db.js";
@@ -26,14 +27,10 @@ export interface InstallationSpend {
   windowDays: number;
 }
 
-export function startOfUtcMonth(d: Date): Date {
-  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1));
-}
-
 export async function installationSpend(
   ledger: CostLedger,
   installationId: number,
-  now: Date,
+  _now: Date,
   windowDays: number,
 ): Promise<InstallationSpend> {
   const id = String(installationId);
@@ -41,7 +38,8 @@ export async function installationSpend(
   const [w, a, m] = await Promise.all([
     ledger.forWindow(id, windowMs),
     ledger.allTime(id),
-    ledger.forWindow(id, Math.max(now.getTime() - startOfUtcMonth(now).getTime(), 1)),
+    // Same window the gate uses at admission: the monthly ceiling is a rolling 30 days, not the calendar month.
+    ledger.forWindow(id, MONTH_MS),
   ]);
   return { windowUsd: w.usd, allTimeUsd: a.usd, monthlyUsd: m.usd, windowDays };
 }
