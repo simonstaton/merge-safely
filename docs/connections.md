@@ -56,11 +56,19 @@ Each connection takes its secret from exactly one of:
 
 Environment references are the simplest safe option: the file holds a variable name, and the value lives in your shell, keychain or secret manager.
 
-The file is written atomically with mode `0600`, and the `.merge-safely` directory is kept at `0700`. Without a master key or an env reference, `connect` writes the secret in plaintext and warns you.
+The file is written atomically with mode `0600`. The merge-safely home directory is created `0700`, and an existing home that other users can read is tightened to `0700` on the next write (a connections file elsewhere only gets a warning).
+
+How `connect` stores the secret, in order of precedence:
+
+1. `--api-key-env NAME`: only `secretRef: { env: NAME }` is written, even when `MERGE_SAFELY_MASTER_KEY` is set. Nothing secret is stored.
+2. `MERGE_SAFELY_MASTER_KEY` set: the secret is written as a `secretRef.encrypted` blob.
+3. Otherwise: plaintext in the `0600` file, with a warning.
+
+Connections that hold no secret (`subscription`, `cloud`, keyless local servers such as Ollama or LM Studio) are always written as plain records, never encrypted, so they load without the master key.
 
 ## Encryption at rest
 
-Set `MERGE_SAFELY_MASTER_KEY` and secrets are stored as `secretRef.encrypted` blobs (`v1:…`).
+Set `MERGE_SAFELY_MASTER_KEY` and secrets are stored as `secretRef.encrypted` blobs (`v1:…`), except for connections made with `--api-key-env` (an env reference wins) and connections with no secret at all.
 
 - Envelope encryption. A random 32-byte data key seals the secret with AES-256-GCM. The master key seals the data key with AES-256-GCM.
 - Both layers bind the connection id as associated data, so a blob copied to another connection fails to decrypt.
@@ -140,7 +148,7 @@ The child process gets an empty temporary `HOME`, so it cannot read host credent
 ### Claude subscription
 
 ```bash
-merge-safely connect anthropic --subscription
+merge-safely connect anthropic --subscription --id claude-sub
 ```
 
 ```json
@@ -231,7 +239,9 @@ A keyless compatible connection sends a placeholder key. It never falls back to 
 
 ## Validation
 
-`merge-safely connections test` (CLI), the first run (Action) and the setup page (App) validate each connection with a cheap call and list the models it can reach. A failing connection marks its seats `error` and the check run names the connection. It is never skipped silently.
+`merge-safely connections test` (CLI), the first run (Action) and the setup page (App) validate each connection with a cheap call and list the models it can reach. In the CLI, an entry that cannot even be loaded (its env variable is not set, or it is encrypted and the master key is missing or wrong) is reported as a `FAIL` with the reason, and the command exits 2.
+
+`merge-safely run` validates connections before seating (15 s each). A dead connection the policy names stops the run with `error [CONNECTION_UNREACHABLE]` naming it and the fix; under automatic model choice a dead connection is skipped with a warning, and the run stops only when none is left. A connection that fails mid-run marks its seats `error` and the check run names the connection. It is never skipped silently.
 
 ## Fallback and decorrelation
 

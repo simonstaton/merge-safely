@@ -6,6 +6,9 @@
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "bin": {
+    "merge-safely": "./dist/bin.js"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -38,6 +41,10 @@
     "@merge-safely/store-sqlite": "0.1.0",
     "@merge-safely/escalation-slack": "0.1.0",
     "commander": "^12.1.0",
-    "yaml": "^2.6.0"
+    "yaml": "^2.6.0",
+    "@merge-safely/evals": "0.1.0"
+  },
+  "devDependencies": {
+    "@merge-safely/testkit": "0.1.0"
   }
 }
