@@ -32,8 +32,8 @@ setInterval(() => compact({ olderThanMs: 30 * 24 * 3_600_000 }), 3_600_000).unre
 ## Why the all-time ceiling reads this ledger, never the provider's figure
 
 Design section 7.6 ("Ledger, not estimate"). A provider's account usage is the key's lifetime spend. The gate cannot
-reset it, and it includes spend that never went through the gate. Fanbot enforced an all-time limit against
-OpenRouter's figure, and any key with prior usage was permanently over the limit with no way to clear it. Here the
+reset it, and it includes spend that never went through the gate. A ceiling enforced against a gateway's
+account figure leaves any key with prior usage permanently over the limit, with no way to clear it. Here the
 ceiling is checked against rows this ledger recorded from the runner's streamed usage deltas. A seat killed at its
 deadline has still been recorded, and `reset` clears the counter without losing history. Provider usage is for display
 only.

@@ -1,6 +1,6 @@
 # Lenses and personas
 
-A **lens** is one question a reviewer answers, a checklist that tells the reviewer how to investigate it, and the finding classes it typically emits. Policy picks which lenses run at each tier (`panel.t1`, `t2`, `t3`). Each lens becomes one hunter seat.
+A **lens** is one question a reviewer answers, a checklist that tells the reviewer how to investigate it, and the finding classes it typically emits. Policy picks which lenses run at each tier (`panel.t1.hunters`, `t2`, `t3`). Each listed lens becomes one hunter seat. The defaults are `correctness` and `repro` at tier 1, `intent`, `correctness`, `repro` and `design-fidelity` at tier 2, and `intent`, `correctness`, `repro`, `security`, `perf`, `rollout` and `blast-radius` at tier 3 (see [policy.md](policy.md#panel)).
 
 The shared rubric (severities, evidence, verdict rules, untrusted-text handling) is the same for every lens and is added by the prompt builder. A lens only describes what is specific to it.
 
@@ -17,7 +17,7 @@ The shared rubric (severities, evidence, verdict rules, untrusted-text handling)
 | `design-fidelity` | For UI: does it match the referenced design, tokens, accessibility, RTL and reduced motion? Conditional. | `a11y`, `token-drift`, `layout-regression`, `design-mismatch`, `rtl-break`, `motion-sensitivity`, `missing-state` | mid |
 | `rollout` | Flags, migrations, backfills, data volume, rollback path. Does the flag exist in production? | `missing-flag`, `unflagged-enable`, `flag-default-on`, `unbatched-backfill`, `irreversible-migration`, `blocking-migration`, `deploy-order`, `no-rollback` | mid |
 
-`design-fidelity` is conditional: by default it is seated only when the change touches UI-looking paths (`panel.conditionalLenses`).
+`design-fidelity` is conditional: by default it is seated only when the change touches UI-looking paths (`panel.conditionalLenses`). The preferred model tier is a hint; seating follows `models.*` and the automatic rules in [policy.md](policy.md#models).
 
 `repro` adapts to the policy: with `runner.allowedCommands` set, it runs the narrowest allowed command that proves or disproves each claim; without, it traces the claimed path through the tests and code by hand and says what it could not verify.
 
@@ -28,19 +28,21 @@ Every finding has one of four severities:
 | Severity | Meaning |
 |---|---|
 | `blocker` | One surviving blocker blocks the change, regardless of quorum. |
-| `important` | A real defect that should be fixed. |
-| `nit` | Minor. |
-| `pre-existing` | A real problem the change did not introduce. |
+| `important` | A real defect that should be fixed. A hunter's block counts when at least one of its findings survives at `blocker` or `important`, and an open `important` from an earlier round keeps blocking. |
+| `nit` | Minor. Never blocks. |
+| `pre-existing` | A real problem the change did not introduce. Never blocks. |
 
-Style-only classes (`quorum.dropClasses`: `style`, `formatting`, `naming-preference`, `comment-style`, `whitespace` by default) are dropped. Findings without evidence are refuted by judges.
+Style-only classes (`quorum.dropClasses`: `style`, `formatting`, `naming-preference`, `comment-style`, `whitespace` by default) are dropped. Findings without evidence are refuted by judges. Finding ids are fingerprints computed from the finding's content, so the same issue raised by two seats, or in two rounds, is one finding.
 
 ## Judges
 
-Judges are not lenses. A judge receives the hunters' findings and the diff and votes on each finding: `confirm`, `refute`, or `downgrade` with a new severity. A finding survives when the share of confirming judges meets `quorum.judgeAgreement`. Judges may raise findings the hunters missed; those need a second judge to confirm.
+Judges are not lenses. A judge receives the hunters' findings and the diff, investigates with the same read-only tools, and votes on each finding: `confirm`, `refute`, or `downgrade` (with a new severity, or one step down). A finding survives when the share of counted judges voting confirm or downgrade reaches `quorum.judgeAgreement` (a judge that does not vote counts against). A judge's votes only count when it passes proof of work, so a judge that did not look cannot clear a blocker.
+
+Judges may raise findings the hunters missed. One survives when two judges raise it, or when only one judge counted, and it is capped at `important`. At tier 3 (`panel.t3.secondJudgeRound`), findings the judges split on go back to every judge for a second vote. With no judge seats (`judges: 0`) or no judge that counted, hunter findings stand unverified and the digest says so.
 
 ## Personas
 
-A persona changes only the system-prompt flavour of a seat. The rubric is identical.
+A persona changes only the system-prompt flavour of a seat. The rubric is identical. There is no policy key for personas: the CLI, Action and App seat every reviewer as `skeptical-senior`. Embedders can set `Seat.persona`, or pass `persona` to the prompt builders, in their own pipeline.
 
 | Persona | Stance |
 |---|---|
@@ -53,7 +55,7 @@ An unknown persona id is an error.
 
 ## Writing a third-party lens
 
-Publish a package that exports a `Lens` and register it at startup. Then list its id in the policy for the tiers that should run it.
+Third-party lenses work in a pipeline you compose yourself (see [architecture.md](architecture.md#composing-your-own-pipeline)): register the lens before the gate builds its first prompt, then list its id in the policy for the tiers that should run it. The CLI, Action and App load no plugins, so they run only the shipped lenses; `policy lint` warns about an unknown lens id, and a seat for one fails.
 
 ```ts
 import { type Lens, registerLens } from "@merge-safely/lenses";

@@ -40,9 +40,10 @@ Kind rules:
   `api-key`) is an error that lists the fields. Nothing is dropped silently.
 - An empty `apiKey` (an unset GitHub secret) is its own clear error.
 
-Gateways: `openrouter`, `together`, `fireworks`, `groq`, `lmstudio` and `vllm` are normalised to provider
-`openai-compatible`, with the vendor name kept in `label` and a default `baseUrl` filled in where one exists (vllm has
-none). `ollama` keeps its own provider id and defaults to `http://localhost:11434/v1`. File entries follow the same
+Gateways: `openrouter`, `together`, `fireworks`, `groq` and `vllm` are normalised to provider `openai-compatible`,
+with the vendor name kept in `label` and a default `baseUrl` filled in where one exists (vllm has none). The local
+servers `ollama` and `lmstudio` keep their own provider ids (so the local presets in `@merge-safely/provider-compatible`
+serve them) and default to `http://localhost:11434/v1` and `http://localhost:1234/v1`. File entries follow the same
 provider/kind checks and normalisation.
 
 **Strings:** `parseConnectionsInput` accepts an object or a JSON string. YAML is not parsed here, because parser

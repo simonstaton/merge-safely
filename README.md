@@ -13,7 +13,7 @@ Most review failures that reach production are not "too few people read the diff
 
 Merge Safely addresses both directly:
 
-- **The change sets the tier, not the author.** Risk is computed from paths, size, module spread and flag removals. Touching a critical path (migrations, auth, payments, CI workflows, agent config and so on) forces the highest tier. Author trust decides only who may bypass and where escalations go.
+- **The change sets the tier, not the author.** Risk is computed from paths, size, module spread and feature-flag removals. Touching a critical path (migrations, auth, payments, CI workflows, agent config and so on) forces the highest tier. Author trust decides only who may bypass escalation and where escalations go.
 - **Verdicts are facts about a commit.** A verdict is bound to a head SHA. A new push invalidates it and the check goes back to pending. There is no such thing as approving a PR.
 
 ## How it works
@@ -40,18 +40,18 @@ Merge Safely addresses both directly:
                     after max rounds: escalate to a human
 ```
 
-1. **Intake.** Normalise the PR. Title, body, comments and commit messages are untrusted and only reach prompts inside delimited data blocks.
-2. **Tier.** Score 0 to 100 from lines changed, files, module spread and critical-path hits. Level 0 trivial, 1 standard, 2 elevated, 3 critical. A critical-path hit or a removed feature-flag read forces tier 3.
-3. **Triage.** Tier 0 only. Docs-only, assets-only, lockfile-only or tiny non-critical diffs are auto-passed deterministically, with no model call.
-4. **Seat.** Choose lenses (questions to answer), seat count and models per tier. Models are decorrelated across your connected providers.
-5. **Budget.** Estimate the panel cost against your ceilings. Over budget: step down the downgrade ladder, or block with the exact ceiling to raise.
+1. **Intake.** Normalise the PR. Title, body, comments and commit messages are untrusted and only reach prompts inside delimited data blocks. Secret-shaped strings are redacted (`runner.redactSecrets`).
+2. **Tier.** Score 0 to 100 from lines changed, files changed, module spread, critical-path hits and feature-flag removals. Level 0 trivial, 1 standard, 2 elevated, 3 critical. A critical-path hit, a removed feature-flag read or a truncated file list forces tier 3.
+3. **Triage.** Tier 0 only. Docs-only, assets-only and lockfile-only changes, and changes of at most 30 lines in at most 3 files, are auto-passed deterministically, with no model call.
+4. **Seat.** Choose lenses (questions to answer), seat count and models per tier. With more than one connection, hunters are spread across connections and judges prefer a different one.
+5. **Budget.** Estimate the panel cost against five ceilings. Over budget: step down the downgrade ladder, or refuse with the exact ceiling and policy key to raise.
 6. **Run.** Each hunter runs in a fresh context against a disposable checkout of the head SHA, with read-only tools.
 7. **Proof of work.** The runner records what each reviewer actually read and ran. A pass with too little work does not count.
-8. **Judges.** Judges see the hunters' findings and the diff and vote confirm, refute or downgrade on each one. Style-only findings are dropped.
-9. **Aggregate.** Deduplicate, rank by severity, compute quorum. One surviving blocker blocks.
-10. **Verdict.** Written compare-and-set to the verdict store. A later pass cannot overwrite an unresolved block for the same SHA.
+8. **Judges.** Judges see the hunters' findings and the diff and vote confirm, refute or downgrade on each one. Style-only classes are dropped. At tier 3, findings the judges split on get a second judge round.
+9. **Aggregate.** Deduplicate, rank by severity, count quorum. A surviving blocker, or a hunter block upheld by the judges, blocks. Enough valid passes pass. Anything else is pending.
+10. **Verdict.** Written compare-and-set to the verdict store, keyed by head SHA. A machine pass cannot replace a stored machine block with open findings for the same SHA (the result is reported as contested), and a run that could not decide never replaces a decided verdict.
 11. **Report.** Check run, PR review and inline comments, with the digest and a cost line.
-12. **Rounds.** On a new push, reviewers get the delta diff and the known findings, check whether each was addressed, and never repeat one. After the round cap, or at tier 3 for non-trusted authors, a human gets a pre-digested queue.
+12. **Rounds.** On a new push, reviewers get the delta diff and the known findings, check whether each was addressed, and never repeat one. A known blocker stays until a later round shows it addressed or a human passes the commit. After `rounds.max` reviewed commits, when a review cannot decide, or when a non-trusted author's tier 3 change blocks, a human gets a pre-digested escalation.
 
 ## Quickstart: GitHub Action
 
@@ -67,6 +67,9 @@ permissions:
   checks: write
   pull-requests: write
   contents: read
+concurrency:
+  group: merge-safely-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 jobs:
   review:
     runs-on: ubuntu-latest
@@ -77,54 +80,68 @@ jobs:
             anthropic-main: { provider: anthropic, apiKey: "${{ secrets.ANTHROPIC_API_KEY }}" }
 ```
 
-That is enough. With no `.merge-safely.yml` in the repo, the conservative defaults apply. The check run is named `merge-safely/verdict`. See [docs/quickstart-action.md](docs/quickstart-action.md).
+That is enough. No `actions/checkout` step is needed: the Action clones the head SHA itself. With no `.merge-safely.yml` on the base branch, the conservative defaults apply. The check run is named `merge-safely/verdict`. See [docs/quickstart-action.md](docs/quickstart-action.md).
 
 ## Quickstart: CLI
 
+The packages are not on npm yet, so install the CLI from a checkout (Node 20 or later):
+
 ```bash
+git clone https://github.com/simonstaton/merge-safely.git && cd merge-safely
+npm ci && npm run build
+npm link -w packages/cli              # puts `merge-safely` on your PATH
+
 export ANTHROPIC_API_KEY=sk-ant-...
-npx merge-safely connect anthropic --api-key-env ANTHROPIC_API_KEY
-npx merge-safely estimate --local     # tier, seats, models and estimated cost; nothing runs
-npx merge-safely run --local          # review your working tree against the base branch
+merge-safely connect anthropic --api-key-env ANTHROPIC_API_KEY
+cd ~/src/your-repo
+merge-safely estimate --local         # tier, seats, models and estimated cost; no model is called
+merge-safely run --local              # review your working tree against the default branch
 ```
 
-`run --local` is the "review while you write" loop: the same lenses and connections as the PR gate, printed to your terminal before you open a PR. See [docs/quickstart-cli.md](docs/quickstart-cli.md).
+`run --local` is the "review while you write" loop: the same lenses, policy and connections as the PR gate, printed to your terminal before you open a PR. Nothing is stored or posted. See [docs/quickstart-cli.md](docs/quickstart-cli.md).
+
+### Verified end to end
+
+The local loop has been run for real: a 12-line change with a planted bug, reviewed with `merge-safely run --local` by two Claude Sonnet hunters and one Claude Opus judge through the Claude Code CLI runner (`connect anthropic --runner cli`), with triage turned off so a change that small gets a panel. The verdict was `BLOCK` with the correct finding, in 26 seconds.
 
 ## What you read: the digest
 
 The digest is what a human reads instead of the diff. It appears in the check run summary, the PR review body and escalation messages.
 
 ```
-Verdict: BLOCK (tier 3, round 2 of 3)                                 cost $1.84 · 3 seats · 2m 10s
-Why tier 3: touches packages/db/queries/*Raw.ts and services/api/src/jobs/** (critical paths)
-Quorum: 2 required, 1 passed, 2 blocked
+Verdict: BLOCK (tier 3, round 2 of 3)
+commit 3f2c9e1
+Why tier 3: size: 182 lines changed across 6 files in 3 modules (score 39); touches critical path **/jobs/**/backfill* (services/api/src/jobs/backfillJob.ts); tier 3 forced by critical path hit (score alone would be tier 1)
+Quorum: 2 required, 4 passed, 2 blocked, 1 invalid
 
 Blockers (1)
-  [lock-risk] Backfill scans a large table without batching — services/api/src/jobs/backfillJob.ts:41
-     Evidence: ran EXPLAIN on the raw query; seq scan, no LIMIT, inside one transaction.
+  [lock-risk] Backfill scans a large table without batching — services/api/src/jobs/backfillJob.ts:41 (#f3a9c1)
+     The UPDATE runs over every row of user_stats in one transaction and holds row locks until it commits.
+     Evidence: ran EXPLAIN on the raw query: seq scan, no LIMIT, inside one transaction.
      Suggested: batch by id ranges of 1000 with a sleep, commit per batch.
 
 Important (2) … Nits (3) … Pre-existing (1)
 
-Addressed since round 1: 4 of 6 findings. Not addressed: #f3a9, #c17e.
+Addressed since round 1: 4 of 6 findings. Not addressed: #f3a9c1, #c17e02.
 Reviewer effort: 41 files read, 12 commands.
+Cost: $1.84 · 212.4k tokens in / 18.9k out · 9 seats · 2m 10s
 ```
 
 ## Wiring it to your merge process
 
-Merge Safely never merges. It publishes a check run per head SHA with pending, success and failure states.
+Merge Safely never merges. It publishes a check run per head SHA with pending, success and failure states. (With a personal access token the CLI writes a commit status of the same name instead, because only App and Actions tokens can write check runs.)
 
-- **GitHub rulesets or branch protection:** require the `merge-safely/verdict` check. Express trusted-team bypass with bypass actors.
+- **GitHub rulesets or branch protection:** require the `merge-safely/verdict` check and pin its source app. Express trusted-team bypass with bypass actors.
 - **Mergify:** add `check-success = merge-safely/verdict` to your queue conditions.
-- **GitHub merge queue:** the same required check.
-- **Anything else:** read the verdict JSON.
+- **GitHub merge queue:** the same required check; add `merge_group` to the Action's triggers.
+- **Anything else:** read the verdict JSON (the Action's `verdict-json` output, `merge-safely --json explain`, or the App's API).
 
 Because the check is bound to the head SHA, a push after a green verdict flips it back to pending. That closes the stale-approval hole without any extra rule. See [docs/merge-bots.md](docs/merge-bots.md) and [examples/](examples/).
 
 ## What it never does
 
 - **Merge.** It emits a signal. Your merge bot or ruleset decides.
-- **Write code.** Reviewers have read-only tools. No write, no package install, no network beyond the model API.
+- **Write code.** Reviewers have read-only tools. No write, no package install, no network beyond the model API. The one exception is a command you list in `runner.allowedCommands` (empty by default), which runs the PR's own code; see [docs/security.md](docs/security.md#what-allowedcommands-exposes).
 - **Proxy tokens or hold a model budget.** Your keys go straight from your runner to your model provider. There is no hosted inference and no markup.
 - **Phone home.** No telemetry, no analytics, no update checks.
 
@@ -134,23 +151,23 @@ npm workspaces monorepo. Each `packages/<name>` publishes `@merge-safely/<name>`
 
 | Package | What it is |
 |---|---|
-| `core` | Domain types, ports, policy schema, pure pipeline stages, budgets, orchestrator. Zero I/O. |
+| `core` | Domain types, ports, policy schema, pure pipeline stages, budgets, and the `createGate` orchestrator. Zero I/O. |
 | `lenses` | The eight shipped lenses, shared rubric, personas, prompt builders, untrusted-text delimiting. |
-| `registry` | Model registry data and pricing, including the pessimistic fallback. |
-| `providers` | Connection kinds, connections file, envelope encryption, provider registry, model resolution. |
+| `registry` | Model registry data and pricing, including the pessimistic fallback rate. |
+| `providers` | Connection kinds, connections file, envelope encryption, provider registry, catalog, model resolution. |
 | `provider-anthropic` | Messages API runner and Claude Code CLI runner. |
 | `provider-openai` | OpenAI Responses and Chat Completions runners, including OpenAI-compatible endpoints. |
 | `provider-gemini` | Gemini Developer API runner. |
-| `provider-compatible` | OpenAI-compatible and Anthropic-compatible base-URL runners. |
-| `tools` | The shared read-only tool set and runner-observed audit. |
-| `github` | Source provider, check run and PR review reporters, trust provider, webhook verifier, App auth, check-run-backed store. |
-| `workspace-local` | Local git checkout workspace. |
-| `store-memory`, `store-fs`, `store-sqlite` | Verdict stores and cost ledgers. |
+| `provider-compatible` | OpenAI-compatible, Anthropic-compatible, Ollama and LM Studio presets, and `allProviders()`. |
+| `tools` | The shared read-only tool set, runner-observed audit and shared agentic loop. |
+| `github` | Source provider, check run, commit status and PR review reporters, check-run-backed store, trust providers, webhook verifier, App auth. |
+| `workspace-local` | Disposable git worktrees from a bare mirror, and the working-tree workspace for `--local`. |
+| `store-memory`, `store-fs`, `store-sqlite` | Verdict stores and cost ledgers, with shared contract suites. |
 | `escalation-slack` | Slack incoming-webhook escalation and reporter. |
 | `cli` | The `merge-safely` command. |
 | `action` | The GitHub Action. |
 | `app` | The self-hosted GitHub App service. |
-| `evals` | Eval suite format, runner and reports. |
+| `evals` | Eval suite format, runner, reports and a starter incident suite. |
 | `testkit` | Fakes and fixtures for testing pipelines. |
 
 See [docs/architecture.md](docs/architecture.md).
@@ -171,23 +188,17 @@ See [docs/architecture.md](docs/architecture.md).
 
 ## Status
 
-Version 0.1, pre-release. Interfaces may change before 1.0.
+Version 0.1, pre-release. Interfaces may change before 1.0. The packages are not yet published to npm.
 
 In 0.1:
 
-- GitHub Action and CLI (`connect`, `run`, `run --local`, `estimate`, `explain`, `policy lint`).
-- Anthropic (Messages API and Claude Code CLI runners), OpenAI (API runner), Gemini, and OpenAI-compatible and Anthropic-compatible endpoints.
-- Tiering, triage, panel with judges, proof of work, budgets with the downgrade ladder.
-- Check-run-backed, filesystem, SQLite and in-memory stores.
-- Slack escalation.
-- A self-hosted GitHub App.
+- GitHub Action, CLI (`connect`, `connections`, `run`, `run --local`, `estimate`, `explain`, `verdict`, `policy lint`/`init`, `eval`) and a self-hosted GitHub App.
+- Anthropic (Messages API and Claude Code CLI runners), OpenAI (Responses and Chat Completions), Gemini, OpenAI-compatible and Anthropic-compatible endpoints, Ollama and LM Studio.
+- Tiering, triage, panels with judges, proof of work, rounds, five budget ceilings with the downgrade ladder.
+- Check-run-backed, filesystem, SQLite and in-memory verdict stores and cost ledgers.
+- Slack escalation and an eval runner with a starter incident suite.
 
-Not yet:
-
-- Cloud providers (Bedrock, Vertex, Azure OpenAI) and the Codex CLI runner.
-- Container and remote-sandbox workspaces. Today the workspace is a local checkout, so isolation is whatever your runner gives you.
-- Postgres store, OpenTelemetry metrics, GitLab.
-- A hosted instance. There are no plans to run one.
+The only workspace is a local git checkout, so isolation is whatever your runner gives you (see [docs/security.md](docs/security.md)). There are no plans to run a hosted instance.
 
 ## Licence
 
