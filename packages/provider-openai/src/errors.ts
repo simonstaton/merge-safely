@@ -5,7 +5,7 @@ import {
   NETWORK_CODES,
   NonRetryableError,
   parseRetryAfter,
-  redactWithSecrets,
+  redactDiagnostics,
   systemErrorCode,
 } from "@merge-safely/tools";
 import { APIConnectionError, APIConnectionTimeoutError, APIError, APIUserAbortError } from "openai";
@@ -26,7 +26,7 @@ export function isRetryableStatus(status: number): boolean {
  */
 export function classifyOpenAIError(secrets: string[]): ErrorClassifier {
   return (err: unknown): ErrorInfo => {
-    const msg = short(redactWithSecrets(errorMessage(err), secrets));
+    const msg = short(redactDiagnostics(errorMessage(err), secrets));
     if (err instanceof APIUserAbortError || (err instanceof Error && err.name === "AbortError")) {
       return { kind: "abort", retryable: false, message: "aborted" };
     }

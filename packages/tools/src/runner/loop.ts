@@ -18,7 +18,7 @@ import {
   type ToolResult,
   type WorkspaceHandle,
 } from "@merge-safely/core";
-import { redactWithSecrets } from "../redact.js";
+import { redactDiagnostics } from "../redact.js";
 import { SUBMIT_REVIEW_TOOL_NAME } from "../submit-review.js";
 import { errorMessage } from "./errors.js";
 import { RunGuard } from "./guard.js";
@@ -129,7 +129,7 @@ export class AgenticLoop {
   }
 
   private safe(text: string): string {
-    return redactWithSecrets(text, this.cfg.secrets);
+    return redactDiagnostics(text, this.cfg.secrets);
   }
 
   async run(seat: Seat, input: ReviewerInput, ws: WorkspaceHandle, signal?: AbortSignal): Promise<ReviewerRun> {

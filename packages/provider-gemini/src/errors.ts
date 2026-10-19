@@ -4,7 +4,7 @@ import {
   type ErrorInfo,
   errorMessage,
   NETWORK_CODES,
-  redactWithSecrets,
+  redactDiagnostics,
   systemErrorCode,
 } from "@merge-safely/tools";
 
@@ -24,7 +24,7 @@ export function classifyGeminiError(secrets: string[]): ErrorClassifier {
     if (err instanceof Error && err.name === "AbortError")
       return { kind: "abort", retryable: false, message: "aborted" };
     const status = err instanceof ApiError && typeof err.status === "number" ? err.status : undefined;
-    const raw = redactWithSecrets(errorMessage(err), secrets);
+    const raw = redactDiagnostics(errorMessage(err), secrets);
     const msg = short(raw);
     if (status !== undefined) {
       if (status === 401 || (status === 400 && /API[_ ]KEY[_ ]INVALID|API key not valid/i.test(raw)))

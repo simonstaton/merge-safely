@@ -9,7 +9,13 @@ export function maskSecret(s: string): string {
   return `…${s.slice(-4)}`;
 }
 
-/** Userinfo and query-string values embedded in a URL (e.g. `https://u:pw@gw/v1?api-key=…`), raw and decoded. */
+/** Query parameter names whose values are credentials (`api-key`, `token`, `sig`, ...); `api-version` is not. */
+const CREDENTIAL_QUERY_KEY = /key|token|secret|auth|sig|password|passwd|credential/i;
+
+/**
+ * Userinfo and credential-looking query-string values embedded in a URL (e.g. `https://u:pw@gw/v1?api-key=…`),
+ * raw and decoded. Other query values (`api-version=2024-10-21`) are configuration, not secrets.
+ */
 export function urlCredentials(url: string): string[] {
   let u: URL;
   try {
@@ -29,7 +35,8 @@ export function urlCredentials(url: string): string[] {
   };
   add(u.username);
   add(u.password);
-  for (const [, v] of u.searchParams) {
+  for (const [k, v] of u.searchParams) {
+    if (!CREDENTIAL_QUERY_KEY.test(k)) continue;
     out.add(v);
     add(encodeURIComponent(v));
   }

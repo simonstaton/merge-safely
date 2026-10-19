@@ -29,7 +29,7 @@ export {
 export { globToRegExp, matchGlob } from "./glob.js";
 export { PathError, resolveSafe, type SafePath } from "./paths.js";
 export { toolsSystemPromptFragment } from "./prompt.js";
-export { REDACTED, redactSecrets, redactWithSecrets, replaceLiterals } from "./redact.js";
+export { REDACTED, redactDiagnostics, redactToolOutput, replaceLiterals } from "./redact.js";
 export * from "./runner/index.js";
 export { isHiddenPath, isSensitivePath } from "./sensitive.js";
 export { SUBMIT_REVIEW_TOOL_NAME, submitReviewDefinition } from "./submit-review.js";

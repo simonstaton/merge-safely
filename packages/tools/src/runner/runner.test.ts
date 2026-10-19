@@ -1,6 +1,6 @@
 import type { ModelInfo } from "@merge-safely/core";
 import { describe, expect, it } from "vitest";
-import { redactWithSecrets as redact } from "../redact.js";
+import { redactDiagnostics as redact } from "../redact.js";
 import { secretStrings, systemErrorCode } from "./errors.js";
 import { RunGuard } from "./guard.js";
 import {

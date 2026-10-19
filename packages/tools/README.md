@@ -14,7 +14,7 @@ const audit = tools.audit(); // { substantiveCalls, totalCalls, filesRead, comma
 ## Shape converters and runner helpers
 
 - `toAnthropicTools`, `toOpenAIFunctionTools`, `toOpenAIResponsesTools`, `toGeminiFunctionDeclarations` convert tool definitions (optionally `strict`) to each vendor's wire shape. Every provider package uses them.
-- The OpenAI and Gemini runners share the provider-neutral loop exported here: `AgenticLoop` (a `Transport` owns the wire format), `RunGuard` (turns, deadline, USD via registry pricing, abort), `withRetry` / `parseRetryAfter` / `backoffDelay`, `sanitizeSchema` / `isStrictCompatible`, `addUsage`, and the safe error helpers `errorMessage`, `secretStrings`, `systemErrorCode`.
+- The OpenAI and Gemini runners share the provider-neutral loop exported here: `AgenticLoop` (a `Transport` owns the wire format), `RunGuard` (turns, deadline, USD via registry pricing, abort), `withRetry` / `parseRetryAfter` / `backoffDelay`, `sanitizeSchema` / `isStrictCompatible`, `addUsage`, and the error helpers `errorMessage`, `secretStrings`, `systemErrorCode`.
 
 ## Tools
 
@@ -38,7 +38,7 @@ const audit = tools.audit(); // { substantiveCalls, totalCalls, filesRead, comma
   - untracked git-ignored files (a developer's local secrets in `--local` mode)
   - anything under `.git`
 - **ripgrep** gets the model's glob *before* the exclusions, because in rg the last matching glob wins. Every result is also post-filtered.
-- **Redaction**: all tool output passes through `redactSecrets` before it reaches the model. It is core's redactor (`@merge-safely/core` `redactSecrets` with `aggressive: true`) and covers API keys, GitHub/Slack/AWS/Google tokens, PEM blocks, `Authorization:` values, query-string credentials and `password=`/`token=` assignments. `redactWithSecrets(text, secrets)` first removes known literal values (connection keys, header values).
+- **Redaction**: all tool output passes through `redactToolOutput(text, secrets)` before it reaches the model: known secret values (`opts.secrets`) are replaced verbatim, then core's precise default redactor removes real credential shapes (provider/GitHub/AWS/Slack keys, PEM private keys, JWTs, Bearer tokens, literal password/token assignments). Code that only handles credentials (`apiKey: string`) is shown as written. Error text uses `redactDiagnostics`, which adds core's aggressive rules.
 - **Binaries**: `git`, `rg` and run_command executables are resolved once, to absolute paths, using only PATH entries that are absolute and outside the checkout. A PR-committed `node_modules/.bin/git` can never shadow them.
 - **git** runs with an allowlisted environment:
   - only PATH, LANG, LC_ALL, TZ, SSH_AUTH_SOCK and SSH_AGENT_PID are kept; no inherited `GIT_*`

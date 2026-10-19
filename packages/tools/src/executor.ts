@@ -24,7 +24,7 @@ import { ignoredPaths, isIgnored, listWorkspaceFiles, looksBinary, SKIP_DIRS } f
 import { matchGlob } from "./glob.js";
 import { PathError, realRootOf, resolveSafe, type SafePath } from "./paths.js";
 import { runProcess } from "./proc.js";
-import { redactSecrets } from "./redact.js";
+import { redactDiagnostics, redactToolOutput } from "./redact.js";
 import { type SearchEngine, search } from "./search.js";
 import { hasGitSegment, isSensitivePath } from "./sensitive.js";
 import { matchAllowlist, parseAllowEntry, tokenizeCommand } from "./tokenize.js";
@@ -44,6 +44,8 @@ export interface ReadOnlyToolsOptions extends ToolExecutorOptions {
   /** "auto" (default) uses ripgrep when on PATH, otherwise the JS fallback. */
   searchEngine?: SearchEngine;
   searchTimeoutMs?: number;
+  /** Known secret values (connection keys, tokens from the environment) removed verbatim from every output. */
+  secrets?: readonly string[];
 }
 
 /** A model-facing failure: becomes `{ ok: false, output: "error: <message>" }`. */
@@ -129,6 +131,7 @@ async function forceRemove(dir: string): Promise<void> {
 }
 
 export const createReadOnlyTools = ((ws: WorkspaceHandle, opts: ReadOnlyToolsOptions = {}): ToolExecutor => {
+  const secrets = opts.secrets ?? [];
   const maxOutputBytes =
     opts.maxOutputBytes && opts.maxOutputBytes > 0 ? opts.maxOutputBytes : DEFAULT_MAX_OUTPUT_BYTES;
   const commandTimeoutMs =
@@ -465,8 +468,9 @@ export const createReadOnlyTools = ((ws: WorkspaceHandle, opts: ReadOnlyToolsOpt
         const input = call.input && typeof call.input === "object" && !Array.isArray(call.input) ? call.input : {};
         const o = await handler(input, signal);
         const ok = o.ok ?? true;
-        // Redact before truncating so a cut never leaves half a secret visible.
-        const t = truncateOutput(redactSecrets(o.output), maxOutputBytes, o.truncated === true);
+        // Redact before truncating so a cut never leaves half a secret visible. Precise mode: the reviewer
+        // must see code as written, including code that handles credentials.
+        const t = truncateOutput(redactToolOutput(o.output, secrets), maxOutputBytes, o.truncated === true);
         const result: ToolResult = { ok, output: t.output };
         if (t.truncated) result.truncated = true;
         if (o.filesRead && ok) {
@@ -481,7 +485,10 @@ export const createReadOnlyTools = ((ws: WorkspaceHandle, opts: ReadOnlyToolsOpt
         return result;
       } catch (e: unknown) {
         const msg = e instanceof ToolError || e instanceof PathError ? e.message : errMessage(e);
-        return { ok: false, output: truncateOutput(redactSecrets(`error: ${msg}`), maxOutputBytes).output };
+        return {
+          ok: false,
+          output: truncateOutput(redactDiagnostics(`error: ${msg}`, secrets), maxOutputBytes).output,
+        };
       }
     },
 

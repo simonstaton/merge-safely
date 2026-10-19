@@ -11,7 +11,7 @@ import type {
   ValidationResult,
   WorkspaceHandle,
 } from "@merge-safely/core";
-import { AgenticLoop, errorMessage, type RetryOptions, redactWithSecrets, secretStrings } from "@merge-safely/tools";
+import { AgenticLoop, errorMessage, type RetryOptions, redactDiagnostics, secretStrings } from "@merge-safely/tools";
 import { defaultClientFactory, type OpenAILike } from "./client.js";
 import { classifyOpenAIError } from "./errors.js";
 import { isChatModelId, toModelInfo } from "./models.js";
@@ -103,7 +103,7 @@ function buildProvider(id: string, connectionKinds: ConnectionKind[], opts: Open
           return { ok: true, message: "base URL does not expose /models, assuming reachable", latencyMs };
         if (info.kind === "network")
           return { ok: false, message: `provider unreachable at ${hostOf(conn)} (${info.message})`, latencyMs };
-        return { ok: false, message: `validation failed: ${redactWithSecrets(info.message, secrets)}`, latencyMs };
+        return { ok: false, message: `validation failed: ${redactDiagnostics(info.message, secrets)}`, latencyMs };
       }
     },
 
@@ -128,7 +128,7 @@ function buildProvider(id: string, connectionKinds: ConnectionKind[], opts: Open
           try {
             client = factory(conn);
           } catch (err: unknown) {
-            setupError = `could not create OpenAI client: ${redactWithSecrets(errorMessage(err), secrets)}`;
+            setupError = `could not create OpenAI client: ${redactDiagnostics(errorMessage(err), secrets)}`;
           }
           const loop = new AgenticLoop({
             model,

@@ -1,6 +1,6 @@
 import type { Connection } from "@merge-safely/core";
 import { secretValues as connectionSecretValues } from "@merge-safely/providers";
-import { REDACTED, redactWithSecrets } from "@merge-safely/tools";
+import { REDACTED, redactDiagnostics, redactToolOutput } from "@merge-safely/tools";
 
 export { REDACTED };
 
@@ -21,14 +21,20 @@ export function envSecretValues(env: NodeJS.ProcessEnv = process.env): string[] 
   return out;
 }
 
-/** Remove known secret values (longest first), then anything shaped like a credential (core's redactor). */
+/**
+ * Diagnostics (error messages, validation text): remove known secret values (longest first), then anything
+ * shaped like a credential with core's aggressive redactor. Never use on reviewer output.
+ */
 export function scrub(text: string, secrets: readonly string[] = []): string {
-  return redactWithSecrets(text, secrets, 1);
+  return redactDiagnostics(text, secrets, 1);
 }
 
-/** Deep-scrub every string in a JSON-shaped value. */
+/**
+ * Deep-scrub every string in reviewer/judge output (findings, summaries, evidence): known secret values, then
+ * core's precise default redactor, so evidence quoting code stays as written.
+ */
 export function scrubDeep<T>(value: T, secrets: readonly string[] = []): T {
-  if (typeof value === "string") return scrub(value, secrets) as T;
+  if (typeof value === "string") return redactToolOutput(value, secrets) as T;
   if (Array.isArray(value)) return value.map((v) => scrubDeep(v, secrets)) as T;
   if (value && typeof value === "object") {
     const out: Record<string, unknown> = {};

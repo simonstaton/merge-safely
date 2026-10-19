@@ -50,7 +50,10 @@ export function buildRun(args: {
   error?: string;
   startedAt: Date;
   finishedAt: Date;
-  /** Known secret values; every string in the output and the error is scrubbed of them and of credential shapes. */
+  /**
+   * Known secret values; every string in the output and the error is scrubbed of them. Output then gets the
+   * precise shape redactor (code in evidence stays as written), the error string the aggressive one.
+   */
   secrets: readonly string[];
 }): ReviewerRun {
   const { seat, secrets } = args;

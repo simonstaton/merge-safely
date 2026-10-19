@@ -125,6 +125,33 @@ describe("redactSecrets", () => {
   });
 });
 
+describe("redactSecrets default-mode recall (short real prefixes, scheme-less userinfo)", () => {
+  it.each([
+    ["github-token", j("github_pat_", "11ABCDEFG0123456789_"), "[REDACTED:github-token]"],
+    ["github-token", j("ghp_", "0123456789abcdefghijABCDEFGHIJ"), "[REDACTED:github-token]"],
+    ["anthropic-key", j("sk-ant-", "api03-zzzzzzzzzzzz"), "[REDACTED:anthropic-key]"],
+    [
+      "url-credentials",
+      j("//registry.example/:_auth ", "//npm-user:s3cretPw9@registry.example/"),
+      "//registry.example/:_auth //npm-user:[REDACTED:url-credentials]@registry.example/",
+    ],
+  ])("%s: %s", (_kind, input, expected) => {
+    expect(redactSecrets(input).text).toBe(expected);
+  });
+
+  it("keeps placeholders and code unredacted", () => {
+    for (const t of [
+      "PASSWORD=example",
+      "API_TOKEN=test",
+      "//user:${PASSWORD}@host",
+      "// note: see a@b",
+      'const secret = "secret" in conn ? conn.secret : undefined;',
+    ]) {
+      expect(redactSecrets(t).text).toBe(t);
+    }
+  });
+});
+
 describe("redactSecrets aggressive mode (shapes the adapters used to keep locally)", () => {
   const loud = (t: string) => redactSecrets(t, { aggressive: true }).text;
   const PEM_CERT = j("-----BEGIN ", "CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIU\n-----END ", "CERTIFICATE-----");
@@ -159,6 +186,20 @@ describe("redactSecrets aggressive mode (shapes the adapters used to keep locall
     ],
     ["pem-block", j("-----BEGIN ", "PRIVATE KEY-----\nMIIE cut by truncation"), "[REDACTED:pem-block]"],
     ["pem-block", PEM_CERT, "[REDACTED:pem-block]"],
+    [
+      "authorization",
+      j("Authorization: Basic ", "dXNlcjpwYXNzd29yZA==", " (from netrc)"),
+      "Authorization: [REDACTED:authorization] (from netrc)",
+    ],
+    [
+      "authorization",
+      j("authorization: token ", "abcdef0123456789xyz", " (expired)"),
+      "authorization: [REDACTED:authorization] (expired)",
+    ],
+    ["api-key", "x-api-key: abc", "x-api-key: [REDACTED:api-key]"],
+    ["api-key", "`x-api-key: q1w2e3`", "`x-api-key: [REDACTED:api-key]`"],
+    ["openai-key", j("KEY_sk-", "abcdefghijklmnop"), "KEY_[REDACTED:openai-key]"],
+    ["google-api-key", j('"_AIza', 'SyA1234567890abcdefghijk"'), '"_[REDACTED:google-api-key]"'],
   ])("%s: %s", (_kind, input, expected) => {
     expect(loud(input)).toBe(expected);
   });
@@ -166,6 +207,20 @@ describe("redactSecrets aggressive mode (shapes the adapters used to keep locall
   it("leaves those inputs alone in the default (diff/prompt) mode", () => {
     for (const t of ["Authorization: Bearer abc.def", "x-api-key: qqqqqqqqqqqq", "?key=AAAA1234&x=1", PEM_CERT]) {
       expect(redactSecrets(t).text).toBe(t);
+    }
+  });
+
+  it("leaves code identifiers after credential names alone, even in aggressive mode", () => {
+    for (const t of [
+      "apiKey: string;",
+      "`apiKey: null`",
+      "const apiKey = opts.apiKey;",
+      "authorization: getHeader(req)",
+      "Authorization: does every route check the caller?",
+      "PASSWORD=example",
+      "API_TOKEN=test",
+    ]) {
+      expect(loud(t)).toBe(t);
     }
   });
 

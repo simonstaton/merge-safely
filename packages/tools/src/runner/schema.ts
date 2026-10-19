@@ -6,15 +6,18 @@ function isObj(v: unknown): v is Json {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-/** Deep copy without the `$schema` meta keyword, which most function-calling APIs reject. */
+/**
+ * Deep copy without the `$schema` meta keyword, which most function-calling APIs reject. A *property* that is
+ * literally named `$schema` (a key of a `properties` map) is data, not the keyword, and is kept.
+ */
 export function sanitizeSchema(schema: Record<string, unknown>): Record<string, unknown> {
-  const walk = (v: unknown): unknown => {
-    if (Array.isArray(v)) return v.map(walk);
+  const walk = (v: unknown, isPropertyMap = false): unknown => {
+    if (Array.isArray(v)) return v.map((x) => walk(x));
     if (!isObj(v)) return v;
     const out: Json = {};
     for (const [k, x] of Object.entries(v)) {
-      if (k === "$schema") continue;
-      out[k] = walk(x);
+      if (k === "$schema" && !isPropertyMap) continue;
+      out[k] = walk(x, !isPropertyMap && (k === "properties" || k === "patternProperties"));
     }
     return out;
   };

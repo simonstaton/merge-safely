@@ -15,7 +15,7 @@ import { createReadOnlyTools } from "./executor.js";
 import { globToRegExp, matchGlob } from "./glob.js";
 import { PathError, resolveSafe } from "./paths.js";
 import { toolsSystemPromptFragment } from "./prompt.js";
-import { redactSecrets, redactWithSecrets, replaceLiterals } from "./redact.js";
+import { redactDiagnostics, replaceLiterals } from "./redact.js";
 import { isHiddenPath, isSensitivePath } from "./sensitive.js";
 import { submitReviewDefinition } from "./submit-review.js";
 import { matchAllowlist, tokenizeCommand } from "./tokenize.js";
@@ -165,7 +165,7 @@ describe("environments", () => {
   });
 });
 
-describe("redactSecrets", () => {
+describe("redactDiagnostics (error text)", () => {
   it.each([
     ["sk-ant-api03-abcdefghijklmnop", "[REDACTED]"],
     ["key sk-proj-abcdefghijklmnopqrst done", "key [REDACTED] done"],
@@ -181,18 +181,18 @@ describe("redactSecrets", () => {
     ["-----BEGIN RSA PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY-----\nafter", "[REDACTED]\nafter"],
     ["-----BEGIN PRIVATE KEY-----\nMIIE cut by truncation", "[REDACTED]"],
   ])("%s", (input, expected) => {
-    expect(redactSecrets(input)).toBe(expected);
+    expect(redactDiagnostics(input)).toBe(expected);
   });
 
   it("leaves ordinary code alone", () => {
     const code = "const token = getToken();\nif (password === input) return skip;\nconst sk = 1;";
-    expect(redactSecrets(code)).toBe(code);
+    expect(redactDiagnostics(code)).toBe(code);
   });
   it("replaces known secret values longest first, then shapes", () => {
-    expect(redactWithSecrets("a hunter22hunter22 b hunter22", ["hunter22", "hunter22hunter22"])).toBe(
+    expect(redactDiagnostics("a hunter22hunter22 b hunter22", ["hunter22", "hunter22hunter22"])).toBe(
       "a [REDACTED] b [REDACTED]",
     );
-    expect(redactWithSecrets("tiny abc", ["abc"])).toBe("tiny abc");
+    expect(redactDiagnostics("tiny abc", ["abc"])).toBe("tiny abc");
     expect(replaceLiterals("x secret-value y", ["secret-value"], (v) => `…${v.slice(-2)}`)).toBe("x …ue y");
   });
 });
@@ -245,6 +245,15 @@ describe("shape converters", () => {
     expect(toOpenAIFunctionTools([strictDef])[0]?.function.strict).toBe(true);
     expect(JSON.stringify(toOpenAIFunctionTools([{ ...strictDef, strict: false }]))).not.toContain("strict");
     expect(toOpenAIResponsesTools([strictDef])[0]?.strict).toBe(true);
+  });
+
+  it("keeps a property that is literally named $schema", () => {
+    const def = {
+      name: "t",
+      description: "d",
+      inputSchema: { type: "object", properties: { $schema: { type: "string" } }, required: ["$schema"] },
+    };
+    expect(toAnthropicTools([def])[0]?.input_schema).toEqual({ ...def.inputSchema });
   });
 
   it("drops nested $schema keywords too", () => {

@@ -175,6 +175,13 @@ Default `conditionalLenses`:
 design-fidelity: ["**/*.tsx", "**/*.jsx", "**/*.vue", "**/*.svelte", "**/*.css", "**/*.scss", "**/components/**", "**/ui/**"]
 ```
 
+`conditionalLenses` globs use the same matcher as every other path pattern in the policy (see [Glob patterns](#glob-patterns)). For conditional lenses this means:
+
+- Matching is case-insensitive: `**/components/**` matches `src/Components/Button.tsx`.
+- A pattern without a `/` matches the file name at any depth: `*.css` matches `src/app.css`.
+- A trailing `/**` needs at least one further segment. `**/ui/**` matches `src/ui/button.tsx` but not a file named `ui`, and `src/design-system/**` matches files inside that directory but not the path `src/design-system` itself.
+- `{a,b}` alternatives are expanded: `**/*.{tsx,jsx}` matches either extension.
+
 ## `models`
 
 Which connection and model each seat uses. Connection ids refer to connections in your connections file, the Action's `connections` input, or the App's setup page. See [connections.md](connections.md).
