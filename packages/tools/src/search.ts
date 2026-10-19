@@ -1,9 +1,11 @@
 import { lstat } from "node:fs/promises";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { Worker } from "node:worker_threads";
+import { runGit, type ToolContext } from "./ctx.js";
 import { listWorkspaceFiles } from "./files.js";
 import { matchGlob } from "./glob.js";
-import { onPath, runProcess, scrubbedEnv } from "./proc.js";
+import { runProcess } from "./proc.js";
+import { isHiddenPath, SENSITIVE_RG_GLOBS } from "./sensitive.js";
 
 export interface SearchParams {
   pattern: string;
@@ -26,7 +28,8 @@ export interface SearchOutcome {
 
 export const MAX_LINE_CHARS = 300;
 const SEARCH_TIMEOUT_MS = 60_000;
-const MAX_FILE_BYTES = 2 * 1024 * 1024;
+/** Same cap as read_file, so search never silently skips a file the model could read. */
+const MAX_FILE_BYTES = 10 * 1024 * 1024;
 
 export type SearchEngine = "auto" | "rg" | "js";
 
@@ -35,16 +38,24 @@ function clip(text: string): string {
 }
 
 export async function search(
-  realRoot: string,
+  ctx: ToolContext,
   p: SearchParams,
   engine: SearchEngine,
   signal?: AbortSignal,
 ): Promise<SearchOutcome> {
-  const useRg = engine === "rg" || (engine === "auto" && (await onPath("rg")));
-  return useRg ? searchRg(realRoot, p, signal) : searchJs(realRoot, p, signal);
+  if (engine === "rg" && !ctx.rgBin) throw new Error("ripgrep is not installed");
+  const useRg = engine === "rg" || (engine === "auto" && ctx.rgBin !== undefined);
+  const res = useRg ? await searchRg(ctx, p, signal) : await searchJs(ctx, p, signal);
+  // Defence in depth: whatever the engine did, never surface .git internals or credential files.
+  const lines = res.lines.filter((l) => {
+    const m = /^(.*?):\d+: /.exec(l);
+    return !m || !isHiddenPath(m[1] as string);
+  });
+  return { lines, more: res.more };
 }
 
-async function searchRg(realRoot: string, p: SearchParams, signal?: AbortSignal): Promise<SearchOutcome> {
+async function searchRg(ctx: ToolContext, p: SearchParams, signal?: AbortSignal): Promise<SearchOutcome> {
+  const realRoot = ctx.realRoot;
   const args = [
     "--no-config",
     "--line-number",
@@ -56,17 +67,18 @@ async function searchRg(realRoot: string, p: SearchParams, signal?: AbortSignal)
     "--no-ignore-dot",
     "--no-ignore-global",
     "--no-ignore-exclude",
-    "--glob=!.git",
     `--max-filesize=${MAX_FILE_BYTES}`,
   ];
   if (p.ignoreCase) args.push("--ignore-case");
   if (p.literal) args.push("--fixed-strings");
   if (p.glob) args.push(`--glob=${p.glob}`);
+  // In rg the LAST matching glob wins, so the exclusions must come after the model's glob.
+  args.push("--iglob=!.git", "--iglob=!**/.git/**", ...SENSITIVE_RG_GLOBS.map((g) => `--iglob=${g}`));
   args.push(`--regexp=${p.pattern}`, "--", p.rel);
-  if (!p.isFile) args.push(...(await trackedButIgnored(realRoot, p, signal)));
-  const r = await runProcess("rg", args, {
+  if (!p.isFile) args.push(...(await trackedButIgnored(ctx, p, signal)));
+  const r = await runProcess(ctx.rgBin as string, args, {
     cwd: realRoot,
-    env: scrubbedEnv(),
+    env: { PATH: ctx.pathDirs.join(delimiter) },
     timeoutMs: p.timeoutMs ?? SEARCH_TIMEOUT_MS,
     maxBytes: 8 * 1024 * 1024,
     ...(signal ? { signal } : {}),
@@ -101,25 +113,20 @@ async function searchRg(realRoot: string, p: SearchParams, signal?: AbortSignal)
  * then ignore it to hide it from search. Tracked-but-ignored files are passed to rg explicitly
  * (explicit paths bypass ignore rules). Per-directory .ignore/.rgignore files are disabled by flags.
  */
-async function trackedButIgnored(realRoot: string, p: SearchParams, signal?: AbortSignal): Promise<string[]> {
-  const r = await runProcess(
-    "git",
-    ["-c", "core.fsmonitor=false", "ls-files", "-z", "--cached", "--ignored", "--exclude-standard"],
-    {
-      cwd: realRoot,
-      env: scrubbedEnv({ GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0" }),
-      timeoutMs: SEARCH_TIMEOUT_MS,
-      maxBytes: 8 * 1024 * 1024,
-      ...(signal ? { signal } : {}),
-    },
-  );
+async function trackedButIgnored(ctx: ToolContext, p: SearchParams, signal?: AbortSignal): Promise<string[]> {
+  const realRoot = ctx.realRoot;
+  const r = await runGit(ctx, ["ls-files", "-z", "--cached", "--ignored", "--exclude-standard"], {
+    timeoutMs: SEARCH_TIMEOUT_MS,
+    maxBytes: 8 * 1024 * 1024,
+    signal,
+  });
   if (r.code !== 0 || r.spawnError) return [];
   const prefix = p.rel === "." ? "" : `${p.rel.replace(/\/+$/, "")}/`;
   const g = p.glob;
   const out: string[] = [];
   for (const f of r.stdout.split("\0")) {
     if (out.length >= 5000) break;
-    if (f.length === 0 || !f.startsWith(prefix) || f.split("/").includes(".git") || (g && !matchGlob(g, f))) continue;
+    if (f.length === 0 || !f.startsWith(prefix) || isHiddenPath(f) || (g && !matchGlob(g, f))) continue;
     // rg follows explicitly named symlinks, so only plain files are passed.
     try {
       if ((await lstat(join(realRoot, f))).isFile()) out.push(f);
@@ -170,7 +177,8 @@ function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-async function searchJs(realRoot: string, p: SearchParams, signal?: AbortSignal): Promise<SearchOutcome> {
+async function searchJs(ctx: ToolContext, p: SearchParams, signal?: AbortSignal): Promise<SearchOutcome> {
+  const realRoot = ctx.realRoot;
   const source = p.literal ? escapeRegExp(p.pattern) : p.pattern;
   const flags = p.ignoreCase ? "i" : "";
   try {
@@ -182,9 +190,9 @@ async function searchJs(realRoot: string, p: SearchParams, signal?: AbortSignal)
   if (p.isFile) {
     files = [p.rel];
   } else {
-    const all = await listWorkspaceFiles(realRoot, signal);
+    const all = await listWorkspaceFiles(ctx, signal);
     const prefix = p.rel === "." ? "" : `${p.rel.replace(/\/+$/, "")}/`;
-    files = all.filter((f) => f.startsWith(prefix) && !f.split("/").includes(".git"));
+    files = all.filter((f) => f.startsWith(prefix));
   }
   if (p.glob) {
     const g = p.glob;

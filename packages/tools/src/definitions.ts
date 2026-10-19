@@ -155,18 +155,21 @@ export const GIT_BLAME: ToolDefinition = {
 };
 
 export function runCommandDefinition(allowed: readonly string[]): ToolDefinition {
+  const shown = allowed.map((a) =>
+    a.trim().endsWith(" *") ? `\`${a.trim().slice(0, -2)}\` (extra arguments allowed)` : `\`${a.trim()}\` (exactly)`,
+  );
   return {
     name: TOOL_NAMES.runCommand,
     description:
       "Run one allowlisted command (for example the test suite) in the repository root and return its exit code and output. " +
-      `Allowed commands, optionally followed by extra arguments: ${allowed.map((a) => `\`${a}\``).join(", ")}. ` +
+      `Allowed: ${shown.join(", ")}. ` +
       "No shell: pipes, redirects, `;`, `&`, `$` and backticks are rejected. Quotes group arguments.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
       required: ["command"],
       properties: {
-        command: { type: "string", description: "The full command line, starting with an allowed command." },
+        command: { type: "string", description: "The full command line, matching an allowed command." },
       },
     },
     substantive: true,

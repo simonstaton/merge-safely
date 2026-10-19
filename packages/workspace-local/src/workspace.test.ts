@@ -16,7 +16,7 @@ import type { Change } from "@merge-safely/core";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { currentTreeWorkspace, WORKTREE_SHA } from "./current.js";
 import { git, scrubSecrets } from "./git.js";
-import { localWorkspace } from "./local.js";
+import { localWorkspace, splitUrlCredentials } from "./local.js";
 
 function sh(cwd: string, ...args: string[]): string {
   return execFileSync("git", ["-c", "user.name=T", "-c", "user.email=t@example.com", ...args], {
@@ -162,25 +162,55 @@ describe("localWorkspace (repoPath)", () => {
   });
 
   it("falls back to the PR head ref when the sha cannot be fetched directly", async () => {
-    const env = { ...process.env };
     // Protocol v0 refuses shas that are not advertised tips, forcing the refs/pull/<n>/head path.
-    process.env.GIT_CONFIG_COUNT = "1";
-    process.env.GIT_CONFIG_KEY_0 = "protocol.version";
-    process.env.GIT_CONFIG_VALUE_0 = "0";
+    const ws = localWorkspace({
+      repoPath: clone,
+      worktreeRoot: join(base, "wt"),
+      gitConfig: { "protocol.version": "0" },
+    });
+    const h = await ws.acquire(change({ headSha: prOnlySha }), { seatId: "pr" });
+    expect(readFileSync(join(h.cwd, "a.txt"), "utf8")).toBe("pr\n");
+    expect(sh(clone, "rev-parse", "--verify", "refs/merge-safely/pull/7^")).toBe(prOnlySha);
+    await h.dispose();
+  });
+
+  it("ignores the caller's GIT_* environment (GIT_INDEX_FILE from a pre-commit hook must not be rewritten)", async () => {
+    const saved = { ...process.env };
+    const bogusIndex = join(base, "pre-commit-index");
+    writeFileSync(bogusIndex, "user staged state");
+    process.env.GIT_INDEX_FILE = bogusIndex;
+    process.env.GIT_DIR = join(base, "nope.git");
+    process.env.GIT_WORK_TREE = base;
     try {
       const ws = localWorkspace({ repoPath: clone, worktreeRoot: join(base, "wt") });
-      const h = await ws.acquire(change({ headSha: prOnlySha }), { seatId: "pr" });
-      expect(readFileSync(join(h.cwd, "a.txt"), "utf8")).toBe("pr\n");
-      expect(sh(clone, "rev-parse", "--verify", "refs/merge-safely/pull/7^")).toBe(prOnlySha);
+      const h = await ws.acquire(change(), { seatId: "env" });
+      expect(readFileSync(join(h.cwd, "a.txt"), "utf8")).toBe("two\n");
       await h.dispose();
+      expect(readFileSync(bogusIndex, "utf8")).toBe("user staged state");
     } finally {
-      process.env = env;
+      process.env = saved;
     }
+  });
+
+  it("dispose is idempotent under concurrency and retryable after a failure", async () => {
+    const ws = localWorkspace({ repoPath: clone, worktreeRoot: join(base, "wt") });
+    const h = await ws.acquire(change(), { seatId: "dispose" });
+    // PR code made a directory unremovable.
+    mkdirSync(join(h.cwd, "locked", "inner"), { recursive: true });
+    writeFileSync(join(h.cwd, "locked", "inner", "f"), "x");
+    chmodSync(join(h.cwd, "locked", "inner"), 0o500);
+    chmodSync(join(h.cwd, "locked"), 0o500);
+    const a = h.dispose();
+    const b = h.dispose();
+    await Promise.all([a, b]);
+    expect(existsSync(h.cwd)).toBe(false);
+    await h.dispose();
   });
 
   it("rejects a non-sha headSha", async () => {
     const ws = localWorkspace({ repoPath: clone, worktreeRoot: join(base, "wt") });
-    await expect(ws.acquire(change({ headSha: "--upload-pack=evil" }))).rejects.toThrow(/not a commit sha/);
+    await expect(ws.acquire(change({ headSha: "--upload-pack=evil" }))).rejects.toThrow(/full 40\/64-character/);
+    await expect(ws.acquire(change({ headSha: headSha.slice(0, 12) }))).rejects.toThrow(/full 40\/64-character/);
   });
 });
 
@@ -242,6 +272,100 @@ describe("localWorkspace (cloneUrl)", () => {
     const config = readFileSync(join(cacheDir, "config"), "utf8");
     expect(config).not.toContain(token);
     expect(config).not.toContain(b64);
+  });
+
+  it("rebuilds a mirror whose config was tampered with (e.g. a smudge filter planted by PR code)", async () => {
+    const cacheDir = join(base, "cache", "tamper.git");
+    const ws = localWorkspace({ cloneUrl: origin, cacheDir, worktreeRoot: join(base, "wt5") });
+    const h = await ws.acquire(change(), { seatId: "t1" });
+    await h.dispose();
+    const marker = join(base, "smudge-ran");
+    sh(cacheDir, "config", "filter.evil.smudge", `sh -c 'echo ran > ${marker}; cat'`);
+    writeFileSync(join(cacheDir, "info", "attributes"), "* filter=evil\n");
+    const h2 = await ws.acquire(change(), { seatId: "t2" });
+    expect(readFileSync(join(h2.cwd, "a.txt"), "utf8")).toBe("two\n");
+    expect(existsSync(marker)).toBe(false);
+    expect(readFileSync(join(cacheDir, "config"), "utf8")).not.toContain("evil");
+    // While a seat is live, a tampered mirror is refused rather than deleted under it.
+    sh(cacheDir, "config", "core.pager", "evil");
+    await expect(ws.acquire(change(), { seatId: "t3" })).rejects.toThrow(/was modified/);
+    await h2.dispose();
+  });
+
+  it("moves URL userinfo into a scoped header instead of argv", () => {
+    expect(splitUrlCredentials("https://bob:s3cr%40t@git.example.com/a/b.git")).toEqual({
+      url: "https://git.example.com/a/b.git",
+      basic: Buffer.from("bob:s3cr@t").toString("base64"),
+    });
+    expect(splitUrlCredentials("/local/path")).toEqual({ url: "/local/path" });
+    expect(splitUrlCredentials("https://git.example.com/x.git")).toEqual({ url: "https://git.example.com/x.git" });
+  });
+
+  it("never passes URL credentials in argv or error text", async () => {
+    const ws = localWorkspace({
+      cloneUrl: "https://bob:PlainPassw0rd@git.invalid/x.git",
+      cacheDir: join(base, "cache", "userinfo.git"),
+      // No network in tests: make the fetch fail fast after argv/config are built.
+      gitConfig: { "protocol.https.allow": "never" },
+      worktreeRoot: join(base, "wt6"),
+    });
+    let message = "";
+    try {
+      await ws.acquire(change());
+    } catch (e: unknown) {
+      message = e instanceof Error ? e.message : String(e);
+    }
+    expect(message).toMatch(/not available/);
+    expect(message).not.toContain("PlainPassw0rd");
+    expect(message).not.toContain(Buffer.from("bob:PlainPassw0rd").toString("base64"));
+  });
+
+  it("sends the token only to fetch commands, scoped to the clone URL, never in argv", async () => {
+    const realGit = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+    const binDir = join(base, "spy-bin");
+    const log = join(base, "spy.log");
+    mkdirSync(binDir, { recursive: true });
+    writeFileSync(
+      join(binDir, "git"),
+      `#!/bin/sh\n{ printf 'ARGS:'; for a in "$@"; do printf ' %s' "$a"; done; printf '\\n'; env | grep '^GIT_CONFIG_' | sort; } >> "${log}"\nexec "${realGit}" "$@"\n`,
+    );
+    chmodSync(join(binDir, "git"), 0o755);
+    const token = "ghs_SpyToken0123456789";
+    const header = Buffer.from(`x-access-token:${token}`).toString("base64");
+    const saved = process.env.PATH;
+    process.env.PATH = `${binDir}:${saved}`;
+    try {
+      // 1. https: the fetch carries a header scoped to exactly that URL.
+      const remote = localWorkspace({
+        cloneUrl: "https://git.invalid/acme/demo.git",
+        token,
+        cacheDir: join(base, "cache", "spy-https.git"),
+        worktreeRoot: join(base, "wt7"),
+        gitConfig: { "protocol.https.allow": "never" },
+      });
+      await expect(remote.acquire(change())).rejects.toThrow(/not available/);
+      // 2. a successful acquire: worktree add / remove / prune get no credentials at all.
+      const local = localWorkspace({
+        cloneUrl: origin,
+        token,
+        cacheDir: join(base, "cache", "spy-local.git"),
+        worktreeRoot: join(base, "wt7"),
+      });
+      const h = await local.acquire(change(), { seatId: "spy" });
+      await h.dispose();
+    } finally {
+      process.env.PATH = saved;
+    }
+    const entries = readFileSync(log, "utf8").split("ARGS:").filter(Boolean);
+    const fetches = entries.filter((e) => e.startsWith(" fetch"));
+    const others = entries.filter((e) => !e.startsWith(" fetch"));
+    expect(fetches.some((e) => e.includes("http.https://git.invalid/acme/demo.git.extraheader"))).toBe(true);
+    expect(fetches.some((e) => e.includes(header))).toBe(true);
+    expect(others.some((e) => e.startsWith(" worktree add"))).toBe(true);
+    for (const e of others) expect(e).not.toContain("extraheader");
+    for (const e of entries) expect(e.split("\n")[0]).not.toContain(token);
+    for (const e of entries) expect(e.split("\n")[0]).not.toContain(header);
+    for (const e of entries) expect(e).toContain("GIT_CONFIG_KEY_0=core.hooksPath");
   });
 
   it("requires a source", () => {

@@ -45,13 +45,37 @@ export function tokenizeCommand(command: string): TokenizeResult {
   return { ok: true, argv };
 }
 
-/** The command must equal an allowlisted entry or start with it followed by a space. */
-export function matchAllowlist(command: string, allowed: readonly string[]): string | undefined {
+/** Parsed allowlist entry: an exact command, or a prefix that admits extra arguments (` *` suffix). */
+export interface AllowEntry {
+  /** The entry as written in policy. */
+  raw: string;
+  /** The command (without the trailing ` *`). */
+  command: string;
+  /** True when the entry ended in ` *`, allowing extra arguments after `command`. */
+  extraArgs: boolean;
+}
+
+export function parseAllowEntry(raw: string): AllowEntry | undefined {
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed === "*") return undefined;
+  if (trimmed.endsWith(" *")) {
+    const command = trimmed.slice(0, -2).trim();
+    return command ? { raw: trimmed, command, extraArgs: true } : undefined;
+  }
+  return { raw: trimmed, command: trimmed, extraArgs: false };
+}
+
+/**
+ * Exact match by default. An entry ending in ` *` (e.g. "npx vitest run *") also admits the command
+ * followed by a space and further arguments. Returns the matching entry.
+ */
+export function matchAllowlist(command: string, allowed: readonly string[]): AllowEntry | undefined {
   const cmd = command.trim();
   for (const raw of allowed) {
-    const entry = raw.trim();
-    if (!entry) continue;
-    if (cmd === entry || cmd.startsWith(`${entry} `)) return entry;
+    const e = parseAllowEntry(raw);
+    if (!e) continue;
+    if (cmd === e.command) return e;
+    if (e.extraArgs && cmd.startsWith(`${e.command} `)) return e;
   }
   return undefined;
 }

@@ -1,10 +1,16 @@
 import type { ToolDefinition } from "@merge-safely/core";
 
-/** Anthropic Messages API `tools[]` entry. */
+/**
+ * Shapes mirror the vendor SDK typings (checked against @anthropic-ai/sdk `Tool`, openai
+ * `ChatCompletionFunctionTool` / `responses.FunctionTool`, @google/genai `FunctionDeclaration`)
+ * without importing them, so this package stays SDK-free. Provider runners may adopt them.
+ */
+
+/** Anthropic Messages API `Tool`: `input_schema` must be an object schema. */
 export interface AnthropicToolShape {
   name: string;
   description: string;
-  input_schema: Record<string, unknown>;
+  input_schema: { type: "object"; [k: string]: unknown };
 }
 
 /** OpenAI Chat Completions `tools[]` entry (also used by most OpenAI-compatible servers). */
@@ -13,20 +19,23 @@ export interface OpenAIFunctionToolShape {
   function: { name: string; description: string; parameters: Record<string, unknown> };
 }
 
-/** OpenAI Responses API `tools[]` entry (flat function shape). */
+/** OpenAI Responses API `FunctionTool` (flat shape; `strict` is required by the typings). */
 export interface OpenAIResponsesToolShape {
   type: "function";
   name: string;
   description: string;
   parameters: Record<string, unknown>;
-  strict: false;
+  strict: boolean;
 }
 
-/** Gemini `functionDeclarations[]` entry. */
+/**
+ * Gemini `FunctionDeclaration` using `parametersJsonSchema`, which accepts full JSON Schema
+ * (so no lossy conversion to the OpenAPI-subset `parameters` is needed).
+ */
 export interface GeminiFunctionDeclarationShape {
   name: string;
   description: string;
-  parameters: Record<string, unknown>;
+  parametersJsonSchema: Record<string, unknown>;
 }
 
 function clone(schema: Record<string, unknown>): Record<string, unknown> {
@@ -35,7 +44,11 @@ function clone(schema: Record<string, unknown>): Record<string, unknown> {
 }
 
 export function toAnthropicTools(defs: readonly ToolDefinition[]): AnthropicToolShape[] {
-  return defs.map((d) => ({ name: d.name, description: d.description, input_schema: clone(d.inputSchema) }));
+  return defs.map((d) => ({
+    name: d.name,
+    description: d.description,
+    input_schema: { ...clone(d.inputSchema), type: "object" },
+  }));
 }
 
 export function toOpenAIFunctionTools(defs: readonly ToolDefinition[]): OpenAIFunctionToolShape[] {
@@ -55,57 +68,6 @@ export function toOpenAIResponsesTools(defs: readonly ToolDefinition[]): OpenAIR
   }));
 }
 
-/** Keys Gemini's OpenAPI-subset `Schema` accepts; anything else (e.g. additionalProperties, $schema) is dropped. */
-const GEMINI_SCHEMA_KEYS = new Set([
-  "type",
-  "format",
-  "title",
-  "description",
-  "nullable",
-  "enum",
-  "maxItems",
-  "minItems",
-  "properties",
-  "required",
-  "minProperties",
-  "maxProperties",
-  "minLength",
-  "maxLength",
-  "pattern",
-  "example",
-  "anyOf",
-  "propertyOrdering",
-  "default",
-  "items",
-  "minimum",
-  "maximum",
-]);
-
-function isRecord(v: unknown): v is Record<string, unknown> {
-  return typeof v === "object" && v !== null && !Array.isArray(v);
-}
-
-export function toGeminiSchema(schema: unknown): unknown {
-  if (Array.isArray(schema)) return schema.map(toGeminiSchema);
-  if (!isRecord(schema)) return schema;
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(schema)) {
-    if (!GEMINI_SCHEMA_KEYS.has(k)) continue;
-    if (k === "properties" && isRecord(v)) {
-      out[k] = Object.fromEntries(Object.entries(v).map(([pk, pv]) => [pk, toGeminiSchema(pv)]));
-    } else if (k === "items" || k === "anyOf") {
-      out[k] = toGeminiSchema(v);
-    } else {
-      out[k] = structuredClone(v);
-    }
-  }
-  return out;
-}
-
 export function toGeminiFunctionDeclarations(defs: readonly ToolDefinition[]): GeminiFunctionDeclarationShape[] {
-  return defs.map((d) => ({
-    name: d.name,
-    description: d.description,
-    parameters: toGeminiSchema(d.inputSchema) as Record<string, unknown>,
-  }));
+  return defs.map((d) => ({ name: d.name, description: d.description, parametersJsonSchema: clone(d.inputSchema) }));
 }

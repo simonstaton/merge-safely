@@ -1,18 +1,5 @@
 import { spawn } from "node:child_process";
 
-/** Environment variables passed to every subprocess. Everything else (API keys, tokens) is dropped. */
-export const ENV_ALLOWLIST = ["PATH", "HOME", "LANG", "CI", "NODE_ENV"] as const;
-
-/** Build a minimal environment from the allowlist so connection secrets never reach a subprocess. */
-export function scrubbedEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = {};
-  for (const key of ENV_ALLOWLIST) {
-    const v = process.env[key];
-    if (v !== undefined) env[key] = v;
-  }
-  return { ...env, ...extra };
-}
-
 export interface ProcResult {
   /** Exit code, or null when killed by a signal. */
   code: number | null;
@@ -127,8 +114,9 @@ export function runProcess(command: string, args: string[], opts: ProcOptions): 
       settled = true;
       clearTimeout(timer);
       opts.signal?.removeEventListener("abort", onAbort);
-      // Reap any grandchildren still holding the group after the leader exits.
-      if (timedOut || aborted) killGroup();
+      // Always kill the group: background children (e.g. `spawn(...).unref()` in a test script) must not
+      // outlive the call and keep mutating the checkout during the review.
+      killGroup();
       const cut = (bufs: Buffer[]): string => {
         const b = Buffer.concat(bufs);
         if (b.length > opts.maxBytes) overflow = true;
@@ -146,23 +134,9 @@ export function runProcess(command: string, args: string[], opts: ProcOptions): 
       if (spawnError !== undefined) result.spawnError = spawnError;
       resolve(result);
     };
+    // Kill stragglers as soon as the leader exits, so a grandchild holding our pipes cannot delay "close".
+    child.on("exit", () => killGroup());
     child.on("error", (e: Error) => finish(null, e.message));
     child.on("close", (code: number | null) => finish(code));
   });
-}
-
-/** True when `bin` resolves to an executable on PATH. Cached per process. */
-const whichCache = new Map<string, Promise<boolean>>();
-export function onPath(bin: string): Promise<boolean> {
-  let p = whichCache.get(bin);
-  if (!p) {
-    p = runProcess(bin, ["--version"], {
-      cwd: process.cwd(),
-      env: scrubbedEnv(),
-      timeoutMs: 5_000,
-      maxBytes: 4096,
-    }).then((r) => r.spawnError === undefined && r.code === 0);
-    whichCache.set(bin, p);
-  }
-  return p;
 }

@@ -7,11 +7,18 @@ export {
   type OpenAIResponsesToolShape,
   toAnthropicTools,
   toGeminiFunctionDeclarations,
-  toGeminiSchema,
   toOpenAIFunctionTools,
   toOpenAIResponsesTools,
 } from "./convert.js";
 export { DEFAULT_READ_LIMIT, MAX_READ_LIMIT, READ_ONLY_DEFINITIONS, TOOL_NAMES, type ToolName } from "./definitions.js";
+export {
+  COMMAND_ENV_PASSTHROUGH,
+  commandEnv,
+  GIT_ENV_PASSTHROUGH,
+  gitEnv,
+  resolveBinary,
+  safePathDirs,
+} from "./env.js";
 export {
   createReadOnlyTools,
   DEFAULT_COMMAND_TIMEOUT_MS,
@@ -20,8 +27,9 @@ export {
 } from "./executor.js";
 export { globToRegExp, matchGlob } from "./glob.js";
 export { PathError, resolveSafe, type SafePath } from "./paths.js";
-export { ENV_ALLOWLIST, scrubbedEnv } from "./proc.js";
 export { toolsSystemPromptFragment } from "./prompt.js";
+export { REDACTED, redactSecrets } from "./redact.js";
+export { isHiddenPath, isSensitivePath } from "./sensitive.js";
 export { SUBMIT_REVIEW_TOOL_NAME, submitReviewDefinition } from "./submit-review.js";
-export { matchAllowlist, type TokenizeResult, tokenizeCommand } from "./tokenize.js";
+export { type AllowEntry, matchAllowlist, parseAllowEntry, type TokenizeResult, tokenizeCommand } from "./tokenize.js";
 export { TRUNCATED_MARKER, truncateOutput } from "./truncate.js";

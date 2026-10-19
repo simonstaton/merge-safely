@@ -1,5 +1,6 @@
 import { existsSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { hasGitSegment } from "./sensitive.js";
 
 export class PathError extends Error {}
 
@@ -8,6 +9,8 @@ export interface SafePath {
   abs: string;
   /** Path relative to the workspace root, with `/` separators. "." for the root itself. */
   rel: string;
+  /** Like rel, but after resolving symlinks (of the nearest existing ancestor plus the remaining suffix). */
+  realRel: string;
   exists: boolean;
 }
 
@@ -18,10 +21,6 @@ function toPosix(p: string): string {
 function isInside(root: string, p: string): boolean {
   const r = relative(root, p);
   return r === "" || (!r.startsWith(`..${sep}`) && r !== ".." && !isAbsolute(r));
-}
-
-function hasGitSegment(rel: string): boolean {
-  return rel.split("/").some((s) => s.toLowerCase() === ".git");
 }
 
 /**
@@ -59,7 +58,8 @@ export function resolveSafe(realRoot: string, input: string | undefined, opts: {
   const realRel = toPosix(relative(realRoot, real)) || ".";
   if (hasGitSegment(realRel))
     throw new PathError(".git internals are not readable; use git_diff, git_log or git_blame");
-  return { abs: suffix ? resolve(real, suffix) : real, rel: lexRel, exists };
+  const abs = suffix ? resolve(real, suffix) : real;
+  return { abs, rel: lexRel, realRel: toPosix(relative(realRoot, abs)) || ".", exists };
 }
 
 /** Root realpath, so later containment checks compare like with like (e.g. /tmp -> /private/tmp). */

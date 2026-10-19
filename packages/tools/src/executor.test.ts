@@ -1,7 +1,16 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { ToolExecutor, WorkspaceHandle } from "@merge-safely/core";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createReadOnlyTools, type ReadOnlyToolsOptions } from "./executor.js";
@@ -18,6 +27,7 @@ let repo: string;
 let outside: string;
 let baseSha: string;
 let headSha: string;
+let orphanSha: string;
 
 beforeAll(() => {
   base = realpathSync(mkdtempSync(join(tmpdir(), "ms-tools-")));
@@ -62,9 +72,24 @@ beforeAll(() => {
   sh(repo, "add", "-f", "hidden.ts", "hidden-link.txt");
   writeFileSync(join(repo, ".gitignore"), "ignored.log\nnode_modules\nhidden.ts\nhidden-link.txt\n");
   sh(repo, "add", "-A");
+  // Credential-shaped files (tracked and untracked) and secret-shaped strings in ordinary files.
+  mkdirSync(join(repo, "config"));
+  mkdirSync(join(repo, "keys"));
+  writeFileSync(join(repo, "config", ".env.production"), "DB_PASSWORD=hunter2hunter2\n");
+  writeFileSync(join(repo, "keys", "server.pem"), "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\n");
+  writeFileSync(
+    join(repo, "leak.txt"),
+    'const key = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz";\nGITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789\nkeep me\n',
+  );
+  sh(repo, "add", "-A");
   sh(repo, "commit", "-q", "-m", "second: break add");
   headSha = sh(repo, "rev-parse", "HEAD").trim();
   writeFileSync(join(repo, "ignored.log"), "add should be ignored\n");
+  writeFileSync(join(repo, ".env"), "OPENAI_KEY=add-this-is-local\n");
+  // .git internals hold a sentinel that must never be reachable through any tool.
+  sh(repo, "config", "merge-safely.sentinel", "GITSENTINEL42");
+  const emptyTree = sh(repo, "hash-object", "-t", "tree", "-w", "/dev/null").trim();
+  orphanSha = sh(repo, "commit-tree", "-m", "orphan", emptyTree).trim();
 });
 
 afterAll(() => {
@@ -202,7 +227,7 @@ describe("find_files", () => {
     expect(r4.output).toContain("[more than 2 matches");
     const r5 = await t.execute({ name: "find_files", input: { glob: "**/index.js" } });
     expect(r5.output).toBe("no files match **/index.js");
-    expect(t.audit().substantiveCalls).toBe(5);
+    expect(t.audit().substantiveCalls).toBe(3);
   });
 });
 
@@ -329,9 +354,6 @@ describe("git tools", () => {
       { name: "git_diff", input: { base: "--output=/tmp/pwned" } },
       { name: "git_diff", input: { head: "-p" } },
       { name: "git_diff", input: { base: "HEAD", head: "HEAD;rm" } },
-      { name: "git_diff", input: { path: "-dash.txt" } },
-      { name: "git_log", input: { path: "--all" } },
-      { name: "git_blame", input: { path: "-dash.txt" } },
       { name: "git_diff", input: { path: "../outside" } },
       { name: "git_blame", input: { path: ".git/config" } },
       // Paths posing as revisions would put git diff into --no-index mode.
@@ -347,6 +369,43 @@ describe("git tools", () => {
     }
     expect(t.audit().substantiveCalls).toBe(0);
   });
+
+  it("treats file names starting with - as paths after --", async () => {
+    const t = tools();
+    const blame = await t.execute({ name: "git_blame", input: { path: "-dash.txt" } });
+    expect(blame.ok).toBe(true);
+    expect(blame.output).toContain("dash");
+    const log = await t.execute({ name: "git_log", input: { path: "-dash.txt" } });
+    expect(log.output).toContain("second: break add");
+    const diff = await t.execute({ name: "git_diff", input: { path: "-dash.txt" } });
+    expect(diff.output).toContain("+dash");
+    // "--all" is a (non-existent) path, not an option: no commits, not every ref's history.
+    const all = await t.execute({ name: "git_log", input: { path: "--all" } });
+    expect(all.output).toBe("no commits");
+  });
+
+  it("reports a missing merge base instead of a misleading two-dot diff", async () => {
+    const ws: WorkspaceHandle = { cwd: repo, headSha, baseSha: orphanSha, dispose: async () => {} };
+    const r = await createReadOnlyTools(ws).execute({ name: "git_diff", input: {} });
+    expect(r.ok).toBe(false);
+    expect(r.output).toContain("merge base");
+  });
+
+  it("ignores the caller's GIT_* environment (e.g. GIT_INDEX_FILE from a pre-commit hook)", async () => {
+    const saved = { ...process.env };
+    const bogusIndex = join(base, "bogus-index");
+    process.env.GIT_INDEX_FILE = bogusIndex;
+    process.env.GIT_DIR = join(base, "nope.git");
+    process.env.GIT_WORK_TREE = outside;
+    try {
+      const t = tools();
+      expect((await t.execute({ name: "git_log", input: {} })).output).toContain("second: break add");
+      expect((await t.execute({ name: "find_files", input: { glob: "*.ts" } })).output).toContain("src/index.ts");
+      expect(existsSync(bogusIndex)).toBe(false);
+    } finally {
+      process.env = saved;
+    }
+  });
 });
 
 describe("run_command", () => {
@@ -356,8 +415,11 @@ describe("run_command", () => {
     expect(r.output).toContain("unknown tool");
   });
 
-  it("enforces the allowlist by exact match or prefix + space", async () => {
-    const t = tools({ allowedCommands: ["node -v", "git status"] });
+  it("enforces the allowlist: exact by default, extra arguments only with a trailing ' *'", async () => {
+    const t = tools({ allowedCommands: ["node -v", "git status *"] });
+    expect((await t.execute({ name: "run_command", input: { command: "node -v -e 1" } })).output).toContain(
+      "not allowlisted",
+    );
     expect((await t.execute({ name: "run_command", input: { command: "node -v" } })).ok).toBe(true);
     expect((await t.execute({ name: "run_command", input: { command: "node -version" } })).output).toContain(
       "not allowlisted",
@@ -371,7 +433,7 @@ describe("run_command", () => {
   });
 
   it("rejects shell metacharacters", async () => {
-    const t = tools({ allowedCommands: ["node"] });
+    const t = tools({ allowedCommands: ["node *"] });
     for (const command of [
       "node -v; cat /etc/passwd",
       "node -v | cat",
@@ -394,7 +456,7 @@ describe("run_command", () => {
   it("runs without a shell in ws.cwd with a scrubbed environment", async () => {
     process.env.MS_TEST_SECRET = "sk-live-should-not-leak";
     try {
-      const t = tools({ allowedCommands: ["node -e"] });
+      const t = tools({ allowedCommands: ["node -e *"] });
       const command = 'node -e "console.log(JSON.stringify({cwd: process.cwd(), env: process.env}))"';
       const r = await t.execute({ name: "run_command", input: { command } });
       expect(r.ok).toBe(true);
@@ -404,7 +466,13 @@ describe("run_command", () => {
       expect(json.cwd).toBe(repo);
       expect(json.env.MS_TEST_SECRET).toBeUndefined();
       expect(json.env.PATH).toBeDefined();
-      for (const k of Object.keys(json.env)) expect(["PATH", "HOME", "LANG", "CI", "NODE_ENV"]).toContain(k);
+      const allowed = ["PATH", "LANG", "CI", "NODE_ENV", "HOME", "TMPDIR", "TMP", "TEMP"];
+      for (const k of Object.keys(json.env)) expect(allowed.includes(k) || k.startsWith("XDG_"), k).toBe(true);
+      // HOME and TMPDIR are a per-call scratch dir, removed afterwards.
+      expect(json.env.HOME).not.toBe(process.env.HOME);
+      expect(json.env.TMPDIR?.startsWith(dirname(json.env.HOME as string))).toBe(true);
+      expect(existsSync(json.env.HOME as string)).toBe(false);
+      for (const d of json.env.PATH?.split(":") ?? []) expect(d.startsWith("/")).toBe(true);
       expect(r.commandRun).toBe(command);
     } finally {
       delete process.env.MS_TEST_SECRET;
@@ -412,7 +480,7 @@ describe("run_command", () => {
   });
 
   it("reports non-zero exit codes", async () => {
-    const r = await tools({ allowedCommands: ["node -e"] }).execute({
+    const r = await tools({ allowedCommands: ["node -e *"] }).execute({
       name: "run_command",
       input: { command: 'node -e "process.exit(3)"' },
     });
@@ -421,7 +489,7 @@ describe("run_command", () => {
   });
 
   it("kills the whole process group on timeout", async () => {
-    const t = tools({ allowedCommands: ["node -e"], commandTimeoutMs: 300 });
+    const t = tools({ allowedCommands: ["node -e *"], commandTimeoutMs: 300 });
     const started = Date.now();
     const r = await t.execute({
       name: "run_command",
@@ -438,7 +506,7 @@ describe("run_command", () => {
   });
 
   it("honours an abort signal", async () => {
-    const t = tools({ allowedCommands: ["node -e"] });
+    const t = tools({ allowedCommands: ["node -e *"] });
     const ac = new AbortController();
     setTimeout(() => ac.abort(), 200);
     const started = Date.now();
@@ -461,7 +529,7 @@ describe("truncation", () => {
   });
 
   it("truncates command output", async () => {
-    const r = await tools({ maxOutputBytes: 1000, allowedCommands: ["node -e"] }).execute({
+    const r = await tools({ maxOutputBytes: 1000, allowedCommands: ["node -e *"] }).execute({
       name: "run_command",
       input: { command: "node -e \"process.stdout.write('x'.repeat(100000))\"" },
     });
@@ -480,7 +548,21 @@ describe("audit and error handling", () => {
     await t.execute({ name: "search", input: { pattern: "add" } });
     await t.execute({ name: "read_file", input: { path: "missing.ts" } });
     await t.execute({ name: "nope", input: {} });
-    expect(t.audit()).toEqual({ substantiveCalls: 3, totalCalls: 6, filesRead: ["README.md"], commandsRun: [] });
+    expect(t.audit()).toEqual({ substantiveCalls: 2, totalCalls: 6, filesRead: ["README.md"], commandsRun: [] });
+  });
+
+  it("does not count empty results or repeats toward proof of work", async () => {
+    const t = tools();
+    await t.execute({ name: "search", input: { pattern: "zzz-nothing-1" } });
+    await t.execute({ name: "search", input: { pattern: "zzz-nothing-2" } });
+    await t.execute({ name: "find_files", input: { glob: "*.nothing" } });
+    await t.execute({ name: "git_log", input: { path: "no/such/path" } });
+    await t.execute({ name: "git_diff", input: { base: "HEAD", head: "HEAD" } });
+    expect(t.audit().substantiveCalls).toBe(0);
+    for (let i = 0; i < 5; i++) await t.execute({ name: "read_file", input: { path: "big.txt", offset: 1 + i * 10 } });
+    await t.execute({ name: "search", input: { pattern: "add" } });
+    await t.execute({ name: "search", input: { pattern: "add", path: "." } });
+    expect(t.audit()).toMatchObject({ substantiveCalls: 2, totalCalls: 12, filesRead: ["big.txt"] });
   });
 
   it("returns copies so callers cannot mutate the audit", async () => {
@@ -505,5 +587,120 @@ describe("audit and error handling", () => {
     ac.abort();
     const r = await tools().execute({ name: "read_file", input: { path: "README.md" } }, ac.signal);
     expect(r.ok).toBe(false);
+  });
+});
+
+describe.each(engines)(".git is unreachable (%s)", (engine) => {
+  it("search with a broad model glob never returns .git internals", async () => {
+    const t = tools({ searchEngine: engine });
+    for (const glob of ["*", "**", ".git/**", "**/.git/**", "config", ".git", "!.git"]) {
+      const r = await t.execute({ name: "search", input: { pattern: "GITSENTINEL42", glob } });
+      expect(r.output, glob).not.toContain("GITSENTINEL42");
+      expect(r.output, glob).not.toContain(".git/");
+    }
+  });
+});
+
+describe("hidden paths", () => {
+  it("find_files never lists .git internals", async () => {
+    const t = tools();
+    for (const glob of ["**", ".git/*", "**/.git/**", "config", "HEAD"]) {
+      const r = await t.execute({ name: "find_files", input: { glob } });
+      expect(r.output, glob).not.toMatch(/(^|\n)\.git\//);
+    }
+  });
+
+  it("never reads, lists, searches or blames credential-shaped files, tracked or not", async () => {
+    const t = tools();
+    for (const path of [".env", "config/.env.production", "keys/server.pem"]) {
+      const r = await t.execute({ name: "read_file", input: { path } });
+      expect(r.ok, path).toBe(false);
+      expect(r.output).toContain("credentials file");
+    }
+    expect((await t.execute({ name: "git_blame", input: { path: "keys/server.pem" } })).ok).toBe(false);
+    const found = await t.execute({ name: "find_files", input: { glob: "**" } });
+    expect(found.output).not.toMatch(/\.env|server\.pem/);
+    const s = await t.execute({ name: "search", input: { pattern: "hunter2|add-this-is-local|PRIVATE" } });
+    expect(s.output).toBe("no matches");
+    const ls = await t.execute({ name: "list_dir", input: { depth: 3 } });
+    expect(ls.output).not.toMatch(/\.env|server\.pem/);
+    expect(ls.output).toContain("config/");
+  });
+
+  it("hides untracked git-ignored files (local secrets, build output)", async () => {
+    const t = tools();
+    const r = await t.execute({ name: "read_file", input: { path: "ignored.log" } });
+    expect(r.ok).toBe(false);
+    expect(r.output).toContain("git-ignored");
+    expect((await t.execute({ name: "list_dir", input: {} })).output).not.toContain("ignored.log");
+    expect((await t.execute({ name: "find_files", input: { glob: "*.log" } })).output).toBe("no files match *.log");
+    // Tracked-but-ignored files are part of the change and stay readable.
+    expect((await t.execute({ name: "read_file", input: { path: "hidden.ts" } })).ok).toBe(true);
+  });
+
+  it("redacts secret-shaped strings from every tool output", async () => {
+    const t = tools();
+    const r = await t.execute({ name: "read_file", input: { path: "leak.txt" } });
+    expect(r.ok).toBe(true);
+    expect(r.output).not.toContain("sk-ant-api03");
+    expect(r.output).not.toContain("ghp_");
+    expect(r.output).toContain("[REDACTED]");
+    expect(r.output).toContain("keep me");
+    const d = await t.execute({ name: "git_diff", input: {} });
+    expect(d.output).not.toContain("ghp_abcdef");
+    expect(d.output).not.toContain("hunter2");
+  });
+});
+
+describe("binary resolution", () => {
+  it("never runs a git, rg or node planted in the checkout, whatever PATH says", async () => {
+    const marker = join(base, "planted-ran");
+    for (const dir of ["bin", join("node_modules", ".bin")]) {
+      mkdirSync(join(repo, dir), { recursive: true });
+      for (const name of ["git", "rg", "node"]) {
+        const f = join(repo, dir, name);
+        writeFileSync(f, `#!/bin/sh\necho planted >> "${marker}"\n`);
+        chmodSync(f, 0o755);
+      }
+    }
+    const saved = process.env.PATH;
+    process.env.PATH = `bin:node_modules/.bin:.::${join(repo, "bin")}:${saved}`;
+    try {
+      const t = tools({ allowedCommands: ["node -v"] });
+      expect((await t.execute({ name: "git_log", input: {} })).output).toContain("second: break add");
+      expect((await t.execute({ name: "search", input: { pattern: "add\\(" } })).output).toContain("src/index.ts");
+      const v = await t.execute({ name: "run_command", input: { command: "node -v" } });
+      expect(v.output).toMatch(/exit code: 0\nv\d+/);
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      process.env.PATH = saved;
+      rmSync(join(repo, "bin"), { recursive: true, force: true });
+      rmSync(join(repo, "node_modules", ".bin"), { recursive: true, force: true });
+    }
+  });
+});
+
+describe("run_command process hygiene", () => {
+  it("kills background children when the command returns", async () => {
+    const t = tools({ allowedCommands: ["node -e *"] });
+    const r = await t.execute({
+      name: "run_command",
+      input: {
+        command:
+          "node -e \"const c = require('node:child_process').spawn('sleep', ['37'], {stdio: 'ignore'}), p = console.log(c.pid), u = c.unref()\"",
+      },
+    });
+    const pid = Number(/exit code: 0\n(\d+)/.exec(r.output)?.[1]);
+    expect(pid).toBeGreaterThan(0);
+    let alive = true;
+    for (let i = 0; i < 40 && alive; i++) {
+      try {
+        process.kill(pid, 0);
+        await new Promise((res) => setTimeout(res, 50));
+      } catch {
+        alive = false;
+      }
+    }
+    expect(alive).toBe(false);
   });
 });

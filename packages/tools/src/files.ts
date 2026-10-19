@@ -1,39 +1,61 @@
 import { readdir } from "node:fs/promises";
 import { join } from "node:path";
-import { runProcess, scrubbedEnv } from "./proc.js";
+import { runGit, type ToolContext } from "./ctx.js";
+import { isHiddenPath } from "./sensitive.js";
 
 /** Directories never descended into by walks and listings. */
 export const SKIP_DIRS = new Set([".git", "node_modules", "dist"]);
 const WALK_SKIP = new Set([".git", "node_modules"]);
 export const MAX_LISTED_FILES = 100_000;
 
+function splitZ(out: string): string[] {
+  return out.split("\0").filter((p) => p.length > 0);
+}
+
 /**
- * Every file in the workspace, relative with `/` separators.
- * Uses `git ls-files` (tracked + untracked, minus ignored) when the root is a git checkout, so
- * .gitignore is respected; otherwise walks the tree skipping .git and node_modules. Symlinked
- * directories are never followed.
+ * Every file the tools may surface, relative with `/` separators: tracked files plus untracked files
+ * that are not git-ignored (so a developer's ignored `.env` or build output never shows up), minus
+ * anything under `.git` or credential-shaped. Falls back to a walk when the root is not a git
+ * checkout. Symlinked directories are never followed.
  */
-export async function listWorkspaceFiles(realRoot: string, signal?: AbortSignal): Promise<string[]> {
-  const r = await runProcess(
-    "git",
-    ["-c", "core.fsmonitor=false", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-    {
-      cwd: realRoot,
-      env: scrubbedEnv({ GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0" }),
-      timeoutMs: 60_000,
-      maxBytes: 64 * 1024 * 1024,
-      ...(signal ? { signal } : {}),
-    },
-  );
+export async function listWorkspaceFiles(ctx: ToolContext, signal?: AbortSignal): Promise<string[]> {
+  const r = await runGit(ctx, ["ls-files", "-z", "--cached", "--others", "--exclude-standard"], {
+    timeoutMs: 60_000,
+    maxBytes: 64 * 1024 * 1024,
+    signal,
+  });
+  let files: string[];
   if (r.code === 0 && !r.spawnError) {
-    const seen = new Set<string>();
-    for (const p of r.stdout.split("\0")) {
-      if (p && !seen.has(p)) seen.add(p);
-      if (seen.size >= MAX_LISTED_FILES) break;
-    }
-    return [...seen].sort();
+    files = [...new Set(splitZ(r.stdout))].slice(0, MAX_LISTED_FILES).sort();
+  } else {
+    files = await walk(ctx.realRoot);
   }
-  return walk(realRoot);
+  return files.filter((f) => !isHiddenPath(f));
+}
+
+/**
+ * Untracked, git-ignored paths. Whole ignored directories are reported once with a trailing `/`.
+ * Empty when the root is not a git checkout.
+ */
+export async function ignoredPaths(ctx: ToolContext, signal?: AbortSignal): Promise<Set<string>> {
+  const r = await runGit(
+    ctx,
+    ["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory", "--no-empty-directory"],
+    { timeoutMs: 60_000, maxBytes: 16 * 1024 * 1024, signal },
+  );
+  if (r.code !== 0 || r.spawnError) return new Set();
+  return new Set(splitZ(r.stdout));
+}
+
+/** True when rel (a file or directory) is ignored-and-untracked, directly or via an ignored ancestor dir. */
+export function isIgnored(rel: string, ignored: ReadonlySet<string>): boolean {
+  if (ignored.size === 0 || rel === ".") return false;
+  if (ignored.has(rel) || ignored.has(`${rel}/`)) return true;
+  const parts = rel.split("/");
+  for (let i = 1; i < parts.length; i++) {
+    if (ignored.has(`${parts.slice(0, i).join("/")}/`)) return true;
+  }
+  return false;
 }
 
 async function walk(realRoot: string): Promise<string[]> {
