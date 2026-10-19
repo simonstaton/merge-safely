@@ -1,0 +1,28 @@
+{
+  "name": "@merge-safely/store-sqlite",
+  "version": "0.1.0",
+  "description": "SQLite VerdictStore and CostLedger (WAL, compaction)",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@merge-safely/core": "0.1.0",
+    "better-sqlite3": "^11.5.0"
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "name": "@merge-safely/provider-compatible",
+  "version": "0.1.0",
+  "description": "OpenAI-compatible and Anthropic-compatible base-URL runners",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@merge-safely/core": "0.1.0",
+    "@merge-safely/registry": "0.1.0",
+    "@merge-safely/providers": "0.1.0",
+    "@merge-safely/tools": "0.1.0",
+    "@merge-safely/provider-anthropic": "0.1.0",
+    "@merge-safely/provider-openai": "0.1.0"
+  }
+}

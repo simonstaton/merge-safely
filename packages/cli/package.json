@@ -1,0 +1,43 @@
+{
+  "name": "@merge-safely/cli",
+  "version": "0.1.0",
+  "description": "merge-safely command line",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@merge-safely/core": "0.1.0",
+    "@merge-safely/lenses": "0.1.0",
+    "@merge-safely/registry": "0.1.0",
+    "@merge-safely/providers": "0.1.0",
+    "@merge-safely/tools": "0.1.0",
+    "@merge-safely/workspace-local": "0.1.0",
+    "@merge-safely/provider-anthropic": "0.1.0",
+    "@merge-safely/provider-openai": "0.1.0",
+    "@merge-safely/provider-gemini": "0.1.0",
+    "@merge-safely/provider-compatible": "0.1.0",
+    "@merge-safely/github": "0.1.0",
+    "@merge-safely/store-memory": "0.1.0",
+    "@merge-safely/store-fs": "0.1.0",
+    "@merge-safely/store-sqlite": "0.1.0",
+    "@merge-safely/escalation-slack": "0.1.0",
+    "commander": "^12.1.0",
+    "yaml": "^2.6.0"
+  }
+}

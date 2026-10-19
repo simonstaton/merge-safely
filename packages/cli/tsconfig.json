@@ -1,0 +1,23 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": { "rootDir": "src", "outDir": "dist" },
+  "include": ["src/**/*.ts"],
+  "exclude": ["src/**/*.test.ts"],
+  "references": [
+    { "path": "../core" },
+    { "path": "../lenses" },
+    { "path": "../registry" },
+    { "path": "../providers" },
+    { "path": "../tools" },
+    { "path": "../workspace-local" },
+    { "path": "../provider-anthropic" },
+    { "path": "../provider-openai" },
+    { "path": "../provider-gemini" },
+    { "path": "../provider-compatible" },
+    { "path": "../github" },
+    { "path": "../store-memory" },
+    { "path": "../store-fs" },
+    { "path": "../store-sqlite" },
+    { "path": "../escalation-slack" }
+  ]
+}

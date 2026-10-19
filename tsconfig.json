@@ -1,0 +1,23 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/core" },
+    { "path": "packages/registry" },
+    { "path": "packages/lenses" },
+    { "path": "packages/providers" },
+    { "path": "packages/tools" },
+    { "path": "packages/workspace-local" },
+    { "path": "packages/provider-anthropic" },
+    { "path": "packages/provider-openai" },
+    { "path": "packages/provider-gemini" },
+    { "path": "packages/provider-compatible" },
+    { "path": "packages/github" },
+    { "path": "packages/store-memory" },
+    { "path": "packages/store-fs" },
+    { "path": "packages/store-sqlite" },
+    { "path": "packages/escalation-slack" },
+    { "path": "packages/cli" },
+    { "path": "packages/action" },
+    { "path": "packages/evals" }
+  ]
+}

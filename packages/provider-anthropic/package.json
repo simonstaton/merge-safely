@@ -1,0 +1,31 @@
+{
+  "name": "@merge-safely/provider-anthropic",
+  "version": "0.1.0",
+  "description": "Anthropic Messages API runner and Claude Code CLI runner",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@merge-safely/core": "0.1.0",
+    "@merge-safely/registry": "0.1.0",
+    "@merge-safely/providers": "0.1.0",
+    "@merge-safely/tools": "0.1.0",
+    "@anthropic-ai/sdk": "^0.52.0"
+  }
+}
