@@ -151,3 +151,51 @@ describe("dedupeFindings", () => {
     expect(a.severity).toBe("important");
   });
 });
+
+describe("mergeCrossClassDuplicates", () => {
+  it("merges the same bug reported under two classes in one line window", () => {
+    const a = {
+      severity: "blocker" as const,
+      class: "logic-error",
+      title: "bulkRefund refunds unpaid (open) orders and counts them in the refunded total",
+      detail: "long detail about the missing paid check",
+      file: "src/orders.ts",
+      line: 24,
+      lenses: ["correctness"],
+    };
+    const b = {
+      severity: "important" as const,
+      class: "failing-path",
+      title: "bulkRefund refunds unpaid open orders and counts them in the refunded total",
+      detail: "short",
+      file: "src/orders.ts",
+      line: 25,
+      lenses: ["repro"],
+    };
+    const merged = dedupeFindings([b, a]);
+    expect(merged).toHaveLength(1);
+    expect(merged[0]?.class).toBe("logic-error");
+    expect(merged[0]?.severity).toBe("blocker");
+    expect(merged[0]?.lenses?.sort()).toEqual(["correctness", "repro"]);
+    expect(merged[0]?.evidence?.some((e) => e.startsWith("also reported as failing-path"))).toBe(true);
+  });
+  it("keeps distinct bugs in the same window apart", () => {
+    const a = {
+      severity: "nit" as const,
+      class: "off-by-one",
+      title: "Boundary: order created exactly at cutoff is refunded",
+      detail: "d",
+      file: "src/orders.ts",
+      line: 24,
+    };
+    const b = {
+      severity: "important" as const,
+      class: "logic-error",
+      title: "bulkRefund refunds unpaid open orders",
+      detail: "d",
+      file: "src/orders.ts",
+      line: 24,
+    };
+    expect(dedupeFindings([a, b])).toHaveLength(2);
+  });
+});

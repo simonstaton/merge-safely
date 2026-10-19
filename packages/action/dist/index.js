@@ -53821,7 +53821,51 @@ function dedupeFindings(findings) {
     if (prior.endLine === void 0 && f3.endLine !== void 0)
       prior.endLine = f3.endLine;
   }
-  return [...byId.values()];
+  return mergeCrossClassDuplicates([...byId.values()]);
+}
+function titleOverlap(a, b) {
+  const wa = new Set(a.split(" ").filter(Boolean));
+  const wb = new Set(b.split(" ").filter(Boolean));
+  if (wa.size === 0 || wb.size === 0)
+    return 0;
+  let shared = 0;
+  for (const w of wa)
+    if (wb.has(w))
+      shared++;
+  return shared / (wa.size + wb.size - shared);
+}
+var CROSS_CLASS_TITLE_OVERLAP = 0.8;
+function mergeCrossClassDuplicates(findings) {
+  const out = [];
+  const titles = /* @__PURE__ */ new Map();
+  for (const f3 of findings)
+    titles.set(f3, normaliseTitle(f3.title));
+  for (const f3 of findings) {
+    const window2 = f3.file && f3.line !== void 0 && f3.line > 0 ? Math.floor((f3.line - 1) / LINE_WINDOW) : void 0;
+    const twin = out.find((o) => {
+      if (!f3.file || !o.file || normalisePath(o.file) !== normalisePath(f3.file))
+        return false;
+      const ow = o.line !== void 0 && o.line > 0 ? Math.floor((o.line - 1) / LINE_WINDOW) : void 0;
+      if (ow !== window2)
+        return false;
+      return titleOverlap(titles.get(o) ?? "", titles.get(f3) ?? "") >= CROSS_CLASS_TITLE_OVERLAP;
+    });
+    if (!twin) {
+      out.push(f3);
+      continue;
+    }
+    const [keep, drop] = SEVERITY_RANK[f3.severity] < SEVERITY_RANK[twin.severity] ? [f3, twin] : [twin, f3];
+    const merged = {
+      ...keep,
+      detail: keep.detail.length >= drop.detail.length ? keep.detail : drop.detail,
+      suggestedFix: keep.suggestedFix ?? drop.suggestedFix,
+      lenses: union(keep.lenses, drop.lenses),
+      evidence: union(union(keep.evidence, drop.evidence), [`also reported as ${drop.class} (#${drop.id})`]),
+      votes: keep.votes || drop.votes ? [...keep.votes ?? [], ...drop.votes ?? []] : void 0
+    };
+    out[out.indexOf(twin)] = merged;
+  }
+  return out;
 }
 
 // ../core/dist/stages/aggregate.js

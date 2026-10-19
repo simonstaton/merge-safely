@@ -119,5 +119,53 @@ export function dedupeFindings(findings: Array<Finding | FindingDraft>): Finding
     if (prior.line === undefined && f.line !== undefined) prior.line = f.line;
     if (prior.endLine === undefined && f.endLine !== undefined) prior.endLine = f.endLine;
   }
-  return [...byId.values()];
+  return mergeCrossClassDuplicates([...byId.values()]);
+}
+
+/** Jaccard overlap of two normalised title word sets. */
+function titleOverlap(a: string, b: string): number {
+  const wa = new Set(a.split(" ").filter(Boolean));
+  const wb = new Set(b.split(" ").filter(Boolean));
+  if (wa.size === 0 || wb.size === 0) return 0;
+  let shared = 0;
+  for (const w of wa) if (wb.has(w)) shared++;
+  return shared / (wa.size + wb.size - shared);
+}
+
+/** Two hunters often report one bug under different classes (e.g. logic-error vs failing-path). */
+const CROSS_CLASS_TITLE_OVERLAP = 0.8;
+
+/**
+ * Second dedupe pass: findings anchored on the same file and line window whose normalised titles overlap
+ * by at least 80% are the same bug reported under two classes. The higher-severity one wins (its id and
+ * class are kept); the other class is recorded in evidence so nothing is lost from the provenance.
+ */
+export function mergeCrossClassDuplicates(findings: Finding[]): Finding[] {
+  const out: Finding[] = [];
+  const titles = new Map<Finding, string>();
+  for (const f of findings) titles.set(f, normaliseTitle(f.title));
+  for (const f of findings) {
+    const window = f.file && f.line !== undefined && f.line > 0 ? Math.floor((f.line - 1) / LINE_WINDOW) : undefined;
+    const twin = out.find((o) => {
+      if (!f.file || !o.file || normalisePath(o.file) !== normalisePath(f.file)) return false;
+      const ow = o.line !== undefined && o.line > 0 ? Math.floor((o.line - 1) / LINE_WINDOW) : undefined;
+      if (ow !== window) return false;
+      return titleOverlap(titles.get(o) ?? "", titles.get(f) ?? "") >= CROSS_CLASS_TITLE_OVERLAP;
+    });
+    if (!twin) {
+      out.push(f);
+      continue;
+    }
+    const [keep, drop] = SEVERITY_RANK[f.severity] < SEVERITY_RANK[twin.severity] ? [f, twin] : [twin, f];
+    const merged: Finding = {
+      ...keep,
+      detail: keep.detail.length >= drop.detail.length ? keep.detail : drop.detail,
+      suggestedFix: keep.suggestedFix ?? drop.suggestedFix,
+      lenses: union(keep.lenses, drop.lenses),
+      evidence: union(union(keep.evidence, drop.evidence), [`also reported as ${drop.class} (#${drop.id})`]),
+      votes: keep.votes || drop.votes ? [...(keep.votes ?? []), ...(drop.votes ?? [])] : undefined,
+    };
+    out[out.indexOf(twin)] = merged;
+  }
+  return out;
 }
