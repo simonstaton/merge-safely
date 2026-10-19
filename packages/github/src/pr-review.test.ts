@@ -78,14 +78,22 @@ describe("prReviewReporter", () => {
     expect(state.reviews[1]?.body).toContain(reviewMarker("merge-safely", 2, "head1"));
   });
 
-  it("ignores markers posted by humans", async () => {
+  it("ignores markers posted by humans and by other bots", async () => {
     const { octokit, state } = fakeOctokit({
       reviews: [
         {
           id: 1,
           body: reviewMarker("merge-safely", 1, "head1"),
+          state: "COMMENTED",
           commit_id: "head1",
           user: { login: "mallory", type: "User" },
+        },
+        {
+          id: 2,
+          body: reviewMarker("merge-safely", 1, "head1"),
+          state: "COMMENTED",
+          commit_id: "head1",
+          user: { login: "agent-app[bot]", type: "Bot" },
         },
       ],
     });
@@ -95,7 +103,60 @@ describe("prReviewReporter", () => {
       verdict: verdict(),
       digest: digest(),
     });
-    expect(state.reviews).toHaveLength(2);
+    expect(state.reviews).toHaveLength(3);
+  });
+
+  it("uses the github-actions bot login when GET /app is unavailable, or an explicit botLogin", async () => {
+    const actions = fakeOctokit({ self: null, botLogin: "github-actions[bot]" });
+    const r = prReviewReporter({ octokit: actions.octokit });
+    const ev = { type: "verdict" as const, change: change(), verdict: verdict(), digest: digest() };
+    await r.report(ev);
+    await r.report(ev);
+    expect(actions.state.reviews).toHaveLength(1);
+
+    const custom = fakeOctokit({ botLogin: "my-gate[bot]" });
+    const r2 = prReviewReporter({ octokit: custom.octokit, appSlug: "my-gate" });
+    await r2.report(ev);
+    await r2.report(ev);
+    expect(custom.state.reviews).toHaveLength(1);
+    expect(callsTo(custom.calls, "apps.getAuthenticated")).toHaveLength(0);
+  });
+
+  it("dismisses our earlier REQUEST_CHANGES reviews on a pass, never on a block or contested pass", async () => {
+    const { octokit, state, calls } = fakeOctokit({
+      reviews: [
+        { id: 1, body: "x", state: "CHANGES_REQUESTED", commit_id: "old", user: { login: "human", type: "User" } },
+      ],
+    });
+    const reporter = prReviewReporter({ octokit });
+    await reporter.report({
+      type: "verdict",
+      change: change({ headSha: "old" }),
+      verdict: verdict({ headSha: "old" }),
+      digest: digest(),
+    });
+    expect(state.reviews[1]?.state).toBe("CHANGES_REQUESTED");
+    await reporter.report({ type: "verdict", change: change(), verdict: verdict({ round: 2 }), digest: digest() });
+    expect(callsTo(calls, "pulls.dismissReview")).toHaveLength(0);
+    await reporter.report({
+      type: "verdict",
+      change: change(),
+      verdict: verdict({ round: 3, decision: "pass", contested: true }),
+      digest: digest(),
+    });
+    expect(callsTo(calls, "pulls.dismissReview")).toHaveLength(0);
+    await reporter.report({
+      type: "verdict",
+      change: change({ headSha: "new" }),
+      verdict: verdict({ headSha: "new", round: 4, decision: "pass", findings: [] }),
+      digest: digest(),
+    });
+    const dismissed = callsTo(calls, "pulls.dismissReview");
+    expect(dismissed.map((c) => c.params.review_id).sort()).toEqual(
+      [state.reviews[1]?.id, state.reviews[2]?.id].sort(),
+    );
+    expect(dismissed[0]?.params.message).toBe("superseded by verdict on new");
+    expect(state.reviews[0]?.state).toBe("CHANGES_REQUESTED"); // a human's review is never touched
   });
 
   it("skips inline comments when disabled and does nothing when postPrReview is false or on pending", async () => {
@@ -149,6 +210,24 @@ describe("prReviewReporter", () => {
     expect(state.issueComments[0]?.body).not.toContain("/srv/x");
     expect(state.issueComments[1]?.body).toMatch(/^<!-- ms kind=budget-blocked sha=head1 -->/);
     expect(state.issueComments[1]?.body).toContain("Spent $25 of $25");
+  });
+
+  it("uses a separate marker for escalations so both reviews land", async () => {
+    const { octokit, state } = fakeOctokit();
+    const reporter = prReviewReporter({ octokit });
+    const v = verdict({ decision: "pending" });
+    await reporter.report({ type: "verdict", change: change(), verdict: v, digest: digest() });
+    const esc = {
+      type: "escalated" as const,
+      change: change(),
+      verdict: v,
+      digest: digest(),
+      handle: { id: "ESC-1", url: "https://slack.test/e", createdAt: "2026-01-01T00:00:00Z" },
+    };
+    await reporter.report(esc);
+    await reporter.report(esc);
+    expect(state.reviews).toHaveLength(2);
+    expect(state.reviews[1]?.body).toMatch(/^<!-- merge-safely kind=escalated round=1 sha=head1 -->/);
   });
 
   it("posts escalations as a review with the link", async () => {

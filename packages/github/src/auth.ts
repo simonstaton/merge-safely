@@ -13,6 +13,7 @@ import { Octokit } from "@octokit/rest";
  *
  * The App never needs `contents: write`, `administration`, `statuses: write` or `workflows`.
  * Subscribe to the `pull_request`, `check_run` and `check_suite` webhook events.
+ * Note: the Checks API is App-only. A PAT cannot write check runs; use `commitStatusReporter` and a local store.
  */
 export const APP_PERMISSIONS = {
   checks: "write",

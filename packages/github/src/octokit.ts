@@ -50,6 +50,13 @@ export interface CheckRunOutputData {
   title: string | null;
   summary: string | null;
   text: string | null;
+  annotations_count?: number;
+}
+
+/** The GitHub App that created a check run (`github-actions` for workflow tokens). */
+export interface AppData {
+  id: number;
+  slug?: string;
 }
 
 export interface CheckRunData {
@@ -61,6 +68,7 @@ export interface CheckRunData {
   started_at: string | null;
   completed_at: string | null;
   output: CheckRunOutputData;
+  app: AppData | null;
 }
 
 export type CheckAnnotation = {
@@ -109,6 +117,7 @@ export type CheckConclusion = "success" | "failure" | "neutral" | "cancelled" | 
 export interface ReviewData {
   id: number;
   body: string;
+  state: string;
   commit_id: string | null;
   user: { login: string; type?: string } | null;
 }
@@ -161,8 +170,20 @@ export interface OctokitLike {
         comments?: ReviewCommentParams[];
       },
     ): Promise<ApiResponse<{ id: number }>>;
+    dismissReview(
+      params: RepoParams & { pull_number: number; review_id: number; message: string },
+    ): Promise<ApiResponse<{ id: number }>>;
   };
   repos: {
+    createCommitStatus(
+      params: RepoParams & {
+        sha: string;
+        state: "error" | "failure" | "pending" | "success";
+        context?: string;
+        description?: string;
+        target_url?: string;
+      },
+    ): Promise<ApiResponse<{ id: number }>>;
     getCombinedStatusForRef(
       params: RepoParams & PageParams & { ref: string },
     ): Promise<ApiResponse<{ statuses: { context: string; state: string }[] }>>;
@@ -180,6 +201,11 @@ export interface OctokitLike {
   issues: {
     listComments(params: RepoParams & PageParams & { issue_number: number }): Promise<ApiResponse<IssueCommentData[]>>;
     createComment(params: RepoParams & { issue_number: number; body: string }): Promise<ApiResponse<{ id: number }>>;
+    updateComment(params: RepoParams & { comment_id: number; body: string }): Promise<ApiResponse<{ id: number }>>;
+  };
+  apps: {
+    /** `GET /app`. Needs App (JWT) auth; auth-app switches to the JWT for this route automatically. */
+    getAuthenticated(): Promise<ApiResponse<AppData | null>>;
   };
   teams: {
     getMembershipForUserInOrg(params: {

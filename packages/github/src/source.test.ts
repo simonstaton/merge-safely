@@ -17,6 +17,7 @@ function run(name: string, status: string, conclusion: string | null): CheckRunD
     started_at: null,
     completed_at: null,
     output: { title: null, summary: null, text: null },
+    app: { id: 99, slug: "ci" },
     annotations: [],
   };
 }
@@ -37,6 +38,21 @@ describe("classifyAuthor", () => {
     expect(
       classifyAuthor({ login: "alice", id: 1, type: "User" }, [], "Co-authored-by: Bob <bob@example.com>").kind,
     ).toBe("human");
+    // Product names that are also surnames no longer count; known signatures do.
+    expect(
+      classifyAuthor({ login: "alice", id: 1, type: "User" }, [], "Co-authored-by: Ana Cursor <ana@example.com>").kind,
+    ).toBe("human");
+    expect(
+      classifyAuthor(
+        { login: "alice", id: 1, type: "User" },
+        [],
+        "Co-authored-by: Copilot <175728472+Copilot@users.noreply.github.com>",
+      ).kind,
+    ).toBe("agent");
+    expect(
+      classifyAuthor({ login: "alice", id: 1, type: "User" }, [], "Co-authored-by: devin-ai-integration[bot] <x@y>")
+        .kind,
+    ).toBe("agent");
   });
 
   it("handles a deleted user", () => {
@@ -198,6 +214,51 @@ describe("githubSource.getDiff", () => {
     });
     const diff = await githubSource({ octokit }).getDiff(ref, { sinceSha: "old9" });
     expect(diff).toContain("--- /dev/null\n+++ b/n.ts");
+  });
+
+  it("pins the diff to opts.headSha, for full and delta diffs", async () => {
+    const { octokit, calls } = fakeOctokit({
+      diffs: { "base1...pinned": "full@pinned", "old9...pinned": "delta@pinned" },
+    });
+    const src = githubSource({ octokit });
+    expect(await src.getDiff(ref, { headSha: "pinned" })).toBe("full@pinned");
+    expect(await src.getDiff(ref, { headSha: "pinned", sinceSha: "old9" })).toBe("delta@pinned");
+    expect(callsTo(calls, "repos.compareCommitsWithBasehead").map((c) => c.params.basehead)).toEqual([
+      "base1...pinned",
+      "old9...pinned",
+    ]);
+  });
+
+  it("falls back to compare JSON (never listFiles) when the pinned head is not the PR's current head", async () => {
+    const { octokit, calls } = fakeOctokit({
+      diffs: { "base1...pinned": httpError(406, "too large") },
+      compareFiles: {
+        "base1...pinned": [
+          { filename: "p.ts", status: "added", additions: 1, deletions: 0, patch: "@@ -0,0 +1 @@\n+p" },
+        ],
+      },
+    });
+    const diff = await githubSource({ octokit }).getDiff(ref, { headSha: "pinned" });
+    expect(diff).toContain("+++ b/p.ts");
+    expect(callsTo(calls, "pulls.listFiles")).toHaveLength(0);
+  });
+
+  it("adds the truncation trailer when a delta hits the 300-file compare limit", async () => {
+    const files = Array.from({ length: 300 }, (_, i) => ({
+      filename: `f${i}.ts`,
+      status: "modified",
+      additions: 1,
+      deletions: 0,
+      patch: "@@ -1 +1 @@\n-a\n+b",
+    }));
+    const { octokit } = fakeOctokit({
+      diffs: { "old9...head1": httpError(406, "too large") },
+      compareFiles: { "old9...head1": files },
+    });
+    const diff = await githubSource({ octokit }).getDiff(ref, { sinceSha: "old9" });
+    expect(diff.trimEnd().split("\n").pop()).toMatch(
+      /^# merge-safely: diff truncated \(0 files omitted, and the file list hit the 300-file API limit/,
+    );
   });
 
   it("rethrows unrelated errors", async () => {

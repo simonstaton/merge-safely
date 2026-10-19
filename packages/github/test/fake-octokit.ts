@@ -3,6 +3,7 @@
  * exactly what would have been sent to GitHub.
  */
 import type {
+  AppData,
   CheckAnnotation,
   CheckRunCreateParams,
   CheckRunData,
@@ -35,6 +36,13 @@ export interface FakeState {
   memberships: Record<string, string>;
   /** Make the next createReview call with comments fail with 422. */
   failReviewWithComments?: boolean;
+  /** What `GET /app` returns; null makes it fail with 403 (token auth). */
+  self: AppData | null;
+  /** App stamped on check runs this client creates. Defaults to `self` or github-actions. */
+  writerApp?: AppData;
+  /** Login stamped on reviews and comments this client creates. */
+  botLogin: string;
+  commitStatuses: { sha: string; state: string; context?: string; description?: string; target_url?: string }[];
 }
 
 export interface Call {
@@ -94,8 +102,13 @@ export function fakeOctokit(init: Partial<FakeState> = {}): { octokit: OctokitLi
     diffs: {},
     compareFiles: {},
     memberships: {},
+    self: { id: 1, slug: "merge-safely" },
+    botLogin: "merge-safely[bot]",
+    commitStatuses: [],
     ...init,
   };
+  const writerApp = () => state.writerApp ?? state.self ?? { id: 15368, slug: "github-actions" };
+  const botUser = () => ({ login: state.botLogin, type: "Bot" });
   const calls: Call[] = [];
   let nextId = 1000;
   let clock = Date.parse("2026-01-01T00:00:00Z");
@@ -137,14 +150,33 @@ export function fakeOctokit(init: Partial<FakeState> = {}): { octokit: OctokitLi
           id,
           body: params.body ?? "",
           commit_id: params.commit_id ?? null,
-          user: { login: "merge-safely[bot]", type: "Bot" },
+          state: params.event === "REQUEST_CHANGES" ? "CHANGES_REQUESTED" : "COMMENTED",
+          user: botUser(),
           event: params.event,
           comments: params.comments,
         });
         return { data: { id } };
       },
+      async dismissReview(params) {
+        rec("pulls.dismissReview", params);
+        const r = state.reviews.find((x) => x.id === params.review_id);
+        if (!r) throw httpError(404);
+        r.state = "DISMISSED";
+        return { data: { id: r.id } };
+      },
     },
     repos: {
+      async createCommitStatus(params) {
+        rec("repos.createCommitStatus", params);
+        state.commitStatuses.push({
+          sha: params.sha,
+          state: params.state,
+          context: params.context,
+          description: params.description,
+          target_url: params.target_url,
+        });
+        return { data: { id: nextId++ } };
+      },
       async getCombinedStatusForRef(params) {
         rec("repos.getCombinedStatusForRef", params);
         return { data: { statuses: page(state.statuses, params) } };
@@ -185,7 +217,9 @@ export function fakeOctokit(init: Partial<FakeState> = {}): { octokit: OctokitLi
             title: params.output?.title ?? null,
             summary: params.output?.summary ?? null,
             text: params.output?.text ?? null,
+            annotations_count: params.output?.annotations?.length ?? 0,
           },
+          app: writerApp(),
           annotations: [...(params.output?.annotations ?? [])],
         };
         state.checkRuns.push(run);
@@ -207,12 +241,13 @@ export function fakeOctokit(init: Partial<FakeState> = {}): { octokit: OctokitLi
         }
         if (params.details_url) run.details_url = params.details_url;
         if (params.output) {
+          run.annotations.push(...(params.output.annotations ?? []));
           run.output = {
             title: params.output.title,
             summary: params.output.summary,
             text: params.output.text ?? run.output.text,
+            annotations_count: run.annotations.length,
           };
-          run.annotations.push(...(params.output.annotations ?? []));
         }
         return { data: run };
       },
@@ -225,8 +260,22 @@ export function fakeOctokit(init: Partial<FakeState> = {}): { octokit: OctokitLi
       async createComment(params) {
         rec("issues.createComment", params);
         const id = nextId++;
-        state.issueComments.push({ id, body: params.body, user: { login: "merge-safely[bot]", type: "Bot" } });
+        state.issueComments.push({ id, body: params.body, user: botUser() });
         return { data: { id } };
+      },
+      async updateComment(params) {
+        rec("issues.updateComment", params);
+        const c = state.issueComments.find((x) => x.id === params.comment_id);
+        if (!c) throw httpError(404);
+        c.body = params.body;
+        return { data: { id: c.id } };
+      },
+    },
+    apps: {
+      async getAuthenticated() {
+        rec("apps.getAuthenticated", {});
+        if (!state.self) throw httpError(403, "Resource not accessible by integration");
+        return { data: state.self };
       },
     },
     teams: {

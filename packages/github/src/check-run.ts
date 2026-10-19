@@ -1,17 +1,25 @@
-import type { Change, Finding, ReportEvent, Reporter, Verdict } from "@merge-safely/core";
+import type { Change, Finding, Policy, ReportEvent, Reporter } from "@merge-safely/core";
 import { conclusionForVerdict, findCheckRun } from "./check-run-shared.js";
-import { serializeVerdict as defaultSerialize } from "./check-run-store.js";
+import { type IdentityOptions, lazyIdentity, resolveCheckName } from "./identity.js";
 import type { CheckAnnotation, CheckConclusion, CheckRunData, OctokitLike } from "./octokit.js";
-import { clip, DEFAULT_CHECK_NAME, GITHUB_TEXT_LIMIT, redactSecrets, truncateMarkdown } from "./util.js";
+import { clip, GITHUB_TEXT_LIMIT, redactSecrets, truncateMarkdown } from "./util.js";
 
-export interface CheckRunReporterOptions {
+/**
+ * Writes the merge signal: status, conclusion, title, summary, annotations. It never writes
+ * verdict state. `output.text` belongs to `checkRunStore`, which updates it under compare-and-set;
+ * every reporter update re-sends the run's current `output.text` unchanged so the stored verdict
+ * survives (store a block, then report a contested pass: the stored verdict is still the block).
+ *
+ * Requires a GitHub App installation token or an Actions `GITHUB_TOKEN`: the Checks API refuses
+ * PATs. With a PAT, use `commitStatusReporter` instead.
+ */
+export interface CheckRunReporterOptions extends IdentityOptions {
   octokit: OctokitLike;
-  /** Defaults to `merge-safely/verdict`. Keep the `merge-safely/` prefix so the source provider ignores it. */
+  /** Overrides `policy.reporting.checkName` (default `merge-safely/verdict`). Keep the `merge-safely/` prefix. */
   checkName?: string;
-  /** Link shown as "Details" on the check (also required context for `action_required`). Defaults to the PR URL. */
+  policy?: Pick<Policy, "reporting">;
+  /** "Details" link on the check (context for `action_required`). Defaults to the PR URL. */
   detailsUrl?: string;
-  /** Override how the verdict is stored in `output.text`. Defaults to the check-run store's serialiser. */
-  serializeVerdict?: (v: Verdict) => string;
   now?: () => Date;
 }
 
@@ -49,17 +57,19 @@ export function findingsToAnnotations(findings: Finding[]): CheckAnnotation[] {
 
 export function checkRunReporter(opts: CheckRunReporterOptions): Reporter {
   const { octokit } = opts;
-  const name = opts.checkName ?? DEFAULT_CHECK_NAME;
-  const serialize = opts.serializeVerdict ?? defaultSerialize;
+  const name = resolveCheckName(opts.checkName, opts.policy);
+  const identity = lazyIdentity(octokit, opts);
+  const find = async (c: Change) => findCheckRun(octokit, c.repo, c.headSha, name, await identity());
   const now = () => (opts.now ? opts.now() : new Date()).toISOString();
   const details = (change: Change, override?: string) => override ?? opts.detailsUrl ?? change.url;
   const summary = (md: string) => truncateMarkdown(md, GITHUB_TEXT_LIMIT);
-  const textOrUndefined = (t: string | null | undefined) => (t ? truncateMarkdown(t, GITHUB_TEXT_LIMIT) : undefined);
+  // The store's text is re-sent verbatim (it is already ≤ 65,535 chars).
+  const keepText = (run: CheckRunData | null) => (run?.output.text ? { text: run.output.text } : {});
 
   async function pending(change: Change, title: string, body: string): Promise<void> {
-    const existing = await findCheckRun(octokit, change.repo, change.headSha, name);
+    const existing = await find(change);
     const detailsUrl = details(change);
-    const output = { title, summary: summary(body), text: textOrUndefined(existing?.output.text) };
+    const output = { title, summary: summary(body), ...keepText(existing) };
     if (existing) {
       await octokit.checks.update({
         owner: change.repo.owner,
@@ -88,13 +98,14 @@ export function checkRunReporter(opts: CheckRunReporterOptions): Reporter {
     conclusion: CheckConclusion,
     title: string,
     body: string,
-    text: string | undefined,
-    annotations: CheckAnnotation[] = [],
+    allAnnotations: CheckAnnotation[] = [],
     detailsOverride?: string,
   ): Promise<void> {
-    const existing: CheckRunData | null = await findCheckRun(octokit, change.repo, change.headSha, name);
-    const keptText = text ?? textOrUndefined(existing?.output.text);
-    const base = { title: clip(title, 255), summary: summary(body), ...(keptText ? { text: keptText } : {}) };
+    const existing = await find(change);
+    const base = { title: clip(title, 255), summary: summary(body), ...keepText(existing) };
+    // GitHub appends annotations across updates and cannot remove them, so a same-SHA re-run of an
+    // already-annotated run updates summary and conclusion only; the digest still lists every finding.
+    const annotations = (existing?.output.annotations_count ?? 0) > 0 ? [] : allAnnotations;
     const first = annotations.slice(0, ANNOTATIONS_PER_REQUEST);
     const detailsUrl = details(change, detailsOverride);
     const common = {
@@ -135,7 +146,6 @@ export function checkRunReporter(opts: CheckRunReporterOptions): Reporter {
             conclusionForVerdict(event.verdict),
             event.digest.headline,
             event.digest.markdown,
-            serialize(event.verdict),
             findingsToAnnotations(event.verdict.findings),
           );
           return;
@@ -146,14 +156,13 @@ export function checkRunReporter(opts: CheckRunReporterOptions): Reporter {
             "action_required",
             event.digest.headline,
             `**Escalated for human review:** ${link}\n\n${event.digest.markdown}`,
-            serialize(event.verdict),
             findingsToAnnotations(event.verdict.findings),
             event.handle.url,
           );
           return;
         }
         case "budget-blocked":
-          await complete(event.change, "failure", event.digest.headline, event.digest.markdown, undefined);
+          await complete(event.change, "failure", event.digest.headline, event.digest.markdown);
           return;
         case "error":
           await complete(
@@ -161,7 +170,6 @@ export function checkRunReporter(opts: CheckRunReporterOptions): Reporter {
             "failure",
             "Review failed",
             `Merge Safely could not complete round ${event.round}. The change is blocked until a review succeeds.\n\n\`\`\`\n${clip(redactSecrets(event.error), 2000)}\n\`\`\``,
-            undefined,
           );
           return;
       }

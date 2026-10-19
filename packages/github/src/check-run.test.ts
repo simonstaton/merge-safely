@@ -1,9 +1,9 @@
+import { DEFAULT_POLICY } from "@merge-safely/core";
 import { describe, expect, it } from "vitest";
 import { change, digest, finding, verdict } from "../test/builders.js";
 import { callsTo, fakeOctokit } from "../test/fake-octokit.js";
 import { checkRunReporter, findingsToAnnotations } from "./check-run.js";
 import { conclusionForVerdict } from "./check-run-shared.js";
-import { parseVerdictText } from "./check-run-store.js";
 
 describe("conclusionForVerdict", () => {
   it("maps decisions", () => {
@@ -50,7 +50,6 @@ describe("checkRunReporter", () => {
     expect(run).toMatchObject({ status: "completed", conclusion: "failure" });
     expect(run?.output.title).toBe("Verdict: BLOCK (tier 2, round 1)");
     expect(run?.output.summary).toBe("## Blockers\n- thing");
-    expect(parseVerdictText(run?.output.text)?.decision).toBe("block");
     expect(run?.annotations).toHaveLength(1);
     expect(callsTo(calls, "checks.listForRef")[0]?.params).toMatchObject({
       check_name: "merge-safely/verdict",
@@ -135,7 +134,8 @@ describe("checkRunReporter", () => {
     const { octokit, state } = fakeOctokit();
     const reporter = checkRunReporter({ octokit });
     await reporter.report({ type: "verdict", change: change(), verdict: verdict(), digest: digest() });
-    const stored = state.checkRuns[0]?.output.text;
+    const stored = "STORED";
+    if (state.checkRuns[0]) state.checkRuns[0].output.text = stored;
     await reporter.report({
       type: "budget-blocked",
       change: change(),
@@ -159,15 +159,55 @@ describe("checkRunReporter", () => {
     expect(state.checkRuns[0]?.output.summary).not.toContain("ghs_abc");
   });
 
-  it("uses a custom serializer when provided", async () => {
-    const { octokit, state } = fakeOctokit();
-    await checkRunReporter({ octokit, serializeVerdict: () => "custom" }).report({
+  it("never writes verdict text itself and re-sends the stored text unchanged", async () => {
+    const { octokit, state, calls } = fakeOctokit();
+    await checkRunReporter({ octokit }).report({
       type: "verdict",
       change: change(),
       verdict: verdict(),
       digest: digest(),
     });
-    expect(state.checkRuns[0]?.output.text).toBe("custom");
+    expect(state.checkRuns[0]?.output.text).toBeNull();
+    expect(callsTo(calls, "checks.create")[0]?.params.output).not.toHaveProperty("text");
+    if (state.checkRuns[0]) state.checkRuns[0].output.text = "STORED";
+    await checkRunReporter({ octokit }).report({ type: "pending", change: change(), round: 2 });
+    const lastOutput = callsTo(calls, "checks.update").pop()?.params.output as { text?: string } | undefined;
+    expect(lastOutput?.text).toBe("STORED");
+  });
+
+  it("does not re-post annotations on a same-SHA re-run of an annotated run", async () => {
+    const { octokit, state, calls } = fakeOctokit();
+    const reporter = checkRunReporter({ octokit });
+    const ev = { type: "verdict" as const, change: change(), verdict: verdict(), digest: digest() };
+    await reporter.report(ev);
+    expect(state.checkRuns[0]?.annotations).toHaveLength(1);
+    await reporter.report({ ...ev, verdict: verdict({ round: 2 }), digest: digest({ headline: "round 2" }) });
+    expect(state.checkRuns[0]?.annotations).toHaveLength(1);
+    expect(state.checkRuns[0]?.output.title).toBe("round 2");
+    expect(callsTo(calls, "checks.update").pop()?.params.output).not.toHaveProperty("annotations");
+  });
+
+  it("ignores same-named check runs from other apps", async () => {
+    const { octokit, state } = fakeOctokit();
+    state.writerApp = { id: 666, slug: "evil-app" };
+    await octokit.checks.create({ owner: "acme", repo: "widgets", name: "merge-safely/verdict", head_sha: "head1" });
+    state.writerApp = undefined;
+    await checkRunReporter({ octokit }).report({
+      type: "verdict",
+      change: change(),
+      verdict: verdict(),
+      digest: digest(),
+    });
+    expect(state.checkRuns).toHaveLength(2);
+    expect(state.checkRuns[0]?.conclusion).toBeNull();
+    expect(state.checkRuns[1]).toMatchObject({ conclusion: "failure", app: { slug: "merge-safely" } });
+  });
+
+  it("takes the check name from policy", async () => {
+    const { octokit, state } = fakeOctokit();
+    const policy = { reporting: { ...DEFAULT_POLICY.reporting, checkName: "merge-safely/gate" } };
+    await checkRunReporter({ octokit, policy }).report({ type: "pending", change: change(), round: 1 });
+    expect(state.checkRuns[0]?.name).toBe("merge-safely/gate");
   });
 
   it("updates the newest run when duplicates exist for the SHA", async () => {

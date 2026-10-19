@@ -8,10 +8,11 @@ import {
   type Reporter,
   type Verdict,
 } from "@merge-safely/core";
-import { collectPages, errorStatus, type OctokitLike, type ReviewCommentParams } from "./octokit.js";
+import { type GithubIdentity, type IdentityOptions, isOwnUser, lazyIdentity, resolveCheckName } from "./identity.js";
+import { collectPages, errorStatus, type OctokitLike, type ReviewCommentParams, type ReviewData } from "./octokit.js";
 import { clip, GITHUB_TEXT_LIMIT, truncateMarkdown } from "./util.js";
 
-export interface PrReviewReporterOptions {
+export interface PrReviewReporterOptions extends IdentityOptions {
   octokit: OctokitLike;
   /** Only `reporting` is read. Defaults to the core's default policy. */
   policy?: Pick<Policy, "reporting">;
@@ -22,37 +23,49 @@ export interface PrReviewReporterOptions {
 /** Cap on inline comments per review; the rest are still in the review body. */
 export const MAX_INLINE_COMMENTS = 50;
 
-/** Markers only count when a bot (the Action token or the App) wrote them, so a human cannot suppress the gate by pasting one. */
-const byBot = (u: { login: string; type?: string } | null) =>
-  u?.type === "Bot" || (u?.login.endsWith("[bot]") ?? false);
-
 const safeTag = (tag: string) => tag.replace(/[^A-Za-z0-9_.:-]/g, "") || "merge-safely";
 
 export function reviewMarker(tag: string, round: number, sha: string): string {
   return `<!-- ${safeTag(tag)} round=${round} sha=${sha} -->`;
 }
 
-export function commentMarker(tag: string, kind: "error" | "budget-blocked", sha: string, round?: number): string {
+export function commentMarker(
+  tag: string,
+  kind: "error" | "budget-blocked" | "escalated",
+  sha: string,
+  round?: number,
+): string {
   return `<!-- ${safeTag(tag)} kind=${kind}${round === undefined ? "" : ` round=${round}`} sha=${sha} -->`;
 }
 
-/** RIGHT-side line numbers a review comment can attach to (added and context lines of every hunk). */
+/**
+ * RIGHT-side line numbers a review comment can attach to: added and context lines inside each hunk,
+ * bounded by the hunk header's counts (so a trailing newline never adds a phantom line).
+ */
 export function commentableLines(patch: string): Set<number> {
   const lines = new Set<number>();
   let right = 0;
-  let inHunk = false;
+  let leftLeft = 0;
+  let rightLeft = 0;
   for (const l of patch.split("\n")) {
-    const h = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(l);
+    const h = /^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(l);
     if (h) {
-      right = Number(h[1]);
-      inHunk = true;
+      leftLeft = h[1] === undefined ? 1 : Number(h[1]);
+      right = Number(h[2]);
+      rightLeft = h[3] === undefined ? 1 : Number(h[3]);
       continue;
     }
-    if (!inHunk || l.startsWith("\\")) continue;
-    if (l.startsWith("-")) continue;
-    if (l.startsWith("+") || l.startsWith(" ") || l === "") {
-      lines.add(right);
-      right++;
+    if (leftLeft <= 0 && rightLeft <= 0) continue;
+    if (l.startsWith("\\")) continue;
+    if (l.startsWith("-")) {
+      leftLeft--;
+    } else if (l.startsWith("+")) {
+      lines.add(right++);
+      rightLeft--;
+    } else if (l.startsWith(" ") || (l === "" && rightLeft > 0 && leftLeft > 0)) {
+      lines.add(right++);
+      rightLeft--;
+      leftLeft--;
     }
   }
   return lines;
@@ -63,22 +76,32 @@ function inlineBody(f: Finding): string {
   return clip(`**[${f.severity}] ${f.title}** \`${f.class}\`\n\n${f.detail}${fix}`, 4000);
 }
 
+/**
+ * Posts the digest as a PR review. Never `APPROVE`: a machine verdict is a signal for the merge gate
+ * (the check run), never a human approval that could satisfy a required-reviewers rule.
+ *
+ * Idempotent: hidden markers only count on reviews/comments posted by our own bot login.
+ * On a non-contested pass, our earlier `CHANGES_REQUESTED` reviews are dismissed so they stop
+ * blocking merge under required-review protection; a block never dismisses anything.
+ */
 export function prReviewReporter(opts: PrReviewReporterOptions): Reporter {
   const { octokit } = opts;
   const reporting = opts.policy?.reporting ?? DEFAULT_POLICY.reporting;
+  const checkName = resolveCheckName(undefined, opts.policy);
   const tag = opts.marker ?? "merge-safely";
+  const identity = lazyIdentity(octokit, opts);
 
   const prParams = (c: Change) => ({ owner: c.repo.owner, repo: c.repo.name, pull_number: c.number });
 
-  async function hasReview(c: Change, marker: string): Promise<boolean> {
+  async function ownReviews(c: Change, who: GithubIdentity): Promise<ReviewData[]> {
     const reviews = await collectPages(
       async (page, per_page) => (await octokit.pulls.listReviews({ ...prParams(c), per_page, page })).data,
       { maxItems: 1000 },
     );
-    return reviews.some((r) => byBot(r.user) && r.body.includes(marker));
+    return reviews.filter((r) => isOwnUser(r.user, who));
   }
 
-  async function hasComment(c: Change, marker: string): Promise<boolean> {
+  async function hasComment(c: Change, marker: string, who: GithubIdentity): Promise<boolean> {
     const comments = await collectPages(
       async (page, per_page) =>
         (
@@ -92,7 +115,7 @@ export function prReviewReporter(opts: PrReviewReporterOptions): Reporter {
         ).data,
       { maxItems: 1000 },
     );
-    return comments.some((x) => byBot(x.user) && (x.body ?? "").includes(marker));
+    return comments.some((x) => isOwnUser(x.user, who) && (x.body ?? "").includes(marker));
   }
 
   async function inlineComments(c: Change, findings: Finding[]): Promise<ReviewCommentParams[]> {
@@ -115,26 +138,42 @@ export function prReviewReporter(opts: PrReviewReporterOptions): Reporter {
     return out;
   }
 
-  async function postVerdictReview(c: Change, v: Verdict, digest: HumanDigest, preface = ""): Promise<void> {
-    const marker = reviewMarker(tag, v.round, v.headSha);
-    if (await hasReview(c, marker)) return;
-    // Never "APPROVE": a machine verdict is a signal for the merge gate (the check run), never a
-    // human approval that could satisfy branch protection's required-reviewers rule.
-    const event = v.decision === "block" && reporting.requestChangesOnBlock ? "REQUEST_CHANGES" : "COMMENT";
-    const body = truncateMarkdown(`${marker}\n${preface}${digest.markdown}`, GITHUB_TEXT_LIMIT);
-    const comments = await inlineComments(c, v.findings);
-    const base = { ...prParams(c), commit_id: v.headSha, event } as const;
-    try {
-      await octokit.pulls.createReview({ ...base, body, ...(comments.length ? { comments } : {}) });
-    } catch (err: unknown) {
-      // 422 = a comment line GitHub could not resolve (e.g. the PR moved on). Keep the digest anyway.
-      if (errorStatus(err) !== 422 || comments.length === 0) throw err;
-      await octokit.pulls.createReview({ ...base, body });
+  async function postVerdictReview(
+    c: Change,
+    v: Verdict,
+    digest: HumanDigest,
+    marker: string,
+    preface = "",
+  ): Promise<void> {
+    const who = await identity();
+    const mine = await ownReviews(c, who);
+    if (!mine.some((r) => r.body.includes(marker))) {
+      const event = v.decision === "block" && reporting.requestChangesOnBlock ? "REQUEST_CHANGES" : "COMMENT";
+      const body = truncateMarkdown(`${marker}\n${preface}${digest.markdown}`, GITHUB_TEXT_LIMIT);
+      const comments = await inlineComments(c, v.findings);
+      const base = { ...prParams(c), commit_id: v.headSha, event } as const;
+      try {
+        await octokit.pulls.createReview({ ...base, body, ...(comments.length ? { comments } : {}) });
+      } catch (err: unknown) {
+        // 422 = a comment line GitHub could not resolve (e.g. the PR moved on). Keep the digest anyway.
+        if (errorStatus(err) !== 422 || comments.length === 0) throw err;
+        await octokit.pulls.createReview({ ...base, body });
+      }
+    }
+    if (v.decision === "pass" && !v.contested) {
+      for (const r of mine) {
+        if (r.state !== "CHANGES_REQUESTED") continue;
+        await octokit.pulls.dismissReview({
+          ...prParams(c),
+          review_id: r.id,
+          message: `superseded by verdict on ${v.headSha}`,
+        });
+      }
     }
   }
 
   async function postComment(c: Change, marker: string, text: string): Promise<void> {
-    if (await hasComment(c, marker)) return;
+    if (await hasComment(c, marker, await identity())) return;
     await octokit.issues.createComment({
       owner: c.repo.owner,
       repo: c.repo.name,
@@ -150,7 +189,12 @@ export function prReviewReporter(opts: PrReviewReporterOptions): Reporter {
         case "pending":
           return;
         case "verdict":
-          await postVerdictReview(event.change, event.verdict, event.digest);
+          await postVerdictReview(
+            event.change,
+            event.verdict,
+            event.digest,
+            reviewMarker(tag, event.verdict.round, event.verdict.headSha),
+          );
           return;
         case "escalated": {
           const link = event.handle.url ? `[${event.handle.id}](${event.handle.url})` : `\`${event.handle.id}\``;
@@ -158,6 +202,7 @@ export function prReviewReporter(opts: PrReviewReporterOptions): Reporter {
             event.change,
             event.verdict,
             event.digest,
+            commentMarker(tag, "escalated", event.verdict.headSha, event.verdict.round),
             `**Escalated for human review:** ${link}\n\n`,
           );
           return;
@@ -174,7 +219,7 @@ export function prReviewReporter(opts: PrReviewReporterOptions): Reporter {
           await postComment(
             event.change,
             commentMarker(tag, "error", event.change.headSha, event.round),
-            `**Merge Safely could not complete the review (round ${event.round}).** The \`${reporting.checkName}\` check stays failing until a review succeeds; see the check run for details.`,
+            `**Merge Safely could not complete the review (round ${event.round}).** The \`${checkName}\` check stays failing until a review succeeds; see the check run for details.`,
           );
           return;
       }

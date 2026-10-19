@@ -60,4 +60,28 @@ describe("redactSecrets", () => {
     expect(out).not.toMatch(/ghp_|ghs_z|sk-ant-a/);
     expect(out).toMatch(/\[redacted\]/);
   });
+
+  it("masks provider, cloud and chat key shapes, api-key headers and PEM keys", () => {
+    const samples = [
+      "AIzaSyA1234567890abcdefghijklmnopqrstuv",
+      "AKIAIOSFODNN7EXAMPLE",
+      "xoxb-123456789012-abcdefghijkl",
+      "x-api-key: abc123secretvalue",
+      "api-key=abc123secretvalue",
+      "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig",
+      "glpat-abcdefghijklmnopqrst",
+      "npm_abcdefghijklmnopqrstuvwxyz0123456789",
+      "sk_live_abcdefghijklmnop1234",
+      "sk-proj-abcdefghijklmnop1234",
+      "-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----",
+    ];
+    for (const s of samples) {
+      const out = redactSecrets(`error: ${s} end`);
+      expect(out, s).toMatch(/\[redacted/);
+      expect(out, s).not.toMatch(
+        /AIzaSy|AKIAIOSF|xoxb-1|abc123secret|eyJhbGci|glpat-a|npm_abc|sk_live_a|sk-proj-a|MIIEow/,
+      );
+    }
+    expect(redactSecrets("plain error message")).toBe("plain error message");
+  });
 });

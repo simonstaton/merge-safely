@@ -20,7 +20,14 @@ export function verifyWebhookSignature(
   return given.length === expected.length && timingSafeEqual(given, expected);
 }
 
-export const PULL_REQUEST_ACTIONS = ["opened", "synchronize", "reopened", "ready_for_review", "labeled"] as const;
+export const PULL_REQUEST_ACTIONS = [
+  "opened",
+  "synchronize",
+  "reopened",
+  "ready_for_review",
+  "labeled",
+  "edited",
+] as const;
 
 export interface WebhookChange {
   ref: ChangeRef;
@@ -28,6 +35,16 @@ export interface WebhookChange {
   action: string;
   /** Set for draft PRs. Callers should skip reviewing until `ready_for_review`. */
   draft?: true;
+  /** `edited` with a base change: the merge target moved, so run a full (not delta) re-review. */
+  reason?: "base-changed";
+  /** Delivered as `pull_request_target` (runs with base-repo privileges): the App decides whether to act. */
+  targetEvent?: true;
+}
+
+export interface ChangeRefFromEventOptions {
+  checkNamePrefix?: string;
+  /** Labels whose addition triggers a re-review (case-insensitive). Default: none, so `labeled` is ignored. */
+  triggerLabels?: string[];
 }
 
 const isObj = (x: unknown): x is Record<string, unknown> => typeof x === "object" && x !== null;
@@ -60,8 +77,11 @@ function firstPr(x: unknown): number | undefined {
 
 /**
  * Map a webhook delivery to the change it concerns, or null when it is not one we review.
- * - `pull_request`: opened, synchronize, reopened, ready_for_review, labeled. Draft PRs are returned with
- *   `draft: true` (except on ready_for_review) so the caller can skip them deliberately.
+ * - `pull_request` / `pull_request_target` (flagged `targetEvent: true`): opened, synchronize, reopened,
+ *   ready_for_review; `edited` only when the base branch changed (`reason: "base-changed"`, review in
+ *   full: the SHA-bound check would otherwise survive a retarget); `labeled` only for `triggerLabels`.
+ *   `unlabeled` and everything else are ignored. Draft PRs are returned with `draft: true` (except on
+ *   ready_for_review) so the caller can skip them deliberately.
  * - `check_run` / `check_suite` with action `rerequested` (the "Re-run" button). Check runs not named
  *   with the `merge-safely/` prefix are ignored. Fork PRs arrive with an empty `pull_requests` list on
  *   check events; those return null (re-run by pushing, or via the CLI).
@@ -69,15 +89,22 @@ function firstPr(x: unknown): number | undefined {
 export function changeRefFromEvent(
   name: string,
   payload: unknown,
-  opts: { checkNamePrefix?: string } = {},
+  opts: ChangeRefFromEventOptions = {},
 ): WebhookChange | null {
   if (!isObj(payload)) return null;
   const action = str(payload.action);
   const repo = repoFrom(payload);
   if (!action || !repo) return null;
 
-  if (name === "pull_request") {
+  if (name === "pull_request" || name === "pull_request_target") {
     if (!(PULL_REQUEST_ACTIONS as readonly string[]).includes(action)) return null;
+    const baseChanged = action === "edited" && isObj(payload.changes) && isObj(payload.changes.base);
+    if (action === "edited" && !baseChanged) return null; // title/body edits do not change the code
+    if (action === "labeled") {
+      const label = isObj(payload.label) ? str(payload.label.name)?.toLowerCase() : undefined;
+      const triggers = (opts.triggerLabels ?? []).map((l) => l.toLowerCase());
+      if (!label || !triggers.includes(label)) return null;
+    }
     const pr = payload.pull_request;
     if (!isObj(pr)) return null;
     const number = num(pr.number) ?? num(payload.number);
@@ -85,6 +112,8 @@ export function changeRefFromEvent(
     const headSha = isObj(pr.head) ? str(pr.head.sha) : undefined;
     const out: WebhookChange = { ref: { repo, number }, action, ...(headSha ? { headSha } : {}) };
     if (pr.draft === true && action !== "ready_for_review") out.draft = true;
+    if (baseChanged) out.reason = "base-changed";
+    if (name === "pull_request_target") out.targetEvent = true;
     return out;
   }
 

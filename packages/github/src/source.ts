@@ -39,8 +39,11 @@ const FILE_STATUSES: readonly FileStatus[] = [
 
 /** Labels that mark a change as AI/agent-authored. */
 export const AGENT_LABELS = ["ai-authored", "agent"] as const;
-/** Co-author names that mark an AI-assisted change. Kept short and obvious on purpose. */
-const AI_COAUTHOR = /\b(claude|anthropic|copilot|openai|chatgpt|gpt-?\d|codex|gemini|cursor|devin|aider|windsurf)\b/i;
+/**
+ * Co-author signatures of known AI tools: Claude Code's `noreply@anthropic.com`, any `[bot]` account,
+ * and GitHub Copilot. Product names alone are not used (they collide with people's names).
+ */
+const AI_COAUTHOR = /noreply@anthropic\.com|\[bot\]|\bcopilot\b/i;
 
 const asStatus = (s: string): FileStatus =>
   (FILE_STATUSES as readonly string[]).includes(s) ? (s as FileStatus) : "changed";
@@ -49,7 +52,8 @@ const asStatus = (s: string): FileStatus =>
  * Classify the PR author.
  * - `bot`: GitHub says `type: "Bot"` or the login ends with `[bot]` (Apps, Dependabot, Renovate).
  * - `agent`: a human account, but the PR carries an `ai-authored`/`agent` label, or the body has a
- *   `Co-Authored-By:` trailer naming a well-known AI assistant. This is a cheap heuristic, not proof.
+ *   `Co-Authored-By:` trailer with a known AI signature (`noreply@anthropic.com`, `[bot]`, `Copilot`).
+ *   This is a cheap heuristic, not proof; it only ever makes classification stricter.
  * - `human` otherwise.
  */
 export function classifyAuthor(
@@ -133,9 +137,14 @@ function fileHeader(f: PullFileData): string {
 /**
  * Concatenate per-file patches into a unified diff. Files without a patch (binary, or too large for
  * GitHub to inline) and files beyond what the API returned are counted as omitted and noted in a
- * trailer line so reviewers know the diff is partial.
+ * trailer line so reviewers know the diff is partial. `capped` marks a file list cut off at an API
+ * limit with an unknown total (the compare endpoint's 300 files).
  */
-export function diffFromFiles(files: PullFileData[], totalFiles = files.length): string {
+export function diffFromFiles(
+  files: PullFileData[],
+  totalFiles = files.length,
+  opts: { capped?: boolean } = {},
+): string {
   const parts: string[] = [];
   let omitted = Math.max(0, totalFiles - files.length);
   for (const f of files) {
@@ -146,7 +155,12 @@ export function diffFromFiles(files: PullFileData[], totalFiles = files.length):
     parts.push(`${fileHeader(f)}\n${f.patch.endsWith("\n") ? f.patch.slice(0, -1) : f.patch}`);
   }
   let out = parts.join("\n");
-  if (omitted > 0) out += `${out ? "\n" : ""}# merge-safely: diff truncated (${omitted} files omitted)`;
+  const sep = out ? "\n" : "";
+  if (opts.capped) {
+    out += `${sep}# merge-safely: diff truncated (${omitted} files omitted, and the file list hit the ${DIFF_FILE_LIMIT}-file API limit so more may be missing)`;
+  } else if (omitted > 0) {
+    out += `${sep}# merge-safely: diff truncated (${omitted} files omitted)`;
+  }
   return out.length > 0 ? `${out}\n` : out;
 }
 
@@ -227,11 +241,22 @@ export function githubSource(opts: GithubSourceOptions): SourceProvider {
       };
     },
 
-    async getDiff(ref: ChangeRef, diffOpts?: { sinceSha?: string }): Promise<string> {
+    /**
+     * Full diff base...head, or the delta sinceSha...head. `headSha` pins the head: the orchestrator
+     * always passes the SHA the verdict is bound to, so a push landing mid-review cannot swap the diff.
+     * Without it the PR's current head is used.
+     */
+    async getDiff(ref: ChangeRef, diffOpts?: { sinceSha?: string; headSha?: string }): Promise<string> {
       const { data: pr } = await octokit.pulls.get({ ...repoParams(ref.repo), pull_number: ref.number });
+      const head = diffOpts?.headSha ?? pr.head.sha;
       const since = diffOpts?.sinceSha;
-      const basehead = since ? `${since}...${pr.head.sha}` : `${pr.base.sha}...${pr.head.sha}`;
-      const tooBig = !since && (pr.changed_files > DIFF_FILE_LIMIT || pr.additions + pr.deletions > DIFF_LINE_LIMIT);
+      const basehead = since ? `${since}...${head}` : `${pr.base.sha}...${head}`;
+      // listFiles and the PR stats describe the PR's *current* head; only trust them when it is ours.
+      const atCurrentHead = head === pr.head.sha;
+      const tooBig =
+        !since &&
+        atCurrentHead &&
+        (pr.changed_files > DIFF_FILE_LIMIT || pr.additions + pr.deletions > DIFF_LINE_LIMIT);
       if (!tooBig) {
         try {
           const res = await octokit.repos.compareCommitsWithBasehead({
@@ -245,10 +270,11 @@ export function githubSource(opts: GithubSourceOptions): SourceProvider {
           if (!isDiffTooLarge(err)) throw err;
         }
       }
-      if (since) {
-        // Delta fallback: the compare JSON carries per-file patches (GitHub caps it at 300 files).
+      if (since || !atCurrentHead) {
+        // Compare JSON carries per-file patches for exactly this basehead, capped at 300 files.
         const { data } = await octokit.repos.compareCommitsWithBasehead({ ...repoParams(ref.repo), basehead });
-        return diffFromFiles(data.files ?? []);
+        const files = data.files ?? [];
+        return diffFromFiles(files, files.length, { capped: files.length >= DIFF_FILE_LIMIT });
       }
       return diffFromFiles(await listFiles(ref), pr.changed_files);
     },

@@ -1,8 +1,19 @@
 import { createHash } from "node:crypto";
-import type { Finding, RepoRef, ReviewerRun, Verdict, VerdictKey, VerdictStore } from "@merge-safely/core";
+import type {
+  Finding,
+  Logger,
+  Policy,
+  RepoRef,
+  ReviewerRun,
+  Verdict,
+  VerdictKey,
+  VerdictStore,
+} from "@merge-safely/core";
 import { conclusionForVerdict, findCheckRun } from "./check-run-shared.js";
+import { type IdentityOptions, isOwnUser, lazyIdentity, resolveCheckName } from "./identity.js";
 import { type CheckRunData, collectPages, type OctokitLike } from "./octokit.js";
-import { clip, DEFAULT_CHECK_NAME, GITHUB_TEXT_LIMIT } from "./util.js";
+import { clip, GITHUB_TEXT_LIMIT, mapLimit } from "./util.js";
+import { hydrateEntry, INDEX_MARKER, parseIndex, renderIndex, toIndexEntry, upsertEntry } from "./verdict-index.js";
 
 /**
  * VerdictStore that lives inside the check run itself (design 6.1): the Action needs no database.
@@ -20,13 +31,25 @@ import { clip, DEFAULT_CHECK_NAME, GITHUB_TEXT_LIMIT } from "./util.js";
  * audit lists, clip finding detail and evidence, and finally drop `seats` altogether. Findings,
  * quorum, cost, downgrades and addressed/carried are always kept.
  *
+ * Ownership: this store is the ONLY writer of `output.text`; `checkRunReporter` re-sends it
+ * unchanged, and put() re-sends the reporter's title/summary unchanged. Only check runs created by
+ * our own app (see `identity.ts`) are read or written.
+ *
+ * History: each put() also upserts a compact entry into a bot-authored PR comment (see
+ * `verdict-index.ts`), so `listForChange` still sees rounds whose SHAs a force-push removed.
+ *
  * Concurrency: GitHub has no conditional update, so put() is read-compare-write. It catches stale
  * writers (the common race) but not two writers inside the same few hundred milliseconds; run one
  * review per SHA at a time (an Actions `concurrency` group or the App's queue).
+ *
+ * Needs an App installation token or `GITHUB_TOKEN`; the Checks API refuses PATs (use a local store).
  */
-export interface CheckRunStoreOptions {
+export interface CheckRunStoreOptions extends IdentityOptions {
   octokit: OctokitLike;
+  /** Overrides `policy.reporting.checkName` (default `merge-safely/verdict`). */
   checkName?: string;
+  policy?: Pick<Policy, "reporting">;
+  logger?: Logger;
 }
 
 export const VERDICT_MARKER = "<!-- merge-safely:verdict -->";
@@ -174,10 +197,11 @@ function minimalSummary(v: Verdict): { title: string; summary: string } {
 
 export function checkRunStore(opts: CheckRunStoreOptions): VerdictStore {
   const { octokit } = opts;
-  const name = opts.checkName ?? DEFAULT_CHECK_NAME;
+  const name = resolveCheckName(opts.checkName, opts.policy);
+  const identity = lazyIdentity(octokit, opts, opts.logger);
 
   async function read(repo: RepoRef, headSha: string) {
-    const run = await findCheckRun(octokit, repo, headSha, name);
+    const run = await findCheckRun(octokit, repo, headSha, name, await identity());
     if (!run) return { run: null, verdict: null };
     return { run, verdict: parseVerdictText(run.output.text) };
   }
@@ -187,6 +211,37 @@ export function checkRunStore(opts: CheckRunStoreOptions): VerdictStore {
     v.number === key.number &&
     v.repo.owner.toLowerCase() === key.repo.owner.toLowerCase() &&
     v.repo.name.toLowerCase() === key.repo.name.toLowerCase();
+
+  async function readIndex(repo: RepoRef, number: number) {
+    const who = await identity();
+    const comments = await collectPages(
+      async (page, per_page) =>
+        (
+          await octokit.issues.listComments({
+            owner: repo.owner,
+            repo: repo.name,
+            issue_number: number,
+            per_page,
+            page,
+          })
+        ).data,
+      { maxItems: 1000 },
+    );
+    for (const c of comments) {
+      if (!isOwnUser(c.user, who) || !c.body?.includes(INDEX_MARKER)) continue;
+      const entries = parseIndex(c.body);
+      if (entries) return { commentId: c.id, entries };
+    }
+    return null;
+  }
+
+  async function writeIndex(v: Verdict): Promise<void> {
+    const idx = await readIndex(v.repo, v.number);
+    const body = renderIndex(upsertEntry(idx?.entries ?? [], toIndexEntry(v)));
+    const repo = { owner: v.repo.owner, repo: v.repo.name };
+    if (idx) await octokit.issues.updateComment({ ...repo, comment_id: idx.commentId, body });
+    else await octokit.issues.createComment({ ...repo, issue_number: v.number, body });
+  }
 
   return {
     async get(key) {
@@ -201,7 +256,9 @@ export function checkRunStore(opts: CheckRunStoreOptions): VerdictStore {
       if (current !== expect.version) return { ok: false, version: current ?? "" };
       const text = serializeVerdict(v);
       const fallback = minimalSummary(v);
+      let version: string;
       if (run) {
+        // Title/summary/conclusion belong to the reporter: re-send title and summary unchanged.
         const { data } = await octokit.checks.update({
           owner: v.repo.owner,
           repo: v.repo.name,
@@ -212,36 +269,59 @@ export function checkRunStore(opts: CheckRunStoreOptions): VerdictStore {
             text,
           },
         });
-        return { ok: true, version: checkRunVersion(data) };
+        version = checkRunVersion(data);
+      } else {
+        // No run yet: the store is the signal, so create it completed with the verdict's conclusion.
+        // A reporter that runs later finds this run and enriches title/summary/annotations.
+        const { data } = await octokit.checks.create({
+          owner: v.repo.owner,
+          repo: v.repo.name,
+          name,
+          head_sha: v.headSha,
+          status: "completed",
+          conclusion: conclusionForVerdict(v),
+          completed_at: v.createdAt,
+          output: { ...fallback, text },
+        });
+        version = checkRunVersion(data);
       }
-      // No run yet: the store is the signal, so create it completed with the verdict's conclusion.
-      // A reporter that runs later finds this run and enriches title/summary/annotations.
-      const { data } = await octokit.checks.create({
-        owner: v.repo.owner,
-        repo: v.repo.name,
-        name,
-        head_sha: v.headSha,
-        status: "completed",
-        conclusion: conclusionForVerdict(v),
-        completed_at: v.createdAt,
-        output: { ...fallback, text },
-      });
-      return { ok: true, version: checkRunVersion(data) };
+      try {
+        await writeIndex(v);
+      } catch (err: unknown) {
+        // The verdict itself is stored; only the force-push history is behind. Never fail the put for it.
+        opts.logger?.warn("merge-safely: could not update the round index comment", {
+          repo: `${v.repo.owner}/${v.repo.name}`,
+          number: v.number,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      return { ok: true, version };
     },
 
     async listForChange(repo, number) {
+      const idx = await readIndex(repo, number);
+      if (idx) {
+        const shas = [...new Set(idx.entries.map((e) => e.headSha))];
+        const full = new Map<string, Verdict>();
+        await mapLimit(shas, 5, async (sha) => {
+          const { verdict } = await read(repo, sha);
+          if (verdict && verdict.number === number) full.set(sha, verdict);
+        });
+        // The run holds the latest round for its SHA; older rounds on the same SHA come from the index.
+        return idx.entries.map((e) => {
+          const f = full.get(e.headSha);
+          return f && f.round === e.round ? f : hydrateEntry(e, repo, number);
+        });
+      }
+      // No index (older verdicts, or a store that never wrote one): walk the PR's current commits.
       const commits = await collectPages(
         async (page, per_page) =>
           (await octokit.pulls.listCommits({ owner: repo.owner, repo: repo.name, pull_number: number, per_page, page }))
             .data,
         { maxItems: 250 },
       );
-      const out: Verdict[] = [];
-      for (const c of commits) {
-        const { verdict } = await read(repo, c.sha);
-        if (verdict && verdict.number === number) out.push(verdict);
-      }
-      return out; // commit order: oldest first, newest last
+      const found = await mapLimit(commits, 5, async (c) => (await read(repo, c.sha)).verdict);
+      return found.filter((v): v is Verdict => v !== null && v.number === number); // oldest first
     },
   };
 }

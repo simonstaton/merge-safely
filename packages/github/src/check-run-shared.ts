@@ -1,15 +1,19 @@
 import type { RepoRef, Verdict } from "@merge-safely/core";
+import { type GithubIdentity, isOwnApp } from "./identity.js";
 import { type CheckConclusion, type CheckRunData, collectPages, type OctokitLike } from "./octokit.js";
 
 /**
- * The one check run for (name, headSha): the newest by id when several exist (e.g. created by an
- * older version or a re-run). Callers update it, so each SHA converges on exactly one run per name.
+ * Our check run for (name, headSha): the newest by id among runs created by OUR app. Runs with the
+ * same name from any other app (or any other workflow identity) are ignored, so they can neither
+ * forge a stored verdict nor be updated by us. Callers update the result, so each SHA converges on
+ * one run per name.
  */
 export async function findCheckRun(
   octokit: OctokitLike,
   repo: RepoRef,
   headSha: string,
   name: string,
+  who: GithubIdentity,
 ): Promise<CheckRunData | null> {
   const runs = await collectPages(
     async (page, per_page) =>
@@ -28,7 +32,7 @@ export async function findCheckRun(
   );
   let best: CheckRunData | null = null;
   for (const r of runs) {
-    if (r.name !== name || r.head_sha !== headSha) continue;
+    if (r.name !== name || r.head_sha !== headSha || !isOwnApp(r.app, who)) continue;
     if (!best || r.id > best.id) best = r;
   }
   return best;

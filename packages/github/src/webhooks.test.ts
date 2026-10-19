@@ -28,13 +28,57 @@ const ref = { repo: { host: "github.com", owner: "acme", name: "widgets" }, numb
 
 describe("changeRefFromEvent", () => {
   it("maps reviewable pull_request actions", () => {
-    for (const action of ["opened", "synchronize", "reopened", "ready_for_review", "labeled"]) {
+    for (const action of ["opened", "synchronize", "reopened", "ready_for_review"]) {
       expect(changeRefFromEvent("pull_request", { action, repository, pull_request: pr() })).toEqual({
         ref,
         headSha: "h1",
         action,
       });
     }
+  });
+
+  it("maps edited only when the base changed, as a full re-review", () => {
+    expect(
+      changeRefFromEvent("pull_request", {
+        action: "edited",
+        repository,
+        pull_request: pr(),
+        changes: { base: { ref: { from: "develop" }, sha: { from: "b0" } } },
+      }),
+    ).toEqual({ ref, headSha: "h1", action: "edited", reason: "base-changed" });
+    expect(
+      changeRefFromEvent("pull_request", {
+        action: "edited",
+        repository,
+        pull_request: pr(),
+        changes: { title: { from: "x" } },
+      }),
+    ).toBeNull();
+  });
+
+  it("maps pull_request_target with targetEvent", () => {
+    expect(changeRefFromEvent("pull_request_target", { action: "opened", repository, pull_request: pr() })).toEqual({
+      ref,
+      headSha: "h1",
+      action: "opened",
+      targetEvent: true,
+    });
+  });
+
+  it("triggers on labeled only for configured labels, never on unlabeled", () => {
+    const ev = (action: string, name: string) => ({ action, repository, pull_request: pr(), label: { name } });
+    expect(changeRefFromEvent("pull_request", ev("labeled", "p2"))).toBeNull();
+    expect(changeRefFromEvent("pull_request", ev("labeled", "ai-authored"))).toBeNull();
+    expect(
+      changeRefFromEvent("pull_request", ev("labeled", "AI-Authored"), { triggerLabels: ["ai-authored"] }),
+    ).toEqual({
+      ref,
+      headSha: "h1",
+      action: "labeled",
+    });
+    expect(
+      changeRefFromEvent("pull_request", ev("unlabeled", "ai-authored"), { triggerLabels: ["ai-authored"] }),
+    ).toBeNull();
   });
 
   it("flags drafts except on ready_for_review", () => {

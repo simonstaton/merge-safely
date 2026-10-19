@@ -1,4 +1,4 @@
-import type { Policy, Principal, RepoRef, TrustClass, TrustProvider } from "@merge-safely/core";
+import type { Logger, Policy, Principal, RepoRef, TrustClass, TrustProvider } from "@merge-safely/core";
 import { errorStatus, type OctokitLike } from "./octokit.js";
 
 /**
@@ -9,7 +9,9 @@ import { errorStatus, type OctokitLike } from "./octokit.js";
  * 2. bots/agents → "standard" when `botsAreStandard` (default true): an automated author is never trusted
  * 3. `trusted` (login or team) → "trusted"
  * 4. otherwise "standard"
- * Lookup failures other than 404 fail closed (not a member) and are not cached.
+ * Any team lookup error other than a 404 (rate limit, 5xx, missing `members: read`) makes the whole
+ * classification "standard": no bypass, still fully reviewed. An error never yields "trusted", and
+ * the result is not cached. A 404 means "not a member" and is cached.
  */
 export interface GithubTeamsTrustOptions {
   octokit: OctokitLike;
@@ -19,6 +21,16 @@ export interface GithubTeamsTrustOptions {
   /** Membership cache TTL. Defaults to 5 minutes. */
   cacheTtlMs?: number;
   now?: () => number;
+  logger?: Logger;
+}
+
+class LookupError extends Error {
+  constructor(
+    readonly team: string,
+    readonly status: number | undefined,
+  ) {
+    super(`team membership lookup failed for ${team}`);
+  }
 }
 
 export const TEAM_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -64,7 +76,8 @@ export function githubTeamsTrust(opts: GithubTeamsTrustOptions): TrustProvider {
       });
       member = data.state === "active"; // "pending" invitations are not members yet
     } catch (err: unknown) {
-      if (errorStatus(err) !== 404) return false; // fail closed, do not cache transient errors
+      const status = errorStatus(err);
+      if (status !== 404) throw new LookupError(`${team.org}/${team.slug}`, status);
       member = false;
     }
     cache.set(key, { member, at: now() });
@@ -79,10 +92,21 @@ export function githubTeamsTrust(opts: GithubTeamsTrustOptions): TrustProvider {
 
   return {
     async classify(author: Principal, _repo: RepoRef): Promise<TrustClass> {
-      if (await matches(blocked, author.login)) return "blocked";
-      if (botsAreStandard && isAutomated(author)) return "standard";
-      if (await matches(trusted, author.login)) return "trusted";
-      return "standard";
+      if (blocked.logins.has(author.login.toLowerCase())) return "blocked";
+      try {
+        if (await matches(blocked, author.login)) return "blocked";
+        if (botsAreStandard && isAutomated(author)) return "standard";
+        if (await matches(trusted, author.login)) return "trusted";
+        return "standard";
+      } catch (err: unknown) {
+        if (!(err instanceof LookupError)) throw err;
+        opts.logger?.warn("merge-safely: team lookup failed; classifying author as standard", {
+          team: err.team,
+          login: author.login,
+          status: err.status,
+        });
+        return "standard";
+      }
     },
   };
 }
@@ -112,12 +136,18 @@ export function allowlistTrust(opts: {
  * - `allowlist` uses bare logins only.
  * - `none` and `codeowners` (not implemented here) trust nobody; `blocked` logins still apply.
  */
-export function trustFromPolicy(policy: Pick<Policy, "trust">, octokit?: OctokitLike): TrustProvider {
+export function trustFromPolicy(policy: Pick<Policy, "trust">, octokit?: OctokitLike, logger?: Logger): TrustProvider {
   const t = policy.trust;
   switch (t.provider) {
     case "github-teams":
       if (!octokit) throw new Error("trust.provider github-teams requires a GitHub client with members: read");
-      return githubTeamsTrust({ octokit, trusted: t.trusted, blocked: t.blocked, botsAreStandard: t.botsAreStandard });
+      return githubTeamsTrust({
+        octokit,
+        trusted: t.trusted,
+        blocked: t.blocked,
+        botsAreStandard: t.botsAreStandard,
+        ...(logger ? { logger } : {}),
+      });
     case "allowlist":
       return allowlistTrust({ trusted: t.trusted, blocked: t.blocked, botsAreStandard: t.botsAreStandard });
     default:

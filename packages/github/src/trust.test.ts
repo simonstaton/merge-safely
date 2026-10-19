@@ -50,7 +50,19 @@ describe("githubTeamsTrust", () => {
     expect(await lax.classify({ kind: "bot", login: "renovate[bot]" }, repo)).toBe("trusted");
   });
 
-  it("fails closed on lookup errors without caching them", async () => {
+  it("classifies as standard (never trusted, never silently unblocked) when any team lookup errors", async () => {
+    const warnings: unknown[] = [];
+    const logger = { debug() {}, info() {}, error() {}, warn: (_m: string, meta?: unknown) => warnings.push(meta) };
+    const { octokit } = fakeOctokit({ memberships: { "acme/contractors:eve": "500", "acme/devs:eve": "active" } });
+    const trust = githubTeamsTrust({ octokit, trusted: ["acme/devs"], blocked: ["acme/contractors"], logger });
+    expect(await trust.classify(human("eve"), repo)).toBe("standard");
+    expect(warnings).toEqual([{ team: "acme/contractors", login: "eve", status: 500 }]);
+    // A bare-login block needs no lookup and still wins.
+    const t2 = githubTeamsTrust({ octokit, trusted: ["acme/devs"], blocked: ["eve", "acme/contractors"] });
+    expect(await t2.classify(human("eve"), repo)).toBe("blocked");
+  });
+
+  it("does not cache lookup errors", async () => {
     const { octokit, calls, state } = fakeOctokit({ memberships: { "acme/devs:alice": "500" } });
     const trust = githubTeamsTrust({ octokit, trusted: ["acme/devs"] });
     expect(await trust.classify(human("alice"), repo)).toBe("standard");
