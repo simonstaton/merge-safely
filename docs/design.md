@@ -273,13 +273,13 @@ The thing a human reads instead of the diff. Rendered in the check run summary, 
 
 ```
 Verdict: BLOCK (tier 3, round 2 of 3)                                 cost $1.84 · 3 seats · 2m 10s
-Why tier 3: touches packages/plasma/queries/*Raw.ts and fanguard/src/jobs/** (critical paths)
+Why tier 3: touches packages/db/queries/*Raw.ts and services/api/src/jobs/** (critical paths)
 Quorum: 2 required, 1 passed, 2 blocked
 
 Blockers (1)
-  [lock-risk] Backfill scans tracking_link_period without batching — fanguard/src/jobs/growth/backfill…Job.ts:41
+  [lock-risk] Backfill scans a large table without batching — services/api/src/jobs/backfillJob.ts:41
      Evidence: ran EXPLAIN on the raw query; seq scan, no LIMIT, inside one transaction.
-     Suggested: batch by creator_id ranges of 1000 with a sleep, commit per batch.
+     Suggested: batch by id ranges of 1000 with a sleep, commit per batch.
 
 Important (2) … Nits (3) … Pre-existing (1)
 
@@ -304,7 +304,7 @@ tiers:
     - "**/schema.prisma"
     - "**/jobs/**/backfill*"
     - "**/queries/**/*Raw.ts"
-    - "eden/src/layouts/**"
+    - "apps/web/src/layouts/**"
     - "src/layouts/AppShell/**"
     - "**/auth/**"
     - "**/payments/**"
@@ -345,7 +345,7 @@ rounds:
 
 trust:
   provider: github-teams
-  trusted: ["fanvue/developers"]              # may bypass for tiers 0-2; never changes tiers
+  trusted: ["my-org/developers"]              # may bypass for tiers 0-2; never changes tiers
   trustedBypassMaxTier: 2
   escalateTier3ForStandardAuthors: true
 
@@ -404,7 +404,7 @@ merge-safely connect anthropic              # interactive: pick kind, paste or O
 merge-safely connect openai --api-key-env OPENAI_API_KEY
 merge-safely connect openai-compatible --base-url https://openrouter.ai/api/v1 --api-key-env OPENROUTER_API_KEY
 merge-safely connections list | test | remove <id>
-merge-safely run --repo fanvue/pandora --pr 39180
+merge-safely run --repo my-org/my-repo --pr 1234
 merge-safely run --local                    # review the working tree vs base, pre-PR "spellcheck" mode, no store
 merge-safely explain --pr 39180             # print the digest for the latest verdict
 merge-safely estimate --pr 39180            # tier, seats, model choice, estimated cost, without running
@@ -691,7 +691,7 @@ Stable policy schema and port interfaces; GitLab adapter; container and remote s
 Five production-bound changes in one week in one repo, all authored by non-engineers using AI tools, none caught by process:
 
 - A 35-file UI redesign auto-merged with zero human review twelve minutes before its author asked for one.
-- A feature enabled at 100 percent for every creator by a commit pushed after the only approval, merged on that stale approval.
+- A feature enabled at 100 percent for every user by a commit pushed after the only approval, merged on that stale approval.
 - A feature flag removed in code but never created in production, flooding error tracking past plan limits.
 - A backfill that locked production tables for hours.
 - A shared layout rebuild that would have silently dropped 22 props across 120 routes, caught only because that one repository required an owner.
