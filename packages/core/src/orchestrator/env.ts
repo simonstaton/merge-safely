@@ -8,6 +8,48 @@ import { GateError, type GateErrorCode, isGateError } from "./errors.js";
 import type { GateDeps } from "./types.js";
 import { connectionSecrets, errorText, NOOP_LOGGER, scrub } from "./util.js";
 
+/** Upper bounds on every port call, so a hanging adapter can never hold a review open indefinitely. */
+export interface PortTimeouts {
+  /** One cost-ledger row; on timeout the row is logged as lost and the seat carries on. */
+  ledgerAppendMs: number;
+  ledgerReadMs: number;
+  reporterMs: number;
+  escalationMs: number;
+  storeMs: number;
+  sourceMs: number;
+  trustMs: number;
+  workspaceAcquireMs: number;
+  workspaceDisposeMs: number;
+}
+
+export const DEFAULT_PORT_TIMEOUTS: PortTimeouts = {
+  ledgerAppendMs: 5_000,
+  ledgerReadMs: 30_000,
+  reporterMs: 30_000,
+  escalationMs: 30_000,
+  storeMs: 30_000,
+  sourceMs: 120_000,
+  trustMs: 30_000,
+  workspaceAcquireMs: 120_000,
+  workspaceDisposeMs: 30_000,
+};
+
+/** Reject with "<what> timed out after <ms>ms" unless `p` settles first. The timer is always cleared. */
+export function withTimeout<T>(p: Promise<T> | T, ms: number, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${what} timed out after ${ms}ms`)), Math.max(1, ms));
+  });
+  return Promise.race([Promise.resolve(p), timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+export const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => {
+    setTimeout(resolve, Math.max(0, ms));
+  });
+
 export const DEFAULT_PRODUCED_BY = "@merge-safely/core@0.1.0";
 export const DEFAULT_CONCURRENCY = 4;
 
@@ -22,6 +64,7 @@ export interface Env {
   concurrency: number;
   secrets: string[];
   normalise: (id: string) => string;
+  timeouts: PortTimeouts;
 }
 
 export function makeEnv(deps: GateDeps): Env {
@@ -36,6 +79,7 @@ export function makeEnv(deps: GateDeps): Env {
     concurrency: deps.concurrency ?? DEFAULT_CONCURRENCY,
     secrets: connectionSecrets(deps.connections),
     normalise,
+    timeouts: { ...DEFAULT_PORT_TIMEOUTS, ...(deps.timeouts ?? {}) },
   };
 }
 
@@ -52,10 +96,16 @@ export function toGateError(env: Env, err: unknown, code: GateErrorCode = "inter
   return new GateError(code, prefix ? `${prefix}: ${msg}` : msg);
 }
 
-/** Call a port, converting any throw into a GateError of the given code. */
-export async function guard<T>(env: Env, code: GateErrorCode, what: string, fn: () => Promise<T> | T): Promise<T> {
+/** Call a port with a timeout, converting any throw (or the timeout) into a GateError of the given code. */
+export async function guard<T>(
+  env: Env,
+  code: GateErrorCode,
+  what: string,
+  fn: () => Promise<T> | T,
+  timeoutMs: number,
+): Promise<T> {
   try {
-    return await fn();
+    return await withTimeout(Promise.resolve().then(fn), timeoutMs, what);
   } catch (err: unknown) {
     throw toGateError(env, err, code, what);
   }
@@ -125,7 +175,11 @@ export async function report(env: Env, state: RunState, event: ReportEvent): Pro
   await Promise.all(
     env.deps.reporters.map(async (r, i) => {
       try {
-        await r.report(event);
+        await withTimeout(
+          Promise.resolve().then(() => r.report(event)),
+          env.timeouts.reporterMs,
+          `reporter ${i} (${event.type})`,
+        );
       } catch (err: unknown) {
         env.logger.error("reporter failed", { reporter: i, event: event.type, error: safeText(env, err) });
       }

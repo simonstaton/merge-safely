@@ -14,9 +14,10 @@ import { ceilingEvaluator, downgradeLadder } from "../budget/ladder.js";
 import { estimatePanel } from "../budget/seat-budget.js";
 import { findInCatalog } from "../panel/seating.js";
 import { requiredPasses } from "../stages/aggregate.js";
-import type { Change, DowngradeStep, ModelRef, ModelTierClass, Seat, Tier } from "../types.js";
-import { catalogOf, type Env, modelInfoFor, safeText } from "./env.js";
-import { estimateSeatUsage } from "./util.js";
+import type { Change, DowngradeStep, ModelRef, ModelTierClass, Seat, Tier, Verdict } from "../types.js";
+import { catalogOf, type Env, modelInfoFor, safeText, withTimeout } from "./env.js";
+import type { UsageEstimateContext } from "./types.js";
+import { diffExceedsContext, estimateSeatUsage } from "./util.js";
 
 export const DAY_MS = 24 * 60 * 60 * 1000;
 /** The monthly ceiling is evaluated over a rolling 30 days (the ledger port has no calendar query). */
@@ -28,25 +29,41 @@ export function scopeIdFor(env: Env, change: Change): string {
   return env.deps.installationId ?? `${change.repo.host}/${change.repo.owner}/${change.repo.name}`;
 }
 
+/** Spend recorded on the change's stored verdicts (one per SHA, so an overwritten round's cost is not counted). */
+export function priorVerdictSpend(prior: Verdict[], change: Change): number {
+  let usd = 0;
+  for (const v of prior) {
+    if (v.number !== change.number || v.repo.owner !== change.repo.owner || v.repo.name !== change.repo.name) continue;
+    if (v.repo.host !== change.repo.host) continue;
+    const c = v.cost?.usd;
+    if (typeof c === "number" && Number.isFinite(c) && c > 0) usd += c;
+  }
+  return usd;
+}
+
 /**
- * Spend so far from the ledger. Without a ledger, per-change spend is taken as 0 (only this panel is known) and the
- * installation-wide inputs are undefined, so configured installation ceilings fail closed. A ledger call that throws
- * yields NaN / undefined for that input, which also fails closed.
+ * Spend so far. Per-change spend is the larger of the ledger figure and the sum of `cost.usd` over the change's
+ * stored verdicts (so a ledger-less deployment still enforces "one PR across all rounds"). Without a ledger the
+ * installation-wide inputs are undefined, so configured installation ceilings fail closed. A ledger read that throws
+ * or times out yields NaN / undefined for that input, which also fails closed.
  */
-export async function spendInputs(env: Env, change: Change, scopeId: string): Promise<SpendInputs> {
+export async function spendInputs(env: Env, change: Change, scopeId: string, prior: Verdict[]): Promise<SpendInputs> {
+  const fromVerdicts = priorVerdictSpend(prior, change);
   const ledger = env.deps.ledger;
-  if (!ledger) return { changeSpendUsd: 0 };
+  if (!ledger) return { changeSpendUsd: fromVerdicts };
   const b = env.policy.budget;
   const read = async (what: string, fn: () => Promise<{ usd: number }>): Promise<number | undefined> => {
     try {
-      return (await fn()).usd;
+      const r = await withTimeout(Promise.resolve().then(fn), env.timeouts.ledgerReadMs, `cost ledger ${what}`);
+      return typeof r.usd === "number" && Number.isFinite(r.usd) ? r.usd : undefined;
     } catch (err: unknown) {
       env.logger.error("cost ledger read failed; failing closed", { what, error: safeText(env, err) });
       return undefined;
     }
   };
+  const ledgerChange = await read("forChange", () => ledger.forChange(change.repo, change.number));
   const out: SpendInputs = {
-    changeSpendUsd: (await read("forChange", () => ledger.forChange(change.repo, change.number))) ?? Number.NaN,
+    changeSpendUsd: ledgerChange === undefined ? Number.NaN : Math.max(ledgerChange, fromVerdicts),
   };
   if (effectiveCeilingLimit(b.windowUsd) !== null) {
     const v = await read("forWindow", () => ledger.forWindow(scopeId, b.windowDays * DAY_MS));
@@ -63,7 +80,10 @@ export async function spendInputs(env: Env, change: Change, scopeId: string): Pr
   return out;
 }
 
-/** Per-seat dollar estimate: injected (or heuristic) usage priced with the injected pricing. */
+/**
+ * Per-seat dollar estimate: injected (or heuristic) usage priced with the injected pricing, with the seat model's
+ * context window passed so the estimate is capped by it.
+ */
 export function seatEstimator(
   env: Env,
   change: Change,
@@ -73,14 +93,45 @@ export function seatEstimator(
   const estimateUsage = env.deps.estimateUsage ?? estimateSeatUsage;
   return (seat) => {
     try {
-      const usage = estimateUsage(seat, { diffChars, change, secondJudgeRound });
-      const usd = env.deps.pricing.price(modelInfoFor(env, seat.model), usage).usd;
+      const info = modelInfoFor(env, seat.model);
+      const ctx: UsageEstimateContext = { diffChars, change, secondJudgeRound };
+      if (info.contextTokens > 0) ctx.contextTokens = info.contextTokens;
+      const usd = env.deps.pricing.price(info, estimateUsage(seat, ctx)).usd;
       return Number.isFinite(usd) ? usd : undefined;
     } catch (err: unknown) {
       env.logger.warn("seat estimate failed", { seatId: seat.id, error: safeText(env, err) });
       return undefined;
     }
   };
+}
+
+/** Seats whose model cannot even hold the diff; their estimate is capped and so is not trustworthy. */
+export function overContextSeats(env: Env, seats: Seat[], diffChars: number): string[] {
+  return seats.filter((s) => diffExceedsContext(diffChars, modelInfoFor(env, s.model).contextTokens)).map((s) => s.id);
+}
+
+/**
+ * Whether a fallback attempt fits the per-change ceiling: spend so far, plus the admitted panel estimate with this
+ * seat's own estimate swapped for what its failed attempt actually cost plus the fallback's estimate.
+ */
+export function fallbackFits(
+  env: Env,
+  args: {
+    spend: SpendInputs;
+    panelUsd: number | undefined;
+    estimate: (seat: Seat) => number | undefined;
+    original: Seat;
+    fallback: Seat;
+    spentUsd: number;
+  },
+): boolean {
+  const limit = effectiveCeilingLimit(env.policy.budget.perChangeUsd);
+  if (limit === null) return true;
+  const fb = args.estimate(args.fallback);
+  if (fb === undefined) return false;
+  const projected =
+    args.spend.changeSpendUsd + (args.panelUsd ?? 0) - (args.estimate(args.original) ?? 0) + args.spentUsd + fb;
+  return Number.isFinite(projected) && projected <= limit + 1e-9;
 }
 
 export type BudgetPlan =

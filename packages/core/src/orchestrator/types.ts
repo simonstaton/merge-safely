@@ -19,6 +19,7 @@ import type {
   Change,
   ChangeRef,
   Connection,
+  DowngradeStep,
   EscalationHandle,
   HumanDigest,
   LensId,
@@ -32,6 +33,7 @@ import type {
   TokenUsage,
   Verdict,
 } from "../types.js";
+import type { PortTimeouts } from "./env.js";
 
 /** Resolve the provider adapter for a connection (usually `ProviderRegistry.forConnection`). */
 export type ProviderResolver = (conn: Connection) => ModelProvider;
@@ -71,6 +73,8 @@ export interface UsageEstimateContext {
   diffChars: number;
   change: Change;
   secondJudgeRound: boolean;
+  /** The seat's model context window, when known (0 or undefined = unknown). */
+  contextTokens?: number;
 }
 
 export interface GateDeps {
@@ -110,6 +114,8 @@ export interface GateDeps {
    * `estimateSeatUsage` (a conservative heuristic over diff size and seat role).
    */
   estimateUsage?: (seat: Seat, ctx: UsageEstimateContext) => TokenUsage;
+  /** Override the per-port timeouts (see DEFAULT_PORT_TIMEOUTS). */
+  timeouts?: Partial<PortTimeouts>;
 }
 
 export interface ReviewResult {
@@ -120,6 +126,11 @@ export interface ReviewResult {
   events: ReportEvent[];
   /** True when a stored, unresolved block for this SHA prevented this round's result from replacing it. */
   contested?: boolean;
+  /**
+   * Set when this run could not decide (outage, insufficient seats, budget refusal) and a decided verdict was already
+   * stored for the SHA: `verdict` is then the stored verdict, unchanged, and this says why the run did not decide.
+   */
+  pendingReason?: string;
 }
 
 export interface Estimate {
@@ -133,6 +144,10 @@ export interface Estimate {
   ceilings: CeilingResult[];
   round: number;
   diffOnly: boolean;
+  /** Downgrade-ladder steps review() would apply (the seats above are already downgraded). */
+  downgrades?: DowngradeStep[];
+  /** Set when review() would refuse this panel at admission. */
+  budgetBlocked?: { ceiling: CeilingKind; message: string };
   summary: string;
 }
 
@@ -141,6 +156,17 @@ export interface ReviewChangeContext {
   /** Delta since the last reviewed SHA; used for diff-only rounds. Without it the round reviews the full diff. */
   deltaDiff?: string;
   untrusted?: { commitMessages?: string[]; comments?: string[] };
+}
+
+export interface ReviewChangeOptions {
+  trigger?: string;
+  /**
+   * Default false (`--local` mode): no store writes and no escalation; prior verdicts are still read from the store
+   * for round planning, reporters still receive every event, and real spend still goes to the ledger. A dirty
+   * workspace is allowed. Pass true to store the verdict like review() does; a dirty workspace then requires the
+   * change's headSha to be "WORKTREE" so the verdict is never pinned to a commit it did not review.
+   */
+  persist?: boolean;
 }
 
 export interface HumanVerdictInput {
@@ -154,7 +180,7 @@ export interface HumanVerdictInput {
 export interface Gate {
   review(ref: ChangeRef, opts?: { headSha?: string; trigger?: string }): Promise<ReviewResult>;
   /** Review a change the caller already holds (`--local` mode and tests). No source port is used. */
-  reviewChange(change: Change, ctx: ReviewChangeContext, opts?: { trigger?: string }): Promise<ReviewResult>;
+  reviewChange(change: Change, ctx: ReviewChangeContext, opts?: ReviewChangeOptions): Promise<ReviewResult>;
   /** Tier, seats and estimated cost without any model call or report. */
   estimate(target: ChangeRef | Change): Promise<Estimate>;
   explain(ref: ChangeRef): Promise<{ verdict: Verdict | null; digest: HumanDigest | null; history: Verdict[] }>;

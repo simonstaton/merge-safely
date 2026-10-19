@@ -1,10 +1,4 @@
 import { describe, expect, it } from "vitest";
-import { REVIEWER_OUTPUT_JSON_SCHEMA } from "../schema/reviewer-output.js";
-import { assignFingerprints, fingerprintFinding } from "../stages/fingerprint.js";
-import { makeFinding, makePolicy, makeVerdict } from "../stages/test-helpers.js";
-import { tier } from "../stages/tiering.js";
-import type { Finding, JudgeDecision, ReviewerInput, Verdict } from "../types.js";
-import { GateError } from "./errors.js";
 import {
   API_KEY,
   BACKUP,
@@ -19,7 +13,13 @@ import {
   ThrowingReporter,
   tier1Change,
   tier3Change,
-} from "./test-fakes.js";
+} from "../../test/orchestrator/fakes.js";
+import { REVIEWER_OUTPUT_JSON_SCHEMA } from "../schema/reviewer-output.js";
+import { assignFingerprints, fingerprintFinding } from "../stages/fingerprint.js";
+import { makeFinding, makePolicy, makeVerdict } from "../stages/test-helpers.js";
+import { tier } from "../stages/tiering.js";
+import type { Finding, JudgeDecision, ReviewerInput, Verdict } from "../types.js";
+import { GateError } from "./errors.js";
 
 const T1_PANEL = { hunters: ["correctness", "repro"], judges: 1 };
 const T3_PANEL = { hunters: ["correctness", "security"], judges: 2, secondJudgeRound: true };
@@ -86,7 +86,7 @@ describe("createGate: review panel", () => {
     expect(r.verdict.quorum).toEqual({ required: 1, passed: 2, blocked: 0, invalid: 0 });
     // No candidates, so the judge seat never ran.
     expect(h.provider.calls.map((c) => c.seat.role)).toEqual(["hunter", "hunter"]);
-    const input = h.provider.calls[0]?.input as ReviewerInput;
+    const input = h.provider.calls.find((c) => c.seat.lens === "correctness")?.input as ReviewerInput;
     expect(input.outputSchema).toBe(REVIEWER_OUTPUT_JSON_SCHEMA);
     expect(input.allowedCommands).toEqual(["npm test"]);
     expect(input.diffIsDelta).toBe(false);

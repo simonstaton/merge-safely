@@ -2,25 +2,41 @@ import { redactText } from "../stages/intake.js";
 import type { Change, Connection, Seat, TokenUsage } from "../types.js";
 import type { UsageEstimateContext } from "./types.js";
 
+/** Fixed prompt overhead per seat: system prompt, rubric, metadata, untrusted blocks. */
+export const SYSTEM_TOKENS = 6_000;
+/** Tool output the reviewer reads per turn (files, grep hits, git output). */
+export const TOOL_READ_TOKENS_PER_TURN = 3_000;
+/** Turns a seat is expected to use (bounded by its maxTurns). */
+export const EXPECTED_TURNS = 12;
+
+/** Diff tokens from chars (~4 chars per token). */
+export const diffTokens = (diffChars: number): number => Math.ceil(Math.max(0, diffChars) / 4);
+
 /**
  * Conservative per-seat token estimate for budgets and `estimate()`. Real cost comes from the streamed ledger; this
- * only has to be in the right order of magnitude and err high.
+ * errs high. Caching is assumed absent, because not every provider has it.
  *
- *   context = 6k (system prompt, rubric, metadata) + diffChars / 4
- *   in      = context * 4 (an agentic loop resends context; caching is ignored) + 3k per expected turn of tool output
- *   out     = 6k hunters, 4k judges
- * Expected turns are min(maxTurns, 12). Judges cost 1.5x when a second judge round may run.
+ *   turns   = min(maxTurns, 12)
+ *   context = 6k (system) + diffChars / 4 + 3k * turns (tool reads), capped at the model's contextTokens
+ *   in      = context * max(1, turns / 3)   (an agentic loop resends a growing context every turn)
+ *   out     = 6k hunters, 4k judges; both scaled by 1.5 for judges when a second judge round may run
  */
 export function estimateSeatUsage(seat: Seat, ctx: UsageEstimateContext): TokenUsage {
-  const context = 6_000 + Math.ceil(Math.max(0, ctx.diffChars) / 4);
-  const turns = Math.min(Math.max(1, seat.budget.maxTurns), 12);
-  let input = context * 4 + 3_000 * turns;
+  const turns = Math.min(Math.max(1, seat.budget.maxTurns), EXPECTED_TURNS);
+  let context = SYSTEM_TOKENS + diffTokens(ctx.diffChars) + TOOL_READ_TOKENS_PER_TURN * turns;
+  if (ctx.contextTokens !== undefined && ctx.contextTokens > 0) context = Math.min(context, ctx.contextTokens);
+  let input = Math.ceil(context * Math.max(1, turns / 3));
   let out = seat.role === "judge" ? 4_000 : 6_000;
   if (seat.role === "judge" && ctx.secondJudgeRound) {
     input = Math.ceil(input * 1.5);
     out = Math.ceil(out * 1.5);
   }
   return { in: input, out };
+}
+
+/** True when the diff alone cannot fit the model's context window (contextTokens 0/undefined = unknown, never). */
+export function diffExceedsContext(diffChars: number, contextTokens: number | undefined): boolean {
+  return contextTokens !== undefined && contextTokens > 0 && SYSTEM_TOKENS + diffTokens(diffChars) > contextTokens;
 }
 
 /** Approximate unified-diff size from change stats, for estimates made before the diff is fetched. */

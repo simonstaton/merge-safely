@@ -354,6 +354,8 @@ export interface Verdict extends VerdictKey {
   /** Prior finding ids still open. */
   carried?: string[];
   escalated?: boolean;
+  /** The escalation handle, recorded once `Escalation.request` succeeded; re-runs never request again. */
+  escalation?: EscalationHandle;
   /** Human verdicts: who signed and why. */
   signedBy?: Principal;
   reason?: string;

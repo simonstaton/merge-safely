@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { makeHarness, passOutput } from "../../test/orchestrator/fakes.js";
 import { makeChange, makePolicy, makeSeat } from "../stages/test-helpers.js";
 import { mapLimit } from "./limit.js";
-import { makeHarness, passOutput } from "./test-fakes.js";
 import { connectionSecrets, estimateDiffChars, estimateSeatUsage, scrub } from "./util.js";
 
 describe("mapLimit", () => {

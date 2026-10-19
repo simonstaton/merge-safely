@@ -6,7 +6,9 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Policy } from "../policy/schema.js";
+import { createGate } from "../../src/orchestrator/gate.js";
+import type { Gate, GateDeps, Pricing, PromptBuilders } from "../../src/orchestrator/types.js";
+import type { Policy } from "../../src/policy/schema.js";
 import type {
   Clock,
   CostLedger,
@@ -24,8 +26,8 @@ import type {
   VerdictStore,
   Workspace,
   WorkspaceHandle,
-} from "../ports.js";
-import { makeChange } from "../stages/test-helpers.js";
+} from "../../src/ports.js";
+import { makeChange } from "../../src/stages/test-helpers.js";
 import type {
   Change,
   ChangeRef,
@@ -52,9 +54,7 @@ import type {
   TrustClass,
   Verdict,
   VerdictKey,
-} from "../types.js";
-import { createGate } from "./gate.js";
-import type { Gate, GateDeps, Pricing, PromptBuilders } from "./types.js";
+} from "../../src/types.js";
 
 // ---------------------------------------------------------------------------
 // Models and connections
@@ -102,7 +102,7 @@ export const CATALOG: Record<string, ModelInfo[]> = {
     model("anthropic", "sonnet-x", "mid", 3, 15),
     model("anthropic", "haiku-x", "small", 1, 5),
   ],
-  backup: [model("openai", "gpt-x", "mid", 2, 8)],
+  backup: [model("openai", "gpt-big", "frontier", 30, 120), model("openai", "gpt-x", "mid", 2, 8)],
 };
 
 const TIER_RANK: Record<ModelTierClass, number> = { small: 0, mid: 1, frontier: 2 };
@@ -246,25 +246,32 @@ export class FakeSource implements SourceProvider {
 }
 
 export class TempWorkspace implements Workspace {
+  /** Override what the handle reports, to simulate a wrong checkout or a dirty tree. */
+  handleOverride: { headSha?: string; dirty?: boolean } = {};
+  /** Never resolve acquire (simulates a hung sandbox). */
+  hang = false;
   acquired = 0;
   disposed = 0;
   readonly seatIds: string[] = [];
   readonly dirs: string[] = [];
 
   async acquire(change: Change, opts?: { seatId?: string }): Promise<WorkspaceHandle> {
+    if (this.hang) return new Promise<WorkspaceHandle>(() => {});
     const cwd = await mkdtemp(join(tmpdir(), "ms-orch-"));
     this.acquired++;
     this.dirs.push(cwd);
     if (opts?.seatId) this.seatIds.push(opts.seatId);
-    return {
+    const handle: WorkspaceHandle = {
       cwd,
-      headSha: change.headSha,
+      headSha: this.handleOverride.headSha ?? change.headSha,
       baseSha: change.baseSha,
       dispose: async () => {
         this.disposed++;
         await rm(cwd, { recursive: true, force: true });
       },
     };
+    if (this.handleOverride.dirty !== undefined) handle.dirty = this.handleOverride.dirty;
+    return handle;
   }
 }
 
@@ -306,14 +313,20 @@ export class MemoryStore implements VerdictStore {
   /** Number of upcoming puts to reject as version conflicts (simulates a concurrent writer). */
   conflicts = 0;
   puts = 0;
+  /** Called before each put is applied; may mutate the store to simulate a concurrent writer. */
+  beforePut?: (v: Verdict) => void;
+  /** Never resolve get (simulates a hung database). */
+  hangGet = false;
 
   async get(key: VerdictKey) {
+    if (this.hangGet) return new Promise<null>(() => {});
     const s = this.slots.get(keyOf(key));
     return s ? { verdict: structuredClone(s.verdict), version: s.version } : null;
   }
 
   async put(v: Verdict, expect: { version: string | null }) {
     this.puts++;
+    this.beforePut?.(v);
     const k = keyOf(v);
     const current = this.slots.get(k)?.version ?? null;
     if (this.conflicts > 0) {
@@ -344,9 +357,12 @@ export class MemoryStore implements VerdictStore {
 
 export class MemoryLedger implements CostLedger {
   readonly rows: CostEntry[] = [];
+  /** Never resolve append (simulates a hung ledger). */
+  hangAppend = false;
   constructor(private readonly clock: Clock) {}
 
   async append(entry: CostEntry): Promise<void> {
+    if (this.hangAppend) return new Promise<void>(() => {});
     this.rows.push(structuredClone(entry));
   }
 
@@ -387,6 +403,14 @@ export class CollectingReporter implements Reporter {
   }
 }
 
+export class HangingReporter implements Reporter {
+  calls = 0;
+  report(): Promise<void> {
+    this.calls++;
+    return new Promise<void>(() => {});
+  }
+}
+
 export class ThrowingReporter implements Reporter {
   calls = 0;
   async report(): Promise<void> {
@@ -397,8 +421,11 @@ export class ThrowingReporter implements Reporter {
 
 export class FakeEscalation implements Escalation {
   readonly requests: Array<{ verdict: Verdict; digest: HumanDigest }> = [];
+  mode: "ok" | "throw" | "hang" = "ok";
   async request(verdict: Verdict, digest: HumanDigest): Promise<EscalationHandle> {
     this.requests.push({ verdict: structuredClone(verdict), digest });
+    if (this.mode === "throw") throw new Error(`escalation webhook rejected ${API_KEY}`);
+    if (this.mode === "hang") return new Promise<EscalationHandle>(() => {});
     return { id: `esc-${this.requests.length}`, createdAt: "2026-06-01T00:00:00.000Z" };
   }
 }

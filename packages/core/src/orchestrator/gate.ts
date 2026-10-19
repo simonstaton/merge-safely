@@ -7,8 +7,9 @@
  *           -> reconcile rounds -> aggregate -> verdict -> no-downgrade guard + CAS -> digest -> report
  *           -> escalate -> metrics
  *
- * Every port call is wrapped: once a change is known, any failure reports an `error` event and rejects with a
- * GateError whose message is secret-scrubbed. Reporters, metrics, ledger appends and escalation never fail a review.
+ * Every port call is wrapped and time-bounded: once a change is known, any failure reports an `error` event and rejects
+ * with a GateError whose message is secret-scrubbed. Reporters, metrics, ledger appends and escalation never fail a
+ * review. A run that cannot decide (pending) never replaces a decided verdict stored for the same SHA.
  * The gate holds no per-review state between calls; all timestamps come from `deps.clock`.
  */
 import { ceilingMessage, evaluateCeilings } from "../budget/ceilings.js";
@@ -42,12 +43,41 @@ import type {
   VerdictCost,
   VerdictKey,
 } from "../types.js";
-import { type BudgetPlan, ceilingPolicyName, planBudget, scopeIdFor, seatEstimator, spendInputs } from "./budget.js";
-import { catalogOf, type Env, emit, fail, guard, makeEnv, nowIso, RunState, report, safeText } from "./env.js";
+import {
+  type BudgetPlan,
+  ceilingPolicyName,
+  fallbackFits,
+  overContextSeats,
+  planBudget,
+  scopeIdFor,
+  seatEstimator,
+  spendInputs,
+} from "./budget.js";
+import {
+  catalogOf,
+  type Env,
+  emit,
+  fail,
+  guard,
+  makeEnv,
+  nowIso,
+  RunState,
+  report,
+  safeText,
+  withTimeout,
+} from "./env.js";
 import { GateError } from "./errors.js";
 import { mapLimit } from "./limit.js";
 import { type RoundContext, runSeat, type SeatOutcome, sanitiseRun } from "./seats.js";
-import type { Estimate, Gate, GateDeps, HumanVerdictInput, ReviewChangeContext, ReviewResult } from "./types.js";
+import type {
+  Estimate,
+  Gate,
+  GateDeps,
+  HumanVerdictInput,
+  ReviewChangeContext,
+  ReviewChangeOptions,
+  ReviewResult,
+} from "./types.js";
 import { addUsage, estimateDiffChars } from "./util.js";
 
 export function createGate(deps: GateDeps): Gate {
@@ -83,7 +113,13 @@ function requireSource(env: Env, what: string): SourceProvider {
 async function review(env: Env, ref: ChangeRef, opts: { headSha?: string; trigger?: string }): Promise<ReviewResult> {
   const state = new RunState();
   const source = requireSource(env, "review()");
-  const change = await guard(env, "source", "could not load the change", () => source.getChange(ref));
+  const change = await guard(
+    env,
+    "source",
+    "could not load the change",
+    () => source.getChange(ref),
+    env.timeouts.sourceMs,
+  );
   // Error events carry the redacted change from here on.
   state.change = intake(change, {}, env.policy).change;
   if (opts.headSha !== undefined && opts.headSha !== change.headSha) {
@@ -100,43 +136,55 @@ async function review(env: Env, ref: ChangeRef, opts: { headSha?: string; trigge
   let ctx: IntakeContext = {};
   if (source.getUntrustedContext) {
     try {
-      ctx = await source.getUntrustedContext(ref);
+      const getContext = source.getUntrustedContext.bind(source);
+      ctx = await withTimeout(getContext(ref), env.timeouts.sourceMs, "loading commit messages and comments");
     } catch (err: unknown) {
       env.logger.warn("could not load commit messages and comments; reviewing without them", {
         error: safeText(env, err),
       });
     }
   }
+  const ms = env.timeouts.sourceMs;
   const diffs: DiffSource = {
-    full: () => guard(env, "source", "could not fetch the diff", () => source.getDiff(ref, { headSha })),
+    full: () => guard(env, "source", "could not fetch the diff", () => source.getDiff(ref, { headSha }), ms),
     delta: (sinceSha) =>
-      guard(env, "source", "could not fetch the delta diff", () => source.getDiff(ref, { sinceSha, headSha })),
+      guard(env, "source", "could not fetch the delta diff", () => source.getDiff(ref, { sinceSha, headSha }), ms),
   };
-  return pipeline(env, state, change, ctx, diffs, opts.trigger);
+  return pipeline(env, state, change, ctx, diffs, opts.trigger, { persist: true, allowDirty: false });
 }
 
 async function reviewChange(
   env: Env,
   change: Change,
   ctx: ReviewChangeContext,
-  opts: { trigger?: string },
+  opts: ReviewChangeOptions,
 ): Promise<ReviewResult> {
   const state = new RunState();
   const diffs: DiffSource = { full: async () => ctx.diff };
   const delta = ctx.deltaDiff;
   if (delta !== undefined) diffs.delta = async () => delta;
-  return pipeline(env, state, change, ctx.untrusted ?? {}, diffs, opts.trigger);
+  const mode: Mode = { persist: opts.persist === true, allowDirty: true };
+  return pipeline(env, state, change, ctx.untrusted ?? {}, diffs, opts.trigger, mode);
 }
 
 // ---------------------------------------------------------------------------
 // Pipeline
 // ---------------------------------------------------------------------------
 
+/** review(): persist, clean checkout required. reviewChange(): persist only on request, dirty tree allowed. */
+interface Mode {
+  persist: boolean;
+  allowDirty: boolean;
+}
+
 interface ReviewBase {
+  mode: Mode;
   change: Change;
   tier: Tier;
   plan: RoundPlan;
   prior: Verdict[];
+  /** The verdict stored for this SHA when the run started (the store has one slot per SHA). */
+  priorSame?: Verdict;
   trust: TrustClass;
   /** Trusted author at or below trust.trustedBypassMaxTier: never escalated. */
   bypass: boolean;
@@ -152,6 +200,7 @@ async function pipeline(
   ictx: IntakeContext,
   diffs: DiffSource,
   trigger: string | undefined,
+  mode: Mode,
 ): Promise<ReviewResult> {
   const startedMs = env.clock.now().getTime();
   try {
@@ -159,8 +208,12 @@ async function pipeline(
     const { change, untrusted } = intake(raw, ictx, policy);
     state.change = change;
     const t = tierOf(change, policy);
-    const prior = await guard(env, "internal", "verdict store unavailable", () =>
-      env.deps.store.listForChange(change.repo, change.number),
+    const prior = await guard(
+      env,
+      "internal",
+      "verdict store unavailable",
+      () => env.deps.store.listForChange(change.repo, change.number),
+      env.timeouts.storeMs,
     );
     const plan = planRound({ change, priorVerdicts: prior, policy });
     state.round = plan.round;
@@ -170,7 +223,10 @@ async function pipeline(
 
     const trust = await classifyTrust(env, change);
     const bypass = trust === "trusted" && t.level <= policy.trust.trustedBypassMaxTier;
-    const base: ReviewBase = { change, tier: t, plan, prior, trust, bypass, startedMs };
+    const base: ReviewBase = { mode, change, tier: t, plan, prior, trust, bypass, startedMs };
+    const same = prior.filter((v) => v.headSha === change.headSha).sort((a, b) => a.round - b.round);
+    const priorSame = same[same.length - 1];
+    if (priorSame) base.priorSame = priorSame;
 
     if (plan.capReached) return await capReached(env, state, base);
     const tri = triage(change, t, policy);
@@ -189,7 +245,11 @@ async function classifyTrust(env: Env, change: Change): Promise<TrustClass> {
   if (!trust) return "standard";
   let cls: TrustClass;
   try {
-    cls = await trust.classify(change.author, change.repo);
+    cls = await withTimeout(
+      Promise.resolve().then(() => trust.classify(change.author, change.repo)),
+      env.timeouts.trustMs,
+      "trust lookup",
+    );
   } catch (err: unknown) {
     env.logger.warn("trust lookup failed; treating the author as standard", { error: safeText(env, err) });
     return "standard";
@@ -227,8 +287,17 @@ function baseVerdict(env: Env, base: ReviewBase, fields: Partial<Verdict> & { de
   return v;
 }
 
+/** Escalation already recorded on this SHA's stored verdict: never request again for it. */
+function priorEscalation(base: ReviewBase): Pick<Verdict, "escalated" | "escalation"> | undefined {
+  const v = base.priorSame;
+  if (!v || !(v.escalated || v.escalation)) return undefined;
+  const out: Pick<Verdict, "escalated" | "escalation"> = { escalated: true };
+  if (v.escalation) out.escalation = v.escalation;
+  return out;
+}
+
 async function capReached(env: Env, state: RunState, base: ReviewBase): Promise<ReviewResult> {
-  const { plan, change } = base;
+  const { plan, change, mode } = base;
   const known = plan.knownFindings;
   const sameSha = base.prior
     .filter((v) => v.kind === "machine" && v.headSha === change.headSha && v.decision !== "pending")
@@ -239,17 +308,22 @@ async function capReached(env: Env, state: RunState, base: ReviewBase): Promise<
   const verdict = baseVerdict(env, base, {
     decision,
     findings: rankFindings(known),
-    escalated: true,
     reason: `round cap reached (policy.rounds.max = ${env.policy.rounds.max}); no panel seated, a human must sign off`,
   });
   if (known.length > 0) verdict.carried = known.map((f) => f.id);
-  const escalation = env.deps.escalation;
-  const committed = await commit(env, state, verdict, { reportVerdict: !escalation });
+  const already = priorEscalation(base);
+  if (already) Object.assign(verdict, already);
+  const willRequest = mode.persist && env.deps.escalation !== undefined && !already;
+  let committed = await commit(env, state, verdict, { persist: mode.persist, reportVerdict: !willRequest });
   let handle: EscalationHandle | undefined;
-  if (!committed.refused && escalation) {
-    handle = await escalate(env, state, committed.verdict, committed.digest);
-    if (!handle)
+  if (!committed.refused && willRequest) {
+    const esc = await escalate(env, state, committed.verdict, mode);
+    if (esc) {
+      handle = esc.handle;
+      committed = { ...committed, verdict: esc.verdict, digest: esc.digest };
+    } else {
       await report(env, state, { type: "verdict", change, verdict: committed.verdict, digest: committed.digest });
+    }
   }
   emitVerdictMetrics(env, base, committed.verdict, { escalated: handle !== undefined, capReached: true });
   return result(state, committed, handle);
@@ -263,7 +337,7 @@ async function autoPass(env: Env, state: RunState, base: ReviewBase, reason: str
     quorum: { required: 0, passed: 0, blocked: 0, invalid: 0 },
     reason: `triaged: ${reason}`,
   });
-  const committed = await commit(env, state, verdict);
+  const committed = await commit(env, state, verdict, { persist: base.mode.persist });
   emitVerdictMetrics(env, base, committed.verdict, { escalated: false });
   return result(state, committed);
 }
@@ -309,11 +383,16 @@ async function reviewPanel(
   for (const w of seating.warnings) env.logger.warn(`seating: ${w}`);
 
   const scopeId = scopeIdFor(env, change);
-  const spend = await spendInputs(env, change, scopeId);
+  const spend = await spendInputs(env, change, scopeId, base.prior);
   const estimate = seatEstimator(env, change, diff.length, seating.secondJudgeRound);
   const budget = planBudget(env, { seats: seating.seats, tier: t, spend, estimate });
   if (!budget.ok) return budgetBlocked(env, state, base, budget);
   const seats = budget.seats;
+  for (const id of overContextSeats(env, seats, diff.length)) {
+    env.logger.warn("the diff alone exceeds this seat's model context window; the seat will likely fail", {
+      seatId: id,
+    });
+  }
 
   const rc: RoundContext = {
     change,
@@ -324,6 +403,10 @@ async function reviewPanel(
     untrusted,
     knownFindings: plan.knownFindings,
     scopeId,
+    allowDirty: base.mode.allowDirty,
+    persist: base.mode.persist,
+    fallbackFits: (original, fallback, spentUsd) =>
+      fallbackFits(env, { spend, panelUsd: budget.estimateUsd, estimate, original, fallback, spentUsd }),
   };
   if (sinceSha) rc.sinceSha = sinceSha;
 
@@ -381,16 +464,12 @@ async function reviewPanel(
     verdict.carried = rec.carried;
   }
 
-  // Every hunter produced nothing usable: an outage, reported as such before the (pending) verdict.
+  // Every hunter produced nothing usable: an outage, reported as an error event alongside the verdict.
   const allFailed = hunterRuns.length > 0 && hunterRuns.every((r) => r.output === null);
+  let outage: string | undefined;
   if (allFailed) {
     const list = hunterRuns.map((r) => `${r.seat.id} (${r.status}${r.error ? `: ${r.error}` : ""})`).join("; ");
-    await report(env, state, {
-      type: "error",
-      change,
-      error: safeText(env, `all ${hunterRuns.length} reviewer seats failed: ${list}`, 2_000),
-      round: plan.round,
-    });
+    outage = safeText(env, `all ${hunterRuns.length} reviewer seats failed: ${list}`, 2_000);
   }
 
   const tier3Rule =
@@ -401,13 +480,20 @@ async function reviewPanel(
   const pendingRule = agg.decision === "pending";
   const blockedAuthor = base.trust === "blocked" && agg.decision !== "pass";
   const shouldEscalate = !base.bypass && (tier3Rule || pendingRule || blockedAuthor);
-  const escalation = env.deps.escalation;
-  if (shouldEscalate && escalation) verdict.escalated = true;
+  const already = shouldEscalate ? priorEscalation(base) : undefined;
+  if (already) Object.assign(verdict, already);
+  const willRequest = shouldEscalate && base.mode.persist && env.deps.escalation !== undefined && !already;
 
-  const committed = await commit(env, state, verdict);
+  const commitOpts: CommitOptions = { persist: base.mode.persist };
+  if (outage) commitOpts.outage = outage;
+  let committed = await commit(env, state, verdict, commitOpts);
   let handle: EscalationHandle | undefined;
-  if (!committed.refused && shouldEscalate && escalation) {
-    handle = await escalate(env, state, committed.verdict, committed.digest);
+  if (!committed.refused && willRequest) {
+    const esc = await escalate(env, state, committed.verdict, base.mode);
+    if (esc) {
+      handle = esc.handle;
+      committed = { ...committed, verdict: esc.verdict, digest: esc.digest };
+    }
   }
   emitVerdictMetrics(env, base, committed.verdict, { escalated: handle !== undefined });
   return result(state, committed, handle);
@@ -502,6 +588,15 @@ async function budgetBlocked(
     ceiling: plan.binding.ceiling,
     tier: base.tier.level,
   });
+  if (base.mode.persist) {
+    const stored = await storeGet(env, verdict);
+    if (stored && stored.verdict.decision !== "pending") {
+      // A decided verdict for this SHA stays the signal; re-report it so the check leaves the pending state.
+      const storedDigest = renderDigest(stored.verdict, { policy: env.policy });
+      await report(env, state, { type: "verdict", change, verdict: stored.verdict, digest: storedDigest });
+      return { verdict: stored.verdict, digest: storedDigest, events: [...state.events], pendingReason: plan.message };
+    }
+  }
   return { verdict, digest, events: [...state.events] };
 }
 
@@ -516,31 +611,75 @@ interface Committed {
   contested?: boolean;
   /** True when the stored verdict was kept instead of the new one. */
   refused: boolean;
+  /** Why this run did not decide, when a decided stored verdict was kept instead. */
+  pendingReason?: string;
+}
+
+interface CommitOptions {
+  /** False: render and report only, never touch the store. */
+  persist: boolean;
+  /** Default true. False when the caller reports the outcome itself (escalated event). */
+  reportVerdict?: boolean;
+  /** An outage description, reported as an error event alongside the verdict. */
+  outage?: string;
 }
 
 function result(state: RunState, c: Committed, handle?: EscalationHandle): ReviewResult {
   const r: ReviewResult = { verdict: c.verdict, digest: c.digest, events: [...state.events] };
   if (handle) r.escalation = handle;
   if (c.contested) r.contested = true;
+  if (c.pendingReason) r.pendingReason = c.pendingReason;
   return r;
 }
 
+const keyOf = (v: VerdictKey): VerdictKey => ({ repo: v.repo, number: v.number, headSha: v.headSha });
+
+function storeGet(env: Env, key: VerdictKey): Promise<{ verdict: Verdict; version: string } | null> {
+  return guard(env, "internal", "verdict store read", () => env.deps.store.get(keyOf(key)), env.timeouts.storeMs);
+}
+
+function storePut(env: Env, v: Verdict, version: string | null): Promise<{ ok: boolean; version: string }> {
+  return guard(env, "internal", "verdict store write", () => env.deps.store.put(v, { version }), env.timeouts.storeMs);
+}
+
 /**
- * The no-downgrade guard plus compare-and-set. A version conflict re-reads once and re-checks the guard; a second
- * conflict is a GateError("store-conflict"). When the guard refuses, the stored verdict stays the signal and is
- * reported (with a CONTESTED digest when an unresolved block prevented a pass).
+ * The no-downgrade guards plus compare-and-set.
+ * - A machine `pending` (outage, too few valid seats) never replaces a decided verdict stored for the same SHA: the
+ *   stored verdict stays the signal, is re-reported, and the run's failure goes out as an error event.
+ * - `canAcceptVerdict` refusals keep the stored verdict too (CONTESTED digest when an unresolved block refused a pass).
+ * - A version conflict re-reads once and re-checks both guards; a second conflict is GateError("store-conflict").
+ * With `persist: false` the store is never touched: the verdict is rendered and reported only.
  */
-async function commit(
-  env: Env,
-  state: RunState,
-  verdict: Verdict,
-  opts: { reportVerdict?: boolean } = {},
-): Promise<Committed> {
+async function commit(env: Env, state: RunState, verdict: Verdict, opts: CommitOptions): Promise<Committed> {
   const change = state.change;
   if (!change) throw new GateError("internal", "no change in scope for this verdict");
-  const key: VerdictKey = { repo: verdict.repo, number: verdict.number, headSha: verdict.headSha };
+  const reportOutage = async (message: string): Promise<void> => {
+    await report(env, state, { type: "error", change, error: message, round: verdict.round });
+  };
+  if (!opts.persist) {
+    if (opts.outage) await reportOutage(opts.outage);
+    const digest = renderDigest(verdict, { policy: env.policy });
+    if (opts.reportVerdict !== false) await report(env, state, { type: "verdict", change, verdict, digest });
+    return { verdict, digest, refused: false };
+  }
   for (let i = 0; i < 2; i++) {
-    const stored = await guard(env, "internal", "verdict store read failed", () => env.deps.store.get(key));
+    const stored = await storeGet(env, verdict);
+    if (
+      stored &&
+      verdict.kind === "machine" &&
+      verdict.decision === "pending" &&
+      stored.verdict.decision !== "pending"
+    ) {
+      const why = opts.outage ?? verdict.reason ?? "this run could not reach a decision";
+      const kept = `${stored.verdict.decision.toUpperCase()} (${stored.verdict.kind}, round ${stored.verdict.round})`;
+      env.logger.warn("run ended pending; keeping the decided verdict stored for this SHA", { kept });
+      await reportOutage(
+        safeText(env, `${why}. The stored ${kept} verdict for ${short(verdict.headSha)} stands.`, 2_000),
+      );
+      const digest = renderDigest(stored.verdict, { policy: env.policy });
+      await report(env, state, { type: "verdict", change, verdict: stored.verdict, digest });
+      return { verdict: stored.verdict, digest, refused: true, pendingReason: why };
+    }
     const accept = canAcceptVerdict(stored?.verdict ?? null, verdict);
     if (!accept.ok && stored) {
       if (accept.contested) {
@@ -557,10 +696,9 @@ async function commit(
       await report(env, state, { type: "verdict", change, verdict: stored.verdict, digest });
       return { verdict: stored.verdict, digest, refused: true };
     }
-    const res = await guard(env, "internal", "verdict store write failed", () =>
-      env.deps.store.put(verdict, { version: stored?.version ?? null }),
-    );
+    const res = await storePut(env, verdict, stored?.version ?? null);
     if (res.ok) {
+      if (opts.outage) await reportOutage(opts.outage);
       const digest = renderDigest(verdict, { policy: env.policy });
       if (opts.reportVerdict !== false) await report(env, state, { type: "verdict", change, verdict, digest });
       return { verdict, digest, refused: false };
@@ -585,25 +723,49 @@ function contestedDigest(env: Env, signal: Verdict, incoming: Verdict, reason: s
   return { headline, markdown: md.join("\n"), text: text.join("\n") };
 }
 
+/**
+ * Request a human sign-off. Only after `request` succeeds is the verdict marked `escalated` with its handle, and the
+ * stored copy updated (CAS, only while it is still this verdict), so a re-run never escalates the same SHA twice.
+ * A failing or hanging request is logged and returns undefined.
+ */
 async function escalate(
   env: Env,
   state: RunState,
   verdict: Verdict,
-  digest: HumanDigest,
-): Promise<EscalationHandle | undefined> {
+  mode: Mode,
+): Promise<{ handle: EscalationHandle; verdict: Verdict; digest: HumanDigest } | undefined> {
   const escalation = env.deps.escalation;
   const change = state.change;
   if (!escalation || !change) return undefined;
   let handle: EscalationHandle;
   try {
-    handle = await escalation.request(verdict, digest);
+    const asked: Verdict = { ...verdict, escalated: true };
+    const askedDigest = renderDigest(asked, { policy: env.policy });
+    handle = await withTimeout(
+      Promise.resolve().then(() => escalation.request(asked, askedDigest)),
+      env.timeouts.escalationMs,
+      "escalation request",
+    );
   } catch (err: unknown) {
     env.logger.error("escalation request failed", { error: safeText(env, err) });
     emit(env, "merge_safely.escalation.failed", 1, "count", { tier: verdict.tier.level });
     return undefined;
   }
-  await report(env, state, { type: "escalated", change, verdict, digest, handle });
-  return handle;
+  const updated: Verdict = { ...verdict, escalated: true, escalation: handle };
+  if (mode.persist) {
+    try {
+      const stored = await storeGet(env, verdict);
+      if (stored && stored.verdict.createdAt === verdict.createdAt && stored.verdict.round === verdict.round) {
+        const res = await storePut(env, updated, stored.version);
+        if (!res.ok) env.logger.warn("could not record the escalation on the stored verdict (concurrent write)");
+      }
+    } catch (err: unknown) {
+      env.logger.error("could not record the escalation on the stored verdict", { error: safeText(env, err) });
+    }
+  }
+  const digest = renderDigest(updated, { policy: env.policy });
+  await report(env, state, { type: "escalated", change, verdict: updated, digest, handle });
+  return { handle, verdict: updated, digest };
 }
 
 function emitVerdictMetrics(
@@ -663,24 +825,34 @@ function isChange(target: ChangeRef | Change): target is Change {
 
 const fmtUsd = (n: number): string => `$${n.toFixed(2)}`;
 
+/**
+ * What review() would do, without any model call or report: the same tier, triage, round plan, seating, spend
+ * inputs, admission and downgrade ladder. When the target is a reference and a source exists, the real diff (the
+ * delta on diff-only rounds) sizes the estimate, as in review(); otherwise the change stats do.
+ */
 async function estimate(env: Env, target: ChangeRef | Change): Promise<Estimate> {
   const { policy } = env;
+  const source = env.deps.source;
   let raw: Change;
   if (isChange(target)) {
     raw = target;
   } else {
-    const source = requireSource(env, "estimate() of a change reference");
-    raw = await guard(env, "source", "could not load the change", () => source.getChange(target));
+    const s = requireSource(env, "estimate() of a change reference");
+    raw = await guard(env, "source", "could not load the change", () => s.getChange(target), env.timeouts.sourceMs);
   }
   const { change } = intake(raw, {}, policy);
   const t = tierOf(change, policy);
   const tri = triage(change, t, policy);
-  const prior = await guard(env, "internal", "verdict store unavailable", () =>
-    env.deps.store.listForChange(change.repo, change.number),
+  const prior = await guard(
+    env,
+    "internal",
+    "verdict store unavailable",
+    () => env.deps.store.listForChange(change.repo, change.number),
+    env.timeouts.storeMs,
   );
   const plan = planRound({ change, priorVerdicts: prior, policy });
   const autoPassed = tri.decision === "auto-pass" && !plan.knownFindings.some(serious);
-  let seats: Seat[] = [];
+  let seated: Seat[] = [];
   let secondJudgeRound = false;
   if (!plan.capReached && !autoPassed) {
     try {
@@ -692,25 +864,47 @@ async function estimate(env: Env, target: ChangeRef | Change): Promise<Estimate>
         catalog: (id) => catalogOf(env, id),
         normalise: env.normalise,
       });
-      seats = s.seats;
+      seated = s.seats;
       secondJudgeRound = s.secondJudgeRound;
     } catch (err: unknown) {
       if (err instanceof SeatingError) throw new GateError("seating", safeText(env, err), { fix: err.fix });
       throw new GateError("internal", safeText(env, err));
     }
   }
-  const estimator = seatEstimator(env, change, estimateDiffChars(change), secondJudgeRound);
+
+  let diffChars = estimateDiffChars(change);
+  if (!isChange(target) && source && seated.length > 0) {
+    const ref = target;
+    const opts =
+      plan.diffOnly && plan.sinceSha
+        ? { sinceSha: plan.sinceSha, headSha: change.headSha }
+        : { headSha: change.headSha };
+    try {
+      const diff = await withTimeout(
+        Promise.resolve().then(() => source.getDiff(ref, opts)),
+        env.timeouts.sourceMs,
+        "fetching the diff",
+      );
+      diffChars = redactDiff(diff, policy).length;
+    } catch (err: unknown) {
+      env.logger.warn("could not fetch the diff; estimating from change stats", { error: safeText(env, err) });
+    }
+  }
+  const estimator = seatEstimator(env, change, diffChars, secondJudgeRound);
+  const spend = await spendInputs(env, change, scopeIdFor(env, change), prior);
+
+  let seats = seated;
+  let ceilings: Estimate["ceilings"];
+  let budget: BudgetPlan | undefined;
+  if (seated.length > 0) {
+    budget = planBudget(env, { seats: seated, tier: t, spend, estimate: estimator });
+    if (budget.ok) seats = budget.seats;
+    ceilings = budget.results;
+  } else {
+    ceilings = evaluateCeilings({ policy, ...spend, advisory: env.deps.advisoryCeilings ?? [], seatEstimates: [] });
+  }
   const est = estimatePanel(seats, estimator);
-  const spend = await spendInputs(env, change, scopeIdFor(env, change));
-  const ceilings = evaluateCeilings({
-    policy,
-    ...spend,
-    advisory: env.deps.advisoryCeilings ?? [],
-    seatEstimates: seats.map((s) => {
-      const usd = estimator(s);
-      return usd === undefined ? { seatId: s.id } : { seatId: s.id, usd };
-    }),
-  });
+  const unknownSeats = [...new Set([...est.unknownSeats, ...overContextSeats(env, seats, diffChars)])];
 
   const lines: string[] = [
     `Change ${change.repo.owner}/${change.repo.name}#${change.number} @ ${short(change.headSha)}: tier ${t.level} (score ${t.score})`,
@@ -727,13 +921,17 @@ async function estimate(env: Env, target: ChangeRef | Change): Promise<Estimate>
     lines.push(describeSeating(seats, estimator));
     if (secondJudgeRound) lines.push("Second judge round on split votes is enabled (included in the judge estimates).");
   }
-  const unpriced = est.unknownSeats.length > 0 ? ` (unpriced: ${est.unknownSeats.join(", ")})` : "";
-  lines.push(
-    `Estimated cost: ${est.usd !== undefined ? fmtUsd(est.usd) : "unknown"} for ${seats.length} seat${seats.length === 1 ? "" : "s"}${unpriced}`,
-  );
-  for (const c of ceilings.filter((r) => r.breached)) {
-    lines.push(`${c.advisory ? "Advisory: " : "Over budget: "}${ceilingMessage(c, policy)}`);
+  for (const d of budget?.downgrades ?? []) {
+    if (d.step !== "block")
+      lines.push(`Downgrade: ${d.step}${d.from || d.to ? ` (${d.from ?? "?"} → ${d.to ?? "?"})` : ""}`);
   }
+  const unreliable = unknownSeats.length > 0 ? ` (estimate unreliable for: ${unknownSeats.join(", ")})` : "";
+  lines.push(
+    `Estimated cost: ${est.usd !== undefined ? fmtUsd(est.usd) : "unknown"} for ${seats.length} seat${seats.length === 1 ? "" : "s"}${unreliable}`,
+  );
+  if (budget && !budget.ok) lines.push(`Budget: review would be refused. ${budget.message}`);
+  for (const c of ceilings.filter((r) => r.breached && r.advisory))
+    lines.push(`Advisory: ${ceilingMessage(c, policy)}`);
 
   const out: Estimate = {
     change,
@@ -741,13 +939,15 @@ async function estimate(env: Env, target: ChangeRef | Change): Promise<Estimate>
     triage: tri,
     seats,
     secondJudgeRound,
-    unknownSeats: est.unknownSeats,
+    unknownSeats,
     ceilings,
     round: plan.round,
     diffOnly: plan.diffOnly,
     summary: lines.join("\n"),
   };
   if (est.usd !== undefined) out.estimateUsd = est.usd;
+  if (budget && budget.downgrades.length > 0) out.downgrades = budget.downgrades;
+  if (budget && !budget.ok) out.budgetBlocked = { ceiling: budget.binding.ceiling, message: budget.message };
   return out;
 }
 
@@ -756,12 +956,20 @@ async function explain(
   ref: ChangeRef,
 ): Promise<{ verdict: Verdict | null; digest: HumanDigest | null; history: Verdict[] }> {
   const source = requireSource(env, "explain()");
-  const change = await guard(env, "source", "could not load the change", () => source.getChange(ref));
-  const stored = await guard(env, "internal", "verdict store read failed", () =>
-    env.deps.store.get({ repo: change.repo, number: change.number, headSha: change.headSha }),
+  const change = await guard(
+    env,
+    "source",
+    "could not load the change",
+    () => source.getChange(ref),
+    env.timeouts.sourceMs,
   );
-  const history = await guard(env, "internal", "verdict store read failed", () =>
-    env.deps.store.listForChange(change.repo, change.number),
+  const stored = await storeGet(env, { repo: change.repo, number: change.number, headSha: change.headSha });
+  const history = await guard(
+    env,
+    "internal",
+    "verdict store read failed",
+    () => env.deps.store.listForChange(change.repo, change.number),
+    env.timeouts.storeMs,
   );
   const verdict = stored?.verdict ?? null;
   return { verdict, digest: verdict ? renderDigest(verdict, { policy: env.policy }) : null, history };
@@ -778,8 +986,12 @@ async function recordHumanVerdict(env: Env, input: HumanVerdictInput): Promise<V
   const state = new RunState();
   const { ref, headSha } = input;
   try {
-    const history = await guard(env, "internal", "verdict store unavailable", () =>
-      env.deps.store.listForChange(ref.repo, ref.number),
+    const history = await guard(
+      env,
+      "internal",
+      "verdict store unavailable",
+      () => env.deps.store.listForChange(ref.repo, ref.number),
+      env.timeouts.storeMs,
     );
     const machine = history
       .filter((v) => v.kind === "machine" && v.headSha === headSha)
@@ -790,7 +1002,11 @@ async function recordHumanVerdict(env: Env, input: HumanVerdictInput): Promise<V
     const source = env.deps.source;
     if (source) {
       try {
-        change = await source.getChange(ref);
+        change = await withTimeout(
+          Promise.resolve().then(() => source.getChange(ref)),
+          env.timeouts.sourceMs,
+          "loading the change",
+        );
       } catch (err: unknown) {
         env.logger.warn("could not load the change for the human verdict report", { error: safeText(env, err) });
       }
@@ -816,7 +1032,7 @@ async function recordHumanVerdict(env: Env, input: HumanVerdictInput): Promise<V
       policyHash: env.policyHash,
       producedBy: env.producedBy,
     };
-    const committed = await commit(env, state, verdict);
+    const committed = await commit(env, state, verdict, { persist: true });
     emit(env, "merge_safely.human_verdict", 1, "count", { decision: input.decision, tier: verdict.tier.level });
     return committed.verdict;
   } catch (err: unknown) {
