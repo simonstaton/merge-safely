@@ -89,10 +89,45 @@ describe("planRound", () => {
   });
 
   it("reports the cap and respects diffOnlyAfterRound", () => {
-    const priors = [reviewed({ round: 3, headSha: "c2" })];
+    const priors = [
+      reviewed({ round: 1, headSha: "c0" }),
+      reviewed({ round: 2, headSha: "c1" }),
+      reviewed({ round: 3, headSha: "c2" }),
+    ];
     expect(planRound({ change, priorVerdicts: priors, policy }).capReached).toBe(true);
     const late = makePolicy({ rounds: { diffOnlyAfterRound: 5 } });
     expect(planRound({ change, priorVerdicts: priors, policy: late })).toMatchObject({ round: 4, diffOnly: false });
+  });
+
+  it("does not let outages consume the round cap", () => {
+    const outage = (round: number, headSha: string) =>
+      makeVerdict({ round, headSha, decision: "pending", seats: [makeRun({ status: "error", output: null })] });
+    const history = [
+      outage(1, "s1"),
+      outage(2, "s2"),
+      reviewed({ round: 3, headSha: "s3", decision: "block" }),
+      reviewed({ round: 4, headSha: "s4", decision: "block" }),
+      reviewed({ round: 5, headSha: "s5", decision: "block" }),
+    ];
+    const capAfter = (n: number) => planRound({ change, priorVerdicts: history.slice(0, n), policy });
+    expect([1, 2, 3, 4].map((n) => capAfter(n).capReached)).toEqual([false, false, false, false]);
+    const third = capAfter(5);
+    expect(third).toMatchObject({ round: 6, capReached: true });
+  });
+
+  it("counts reviewed re-runs of the same commit once, and ignores triaged and contested verdicts", () => {
+    const history = [
+      reviewed({ round: 1, headSha: "s1" }),
+      reviewed({ round: 2, headSha: "s1" }),
+      reviewed({ round: 3, headSha: "s1" }),
+      makeVerdict({ round: 4, headSha: "s2", triaged: true }),
+      reviewed({ round: 5, headSha: "s3", contested: true }),
+      reviewed({ round: 6, headSha: "s4" }),
+    ];
+    const plan = planRound({ change, priorVerdicts: history, policy });
+    expect(plan).toMatchObject({ round: 7, capReached: false });
+    const plan2 = planRound({ change, priorVerdicts: [...history, reviewed({ round: 7, headSha: "s5" })], policy });
+    expect(plan2.capReached).toBe(true);
   });
 
   it("uses the full diff when re-running on the same head", () => {

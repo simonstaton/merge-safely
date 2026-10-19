@@ -10,7 +10,10 @@ export interface RoundPlan {
   /** The last reviewed SHA to diff from, when this round reviews only the delta. */
   sinceSha?: string;
   diffOnly: boolean;
-  /** True when this round exceeds policy.rounds.max; the orchestrator escalates instead of reviewing. */
+  /**
+   * True when policy.rounds.max reviewed rounds have already happened (counting only verdicts that
+   * `reviewedCode`, once per headSha); the orchestrator escalates instead of reviewing.
+   */
   capReached: boolean;
 }
 
@@ -60,7 +63,9 @@ export function openFindings(verdicts: Verdict[]): Finding[] {
 /**
  * Plan the next round from prior verdicts for the same change (any SHA; verdicts for other changes are
  * ignored).
- * - round = max prior machine round + 1.
+ * - round = max prior machine round + 1 (every machine verdict counts, including outages).
+ * - capReached once policy.rounds.max distinct commits have a verdict that `reviewedCode`; pending,
+ *   triaged and contested verdicts, and repeat reviews of the same headSha, do not consume the cap.
  * - knownFindings = every finding still open across all prior verdicts (see `openFindings`), so a
  *   blocker raised in round 1 and never addressed is still known in round 3.
  * - The round is diff-only (since the latest machine verdict's headSha) once
@@ -73,7 +78,10 @@ export function planRound(input: { change: Change; priorVerdicts: Verdict[]; pol
   const machine = relevant.filter((v) => v.kind === "machine").sort(byRoundThenTime);
   const last = machine[machine.length - 1];
   const round = last ? last.round + 1 : 1;
-  const capReached = round > policy.rounds.max;
+  // The cap counts real reviews only: outages (pending), triage and contested rounds never consume it,
+  // and re-running the same commit counts once per headSha.
+  const reviewedShas = new Set(machine.filter(reviewedCode).map((v) => v.headSha));
+  const capReached = reviewedShas.size >= policy.rounds.max;
   const knownFindings = openFindings(relevant);
   if (last && round > policy.rounds.diffOnlyAfterRound && last.headSha !== change.headSha && reviewedCode(last)) {
     return { round, knownFindings, sinceSha: last.headSha, diffOnly: true, capReached };
