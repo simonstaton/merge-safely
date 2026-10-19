@@ -132,7 +132,24 @@ On a `merge_group` run, the Action makes no model calls and does not need `conne
 
 The PR's code was reviewed on its head, so the queue commit is not reviewed again. See [packages/action/README.md](../packages/action/README.md#merge-queue).
 
-The GitHub App does not handle `merge_group` yet. With the App, either run the Action workflow for `merge_group` only (it needs `checks: write` and no model keys), or make the merge queue's required checks your CI checks only and require `merge-safely/verdict` on the PR through the ruleset.
+The GitHub App does not handle `merge_group` yet. With the App you have two options:
+
+- **Run the Action for `merge_group` only.** It needs `checks: write` and no model keys. Set `verdict-app-slugs` to your App's slug, so that the verdicts the App wrote on PR heads count:
+
+  ```yaml
+  on: { merge_group: { types: [checks_requested] } }
+  permissions: { checks: write, pull-requests: read, contents: read }
+  jobs:
+    merge-queue:
+      runs-on: ubuntu-latest
+      steps:
+        - uses: simonstaton/merge-safely@v0
+          with:
+            verdict-app-slugs: merge-safely   # the installed App's slug
+  ```
+
+  Without `verdict-app-slugs`, only check runs written by `github-actions` count, so no App verdict is found and every queue entry fails.
+- **Leave Merge Safely out of the queue.** Make the merge queue's required checks your CI checks only, and require `merge-safely/verdict` on the PR through the ruleset.
 
 ## Reading the verdict JSON
 

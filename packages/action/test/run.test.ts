@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import { run } from "../src/run.js";
 import { digest, fixture, HEAD, harness, pullData, result, verdict } from "./helpers.js";
 
+const NEWER = "9".repeat(40);
+
 const KEY = "sk-ant-api03-supersecretvalue1234";
 
 function ownCheckRun(id: number, headSha = HEAD): CheckRunData {
@@ -41,6 +43,8 @@ describe("run: pull_request review", () => {
     expect(setup?.connections.map((c) => c.id)).toEqual(["anthropic-main"]);
     expect(setup?.concurrency).toBe(3);
     expect(setup?.validateConnections).toBe(true);
+    expect(setup?.advisoryCeilings).toEqual(["window", "all-time", "monthly"]);
+    expect(setup?.producedBy).toBe("merge-safely-action@0.1.0");
     expect(setup?.paths.home).toBe("/runner/tmp/merge-safely");
     expect(h.factory.gate.calls).toEqual([
       {
@@ -235,9 +239,9 @@ describe("run: other review events", () => {
     expect(h.factory.gate.calls[0]?.opts).toMatchObject({ headSha: "9".repeat(40) });
     expect(h.factory.setups[0]?.policy.policy.budget.perChangeUsd).toBe(7);
 
-    const h2 = harness("workflow_dispatch", "workflow_dispatch", { "pr-number": "7", "head-sha": "8".repeat(40) });
+    const h2 = harness("workflow_dispatch", "workflow_dispatch", { "pr-number": "7", "head-sha": HEAD });
     await run(h2.deps);
-    expect(h2.factory.gate.calls[0]?.opts).toMatchObject({ headSha: "8".repeat(40) });
+    expect(h2.factory.gate.calls[0]?.opts).toMatchObject({ headSha: HEAD });
   });
 
   it("check_run rerequested re-reviews that head", async () => {
@@ -260,5 +264,119 @@ describe("run: other review events", () => {
     await run(h.deps);
     expect(h.factory.setups[0]?.slackWebhook).toBe(url);
     expect(h.core.secrets).toContain(url);
+  });
+});
+
+describe("run: head moved", () => {
+  it("a superseded pull_request run stands down: skipped, notice, exit 0, no review", async () => {
+    const h = harness("pull_request", "pull_request.synchronize", {}, { pull: pullData({ headSha: NEWER }) });
+    expect(await run(h.deps)).toBe(0);
+    expect(h.core.outputs.decision).toBe("skipped");
+    expect(h.core.failed).toEqual([]);
+    expect(h.core.logs.find((l) => l.level === "notice")?.msg).toMatch(`superseded by ${NEWER}`);
+    expect(h.factory.setups).toHaveLength(0);
+  });
+
+  it("a push landing mid-review (gate head-moved) also stands down", async () => {
+    const h = harness("pull_request", "pull_request.synchronize");
+    h.factory.gate.reviewError = Object.assign(new Error("head moved"), { name: "GateError", code: "head-moved" });
+    h.factory.gate.during = async () => {
+      h.gh.pull = pullData({ headSha: NEWER });
+    };
+    expect(await run(h.deps)).toBe(0);
+    expect(h.core.outputs.decision).toBe("skipped");
+    expect(h.core.logs.find((l) => l.level === "notice")?.msg).toMatch(`superseded by ${NEWER}`);
+  });
+
+  it("workflow_dispatch with an explicit head-sha that is not the head fails with the explanation", async () => {
+    const h = harness("workflow_dispatch", "workflow_dispatch", { "pr-number": "7", "head-sha": "8".repeat(40) });
+    expect(await run(h.deps)).toBe(2);
+    expect(h.core.failed[0]).toMatch(/^error \[HEAD_MOVED\]: head-sha 8{40} is not the head of PR #7 \(now 1{40}\)/);
+    expect(h.core.outputs.decision).toBe("error");
+    expect(h.factory.setups).toHaveLength(0);
+  });
+});
+
+describe("run: check_run re-runs", () => {
+  it("ignores a re-run of a check from a foreign app", async () => {
+    const p = fixture("check_run.rerequested");
+    (p.check_run as { app: { slug: string } }).app.slug = "some-ci";
+    const h = harness("check_run", p);
+    expect(await run(h.deps)).toBe(0);
+    expect(h.core.outputs.decision).toBe("skipped");
+    expect(h.core.logs.find((l) => l.level === "notice")?.msg).toMatch(/from some-ci, not a trusted app/);
+    expect(h.factory.setups).toHaveLength(0);
+  });
+
+  it("ignores a check whose name is not the policy's reporting.checkName", async () => {
+    const h = harness("check_run", "check_run.rerequested");
+    h.gh.files["main:.merge-safely.yml"] = 'reporting: { checkName: "gate/ai" }\n';
+    expect(await run(h.deps)).toBe(0);
+    expect(h.core.outputs.decision).toBe("skipped");
+    expect(h.factory.setups).toHaveLength(0);
+  });
+
+  it("re-reviews when the custom check name matches and the app is trusted via verdict-app-slugs", async () => {
+    const p = fixture("check_run.rerequested");
+    Object.assign(p.check_run as object, { name: "gate/ai", app: { id: 9, slug: "merge-safely" } });
+    const h = harness("check_run", p, { "verdict-app-slugs": "merge-safely" });
+    h.gh.files["main:.merge-safely.yml"] = 'reporting: { checkName: "gate/ai" }\n';
+    expect(await run(h.deps)).toBe(0);
+    expect(h.factory.gate.calls).toHaveLength(1);
+  });
+});
+
+describe("run: budgets, cancellation, failures", () => {
+  it("warns once when an installation-wide ceiling is configured", async () => {
+    const h = harness("pull_request", "pull_request.synchronize");
+    h.gh.files["main:.merge-safely.yml"] = "budget: { windowUsd: 50, spendLimitUsd: 500 }\n";
+    await run(h.deps);
+    const w = h.core.logs.filter((l) => l.level === "warning" && /not enforceable in the Action/.test(l.msg));
+    expect(w).toHaveLength(1);
+    expect(w[0]?.msg).toMatch(
+      /budget.windowUsd, budget.spendLimitUsd are not enforceable in the Action: spend across jobs is not visible/,
+    );
+    expect(w[0]?.msg).toMatch(/use the App/);
+  });
+
+  it("no ceiling warning with the defaults", async () => {
+    const h = harness("pull_request", "pull_request.synchronize");
+    await run(h.deps);
+    expect(h.core.logs.some((l) => /not enforceable/.test(l.msg))).toBe(false);
+  });
+
+  it("cancellation aborts the gate so the pending check run is closed out", async () => {
+    const h = harness("pull_request", "pull_request.synchronize");
+    let cancel: (() => Promise<void>) | undefined;
+    h.deps.onCancel = (fn) => {
+      cancel = fn;
+    };
+    h.factory.gate.during = async () => {
+      await cancel?.();
+    };
+    await run(h.deps);
+    expect(h.factory.gate.aborted).toEqual(["the workflow run was cancelled"]);
+  });
+
+  it("thrown failures set decision=error", async () => {
+    const h = harness("pull_request", "pull_request.synchronize");
+    h.deps.gateFactory = async () => {
+      throw new Error("boom");
+    };
+    expect(await run(h.deps)).toBe(2);
+    expect(h.core.outputs.decision).toBe("error");
+  });
+
+  it("scrubs step outputs (model-written finding titles) like the summary", async () => {
+    const h = harness("pull_request", "pull_request.synchronize");
+    h.factory.gate.reviewResult = result("block", {
+      verdict: verdict({
+        decision: "block",
+        findings: [{ id: "f1", severity: "blocker", class: "leak", title: `key ${KEY} in logs`, detail: "" }],
+      }),
+    });
+    await run(h.deps);
+    expect(h.core.outputs["verdict-json"]).toContain("f1");
+    expect(h.core.outputs["verdict-json"]).not.toContain(KEY);
   });
 });

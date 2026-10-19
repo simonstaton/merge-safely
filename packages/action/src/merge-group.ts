@@ -140,3 +140,28 @@ export async function runMergeGroup(o: MergeGroupRunOptions): Promise<MergeGroup
   o.logger.info(`merge queue: ${name} ${result.ok ? "success" : "failure"} on ${o.headSha}`);
   return { ...result, checkRunId: data.id };
 }
+
+/**
+ * Read-only view over several check-run stores, one per trusted app slug (for example the GitHub App that reviews
+ * PRs plus `github-actions`). `get` returns the newest verdict any of them holds for the key.
+ */
+export function anyOfStores(stores: VerdictStore[]): VerdictStore {
+  return {
+    async get(key) {
+      let best: { verdict: Verdict; version: string } | null = null;
+      for (const s of stores) {
+        const hit = await s.get(key);
+        if (hit && (!best || hit.verdict.createdAt > best.verdict.createdAt)) best = hit;
+      }
+      return best;
+    },
+    async put() {
+      throw new Error("read-only verdict view");
+    },
+    async listForChange(repo, number) {
+      const all: Verdict[] = [];
+      for (const s of stores) all.push(...(await s.listForChange(repo, number)));
+      return all;
+    },
+  };
+}

@@ -30225,7 +30225,7 @@ var require_public_api = __commonJS({
         return docs;
       return Object.assign([], { empty: true }, composer$1.streamInfo());
     }
-    function parseDocument(source, options = {}) {
+    function parseDocument2(source, options = {}) {
       const { lineCounter: lineCounter2, prettyErrors } = parseOptions(options);
       const parser$1 = new parser.Parser(lineCounter2?.addNewLine);
       const composer$1 = new composer.Composer(options);
@@ -30251,7 +30251,7 @@ var require_public_api = __commonJS({
       } else if (options === void 0 && reviver && typeof reviver === "object") {
         options = reviver;
       }
-      const doc = parseDocument(src, options);
+      const doc = parseDocument2(src, options);
       if (!doc)
         return null;
       doc.warnings.forEach((warning2) => log.warn(doc.options.logLevel, warning2));
@@ -30287,7 +30287,7 @@ var require_public_api = __commonJS({
     }
     exports2.parse = parse2;
     exports2.parseAllDocuments = parseAllDocuments;
-    exports2.parseDocument = parseDocument;
+    exports2.parseDocument = parseDocument2;
     exports2.stringify = stringify2;
   }
 });
@@ -102477,10 +102477,10 @@ async function buildGateDeps(setup, registry, overrides = {}) {
     pricing: registryPricing(),
     installationId,
     // The CLI cannot see installation-wide monthly spend across machines; report it, never block on it.
-    advisoryCeilings: ["monthly"],
+    advisoryCeilings: setup.advisoryCeilings ?? ["monthly"],
     concurrency: setup.concurrency ?? DEFAULT_CONCURRENCY2,
     logger,
-    producedBy: `merge-safely-cli@${CLI_VERSION}`
+    producedBy: setup.producedBy ?? `merge-safely-cli@${CLI_VERSION}`
   };
   return { deps: deps2, reporters, abort };
 }
@@ -102650,6 +102650,7 @@ var EXAMPLE = `connections: |
 var CONNECTIONS_REQUIRED = `connections input is required. Add it to the step's with: block, for example
 ${EXAMPLE}
 See ${CONNECTIONS_DOCS}#the-actions-connections-input`;
+var YAML_FIX = `Quote values that come from secrets, e.g. apiKey: "${ghExpr("secrets.ANTHROPIC_API_KEY")}", and use no YAML tags. See ${CONNECTIONS_DOCS}#the-actions-connections-input`;
 var SECRET_KEY = /(api[-_]?key|token|secret|password|authorization|credential)/i;
 function isRecord3(x2) {
   return typeof x2 === "object" && x2 !== null && !Array.isArray(x2);
@@ -102679,6 +102680,23 @@ function yamlLine(err) {
   }
   return "";
 }
+function parseConnectionsYaml(text) {
+  let doc;
+  try {
+    doc = (0, import_yaml5.parseDocument)(text, { logLevel: "silent", uniqueKeys: true });
+  } catch (_err) {
+    throw actionError("CONNECTIONS_INVALID", `connections input is not valid YAML. ${YAML_FIX}`);
+  }
+  const problem = doc.errors[0] ?? doc.warnings[0];
+  if (problem) {
+    throw actionError("CONNECTIONS_INVALID", `connections input is not valid YAML${yamlLine(problem)}. ${YAML_FIX}`);
+  }
+  try {
+    return doc.toJS();
+  } catch (_err) {
+    throw actionError("CONNECTIONS_INVALID", `connections input is not valid YAML. ${YAML_FIX}`);
+  }
+}
 function hints(errors) {
   const out = [];
   const joined = errors.join("\n").toLowerCase();
@@ -102696,15 +102714,7 @@ function hints(errors) {
 }
 function parseConnections(text, env, mask, secrets) {
   if (text.trim() === "") throw actionError("INPUT", CONNECTIONS_REQUIRED);
-  let obj2;
-  try {
-    obj2 = (0, import_yaml5.parse)(text);
-  } catch (err) {
-    throw actionError(
-      "CONNECTIONS_INVALID",
-      `connections input is not valid YAML${yamlLine(err)}. Quote values that come from secrets, e.g. apiKey: "\${{ secrets.ANTHROPIC_API_KEY }}". See ${CONNECTIONS_DOCS}#the-actions-connections-input`
-    );
-  }
+  const obj2 = parseConnectionsYaml(text);
   const record = (s2) => {
     if (s2.trim() === "") return;
     mask(s2);
@@ -102843,20 +102853,24 @@ with: { pr-number: ${ghExpr("inputs.pr")} }`
       }
       return { kind: "review", event: name, ref: { repo: repoOf(payload, env), number: inputs.prNumber } };
     }
-    case "check_run":
-    case "check_suite": {
-      const hit = changeRefFromEvent(name, payload);
+    case "check_suite":
+      return { kind: "skip", message: "check_suite events are ignored; re-run with workflow_dispatch and pr-number" };
+    case "check_run": {
+      const hit = changeRefFromEvent(name, payload, { checkNamePrefix: "" });
+      const cr = isRecord4(payload.check_run) ? payload.check_run : {};
       if (!hit) {
         return {
           kind: "skip",
-          message: `${name}.${str4(payload.action) ?? "?"} is not a re-run of a merge-safely check on a same-repository PR; nothing to do (fork PRs: re-run with workflow_dispatch and pr-number)`
+          message: `check_run.${str4(payload.action) ?? "?"} is not a re-run of a check on a same-repository PR; nothing to do (fork PRs: re-run with workflow_dispatch and pr-number)`
         };
       }
+      const appSlug = isRecord4(cr.app) ? str4(cr.app.slug) : void 0;
       return {
         kind: "review",
         event: name,
         ref: hit.ref,
-        ...hit.headSha ? { headSha: hit.headSha } : {}
+        ...hit.headSha ? { headSha: hit.headSha } : {},
+        checkRun: { name: str4(cr.name) ?? "", ...appSlug ? { appSlug: appSlug.toLowerCase() } : {} }
       };
     }
     case "merge_group": {
@@ -102886,6 +102900,21 @@ with: { pr-number: ${ghExpr("inputs.pr")} }`
 init_import_meta_url();
 var import_node_path17 = require("node:path");
 var DEFAULT_CONCURRENCY3 = 2;
+var DEFAULT_VERDICT_APP_SLUGS = ["github-actions"];
+function parseSlugs(raw) {
+  const v = raw.trim();
+  if (v === "") return [...DEFAULT_VERDICT_APP_SLUGS];
+  const out = [];
+  for (const part3 of v.split(/[,\s]+/)) {
+    const s2 = part3.trim().toLowerCase();
+    if (s2 === "") continue;
+    if (!/^[a-z0-9][a-z0-9-]{0,99}$/.test(s2)) {
+      throw actionError("INPUT", `verdict-app-slugs: "${part3}" is not a GitHub App slug (letters, digits, dashes)`);
+    }
+    if (!out.includes(s2)) out.push(s2);
+  }
+  return out.length ? out : [...DEFAULT_VERDICT_APP_SLUGS];
+}
 var MAX_CONCURRENCY = 16;
 var STORES = ["checkrun"];
 function bool(name, raw, dflt) {
@@ -102925,7 +102954,7 @@ function readInputs(getInput2) {
   }
   const headSha = getInput2("head-sha").trim();
   if (headSha !== "" && !/^[0-9a-f]{40}([0-9a-f]{24})?$/i.test(headSha)) {
-    throw actionError("INPUT", "head-sha must be a full commit SHA (40 hex characters)");
+    throw actionError("INPUT", "head-sha must be a full commit SHA (40 or 64 hex characters)");
   }
   const prNumber = int("pr-number", getInput2("pr-number"), 1, Number.MAX_SAFE_INTEGER);
   const slackWebhook = getInput2("slack-webhook").trim();
@@ -102939,7 +102968,8 @@ function readInputs(getInput2) {
     ...slackWebhook ? { slackWebhook } : {},
     concurrency: int("concurrency", getInput2("concurrency"), 1, MAX_CONCURRENCY) ?? DEFAULT_CONCURRENCY3,
     ...prNumber !== void 0 ? { prNumber } : {},
-    ...headSha ? { headSha: headSha.toLowerCase() } : {}
+    ...headSha ? { headSha: headSha.toLowerCase() } : {},
+    verdictAppSlugs: parseSlugs(getInput2("verdict-app-slugs"))
   };
 }
 
@@ -103019,6 +103049,26 @@ async function runMergeGroup(o) {
   });
   o.logger.info(`merge queue: ${name} ${result3.ok ? "success" : "failure"} on ${o.headSha}`);
   return { ...result3, checkRunId: data.id };
+}
+function anyOfStores(stores) {
+  return {
+    async get(key) {
+      let best = null;
+      for (const s2 of stores) {
+        const hit = await s2.get(key);
+        if (hit && (!best || hit.verdict.createdAt > best.verdict.createdAt)) best = hit;
+      }
+      return best;
+    },
+    async put() {
+      throw new Error("read-only verdict view");
+    },
+    async listForChange(repo, number) {
+      const all = [];
+      for (const s2 of stores) all.push(...await s2.listForChange(repo, number));
+      return all;
+    }
+  };
 }
 
 // src/outputs.ts
@@ -103133,6 +103183,10 @@ function hardenForFork(p, fork, warn) {
   return { policy, hash: policyHash(policy), source: `${p.source} (allowedCommands disabled: fork PR)` };
 }
 
+// src/version.ts
+init_import_meta_url();
+var ACTION_VERSION = "0.1.0";
+
 // src/run.ts
 function isRecord5(x2) {
   return typeof x2 === "object" && x2 !== null && !Array.isArray(x2);
@@ -103156,8 +103210,31 @@ function actionLogger(core2, secrets) {
     error: (m2, meta) => core2.error(fmt(m2, meta))
   };
 }
-function setOutputs(core2, outputs) {
-  for (const [k, v] of Object.entries(outputs)) core2.setOutput(k, v ?? "");
+function setOutputs(core2, outputs, secrets) {
+  for (const [k, v] of Object.entries(outputs)) core2.setOutput(k, v ? secrets.scrub(v) : "");
+}
+async function trustedSlugs(octokit, configured, logger) {
+  let own;
+  try {
+    own = (await resolveIdentity(octokit, {}, logger)).appSlug.toLowerCase();
+  } catch (_err) {
+    own = void 0;
+  }
+  return [.../* @__PURE__ */ new Set([...configured, ...own ? [own] : []])];
+}
+var ACTION_ADVISORY_CEILINGS = ["window", "all-time", "monthly"];
+function advisoryCeilingWarning(policy) {
+  const b = policy.budget;
+  const set = [
+    b.windowUsd !== null ? "budget.windowUsd" : void 0,
+    b.spendLimitUsd !== null ? "budget.spendLimitUsd" : void 0,
+    b.perInstallationMonthlyUsd !== null ? "budget.perInstallationMonthlyUsd" : void 0
+  ].filter((x2) => x2 !== void 0);
+  if (set.length === 0) return void 0;
+  return `${set.join(", ")} ${set.length === 1 ? "is" : "are"} not enforceable in the Action: spend across jobs is not visible to a single job, so these ceilings are reported as advisory only; use the App for enforced installation-wide budgets. budget.perSeatUsd and budget.perChangeUsd are enforced.`;
+}
+function isHeadMoved(err) {
+  return isRecord5(err) && err.code === "head-moved";
 }
 async function readEvent(deps2) {
   const path4 = deps2.env.GITHUB_EVENT_PATH;
@@ -103244,6 +103321,11 @@ function conclude(core2, r2, inputs) {
       return exitFor(r2.outcome);
   }
 }
+function standDown(core2, secrets, liveHead, pinned) {
+  core2.notice(`Merge Safely: ${pinned.slice(0, 7)} was superseded by ${liveHead}; that push gets its own review`);
+  setOutputs(core2, { decision: "skipped" }, secrets);
+  return EXIT.pass;
+}
 async function main(deps2, secrets, logger) {
   const { core: core2, env } = deps2;
   const inputs = readInputs(core2.getInput);
@@ -103262,7 +103344,7 @@ async function main(deps2, secrets, logger) {
   const trigger = resolveTrigger(eventName, payload, inputs, env);
   if (trigger.kind === "skip") {
     core2.notice(`Merge Safely: ${trigger.message}`);
-    setOutputs(core2, { decision: "skipped" });
+    setOutputs(core2, { decision: "skipped" }, secrets);
     return EXIT.pass;
   }
   if (!inputs.githubToken) {
@@ -103287,11 +103369,9 @@ async function main(deps2, secrets, logger) {
       sources,
       ...policyLog
     });
-    const store = (deps2.verdictStore ?? ((octokit, p, l) => checkRunStore({ octokit, policy: p, logger: l })))(
-      gh.octokit,
-      policy2.policy,
-      logger
-    );
+    const slugs = await trustedSlugs(gh.octokit, inputs.verdictAppSlugs, logger);
+    core2.info(`merge queue: verdicts from ${slugs.join(", ")} count`);
+    const store = (deps2.verdictStore ?? ((octokit, p, l, appSlugs) => anyOfStores(appSlugs.map((appSlug) => checkRunStore({ octokit, policy: p, logger: l, appSlug })))))(gh.octokit, policy2.policy, logger, slugs);
     const detailsUrl = workflowRunUrl(env);
     const r2 = await github(
       "merge queue check",
@@ -103308,11 +103388,15 @@ async function main(deps2, secrets, logger) {
       })
     );
     const checkUrl2 = r2.checkRunId !== void 0 ? `${serverUrl(env, trigger.repo)}/${trigger.repo.owner}/${trigger.repo.name}/runs/${r2.checkRunId}` : "";
-    setOutputs(core2, {
-      decision: r2.ok ? "pass" : "block",
-      "check-url": checkUrl2,
-      "verdict-json": JSON.stringify({ mergeGroup: trigger.headSha, ok: r2.ok, prs: r2.entries })
-    });
+    setOutputs(
+      core2,
+      {
+        decision: r2.ok ? "pass" : "block",
+        "check-url": checkUrl2,
+        "verdict-json": JSON.stringify({ mergeGroup: trigger.headSha, ok: r2.ok, prs: r2.entries })
+      },
+      secrets
+    );
     await core2.writeSummary(`## ${r2.title}
 
 ${r2.summary}
@@ -103334,7 +103418,17 @@ ${r2.summary}
   if (fork && trigger.event === "pull_request") {
     throw actionError("FORK_PULL_REQUEST", "this pull request comes from a fork; see pull_request_target in the docs");
   }
-  const headSha = inputs.headSha ?? trigger.headSha ?? pull.head.sha;
+  const pinned = inputs.headSha ?? trigger.headSha;
+  if (pinned && pinned.toLowerCase() !== pull.head.sha.toLowerCase()) {
+    if (trigger.event === "workflow_dispatch" && inputs.headSha) {
+      throw actionError(
+        "HEAD_MOVED",
+        `head-sha ${inputs.headSha} is not the head of PR #${ref.number} (now ${pull.head.sha}). Verdicts are bound to the PR head, so only the current head can be reviewed; leave head-sha empty to review it`
+      );
+    }
+    return standDown(core2, secrets, pull.head.sha, pinned);
+  }
+  const headSha = pull.head.sha;
   core2.info(`Merge Safely: reviewing ${ref.repo.owner}/${ref.repo.name}#${ref.number} at ${headSha}`);
   if (fork) core2.info("fork PR: policy from the base branch, runner commands disabled");
   const workspace = env.GITHUB_WORKSPACE;
@@ -103349,6 +103443,24 @@ ${r2.summary}
     ...policyLog
   });
   const policy = hardenForFork(loaded, fork, (m2) => core2.warning(m2));
+  if (trigger.checkRun) {
+    const want = policy.policy.reporting.checkName;
+    if (trigger.checkRun.name !== want) {
+      core2.notice(`Merge Safely: check_run "${trigger.checkRun.name}" is not ${want}; nothing to do`);
+      setOutputs(core2, { decision: "skipped" }, secrets);
+      return EXIT.pass;
+    }
+    const slugs = await trustedSlugs(gh.octokit, inputs.verdictAppSlugs, logger);
+    if (!trigger.checkRun.appSlug || !slugs.includes(trigger.checkRun.appSlug)) {
+      core2.notice(
+        `Merge Safely: ${want} re-run requested on a check from ${trigger.checkRun.appSlug ?? "an unknown app"}, not a trusted app (${slugs.join(", ")}); nothing to do`
+      );
+      setOutputs(core2, { decision: "skipped" }, secrets);
+      return EXIT.pass;
+    }
+  }
+  const ceilingWarning = advisoryCeilingWarning(policy.policy);
+  if (ceilingWarning) core2.warning(ceilingWarning);
   const connections = parseConnections(inputs.connections, env, mask, secrets);
   core2.info(`connections: ${connections.map((c) => `${c.id} (${c.provider})`).join(", ")}`);
   const identity = PERSONAL_TOKEN.test(inputs.githubToken) ? "user" : "app";
@@ -103374,14 +103486,26 @@ ${r2.summary}
     concurrency: inputs.concurrency,
     // Design 7.4: validate each key on the run and fail with the connection id and the fix before seating anyone.
     validateConnections: true,
+    advisoryCeilings: [...ACTION_ADVISORY_CEILINGS],
+    producedBy: `merge-safely-action@${ACTION_VERSION}`,
     ...inputs.slackWebhook ? { slackWebhook: inputs.slackWebhook } : {}
   });
   deps2.onCancel?.(async () => {
     await gate.abort?.("the workflow run was cancelled");
   });
-  const result3 = await gate.review(ref, { headSha, trigger: `action:${trigger.event}` });
+  let result3;
+  try {
+    result3 = await gate.review(ref, { headSha, trigger: `action:${trigger.event}` });
+  } catch (err) {
+    if (!isHeadMoved(err)) throw err;
+    const { data: now } = await github(
+      `pull request #${ref.number}`,
+      () => gh.octokit.pulls.get({ owner: ref.repo.owner, repo: ref.repo.name, pull_number: ref.number })
+    );
+    return standDown(core2, secrets, now.head.sha, headSha);
+  }
   const checkUrl = await findCheckUrl(gh.octokit, ref.repo, headSha, policy.policy, env, logger);
-  setOutputs(core2, reviewOutputs(result3, checkUrl));
+  setOutputs(core2, reviewOutputs(result3, checkUrl), secrets);
   await core2.writeSummary(secrets.scrub(reviewSummary(result3, checkUrl)));
   return conclude(core2, result3, inputs);
 }
@@ -103392,10 +103516,11 @@ async function run(deps2) {
     return await main(deps2, secrets, logger);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
+    const code0 = isRecord5(err) && typeof err.exitCode === "number" ? err.exitCode : EXIT.error;
+    deps2.core.setOutput("decision", code0 === EXIT.budgetBlocked ? "budget-blocked" : "error");
     deps2.core.setFailed(`error [${errorCode(err)}]: ${secrets.scrub(msg)}`);
     if (!(err instanceof CliError) && err instanceof Error && err.stack) deps2.core.debug(secrets.scrub(err.stack));
-    const code2 = isRecord5(err) && typeof err.exitCode === "number" ? err.exitCode : EXIT.error;
-    return code2 === EXIT.pass ? EXIT.error : code2;
+    return code0 === EXIT.pass ? EXIT.error : code0;
   }
 }
 

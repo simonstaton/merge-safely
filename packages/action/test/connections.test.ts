@@ -1,5 +1,5 @@
 import { SecretSet } from "@merge-safely/cli";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { parseConnections, rawSecretStrings } from "../src/connections.js";
 
 const KEY = "sk-ant-api03-supersecretvalue1234";
@@ -51,6 +51,27 @@ describe("parseConnections", () => {
     const r = parse(`anthropic-main: { provider: anthropic, apiKey: ${KEY}: oops }`);
     expect(r.error).toMatch(/connections input is not valid YAML at line 1/);
     expect(r.error).not.toContain(KEY);
+  });
+
+  it("never lets the YAML library print the source (unresolved tag), and fails by line only", () => {
+    const warn = vi.spyOn(process, "emitWarning");
+    const stderr = vi.spyOn(process.stderr, "write");
+    try {
+      const r = parse(`anthropic-main: { provider: anthropic, apiKey: !foo "${KEY}" }`);
+      expect(r.error).toMatch(/^connections input is not valid YAML at line 1\./);
+      expect(r.error).not.toContain(KEY);
+      expect(warn).not.toHaveBeenCalled();
+      expect(stderr.mock.calls.map((c) => String(c[0])).join("")).not.toContain(KEY);
+    } finally {
+      warn.mockRestore();
+      stderr.mockRestore();
+    }
+  });
+
+  it("rejects duplicate keys by line", () => {
+    expect(parse("a: { provider: anthropic, apiKey: x }\na: { provider: openai, apiKey: y }").error).toMatch(
+      /not valid YAML at line 2/,
+    );
   });
 
   it("rejects a non-map", () => {

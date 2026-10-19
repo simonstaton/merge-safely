@@ -7,7 +7,7 @@
 import type { SecretSet } from "@merge-safely/cli";
 import type { Connection } from "@merge-safely/core";
 import { parseConnectionsInput, secretValues } from "@merge-safely/providers";
-import { parse as parseYaml } from "yaml";
+import { parseDocument } from "yaml";
 import { actionError, ghExpr } from "./errors.js";
 
 export const CONNECTIONS_DOCS = "https://github.com/simonstaton/merge-safely/blob/main/docs/connections.md";
@@ -16,6 +16,10 @@ const EXAMPLE = `connections: |\n  anthropic-main: { provider: anthropic, apiKey
 
 export const CONNECTIONS_REQUIRED =
   `connections input is required. Add it to the step's with: block, for example\n${EXAMPLE}\n` +
+  `See ${CONNECTIONS_DOCS}#the-actions-connections-input`;
+
+const YAML_FIX =
+  `Quote values that come from secrets, e.g. apiKey: "${ghExpr("secrets.ANTHROPIC_API_KEY")}", and use no YAML tags. ` +
   `See ${CONNECTIONS_DOCS}#the-actions-connections-input`;
 
 /** Keys whose string values are credentials, wherever they appear in the input. */
@@ -54,6 +58,29 @@ function yamlLine(err: unknown): string {
   return "";
 }
 
+/**
+ * Parse YAML without ever printing it. Error objects carry the line (linePos) and a pretty excerpt in .message; only the line is used. `logLevel: "silent"` stops the library's `process.emitWarning`, whose
+ * pretty-printed excerpt would quote the source line (and a key on it) before we mask anything. Errors and warnings
+ * (an unresolved `!tag`, a duplicate key) both fail, reported by line number only.
+ */
+export function parseConnectionsYaml(text: string): unknown {
+  let doc: ReturnType<typeof parseDocument>;
+  try {
+    doc = parseDocument(text, { logLevel: "silent", uniqueKeys: true });
+  } catch (_err: unknown) {
+    throw actionError("CONNECTIONS_INVALID", `connections input is not valid YAML. ${YAML_FIX}`);
+  }
+  const problem = doc.errors[0] ?? doc.warnings[0];
+  if (problem) {
+    throw actionError("CONNECTIONS_INVALID", `connections input is not valid YAML${yamlLine(problem)}. ${YAML_FIX}`);
+  }
+  try {
+    return doc.toJS();
+  } catch (_err: unknown) {
+    throw actionError("CONNECTIONS_INVALID", `connections input is not valid YAML. ${YAML_FIX}`);
+  }
+}
+
 /** Hints for the commonest mistakes, keyed off the (secret-free) validation messages. */
 function hints(errors: string[]): string[] {
   const out: string[] = [];
@@ -83,16 +110,7 @@ export function parseConnections(
   secrets: SecretSet,
 ): Connection[] {
   if (text.trim() === "") throw actionError("INPUT", CONNECTIONS_REQUIRED);
-  let obj: unknown;
-  try {
-    obj = parseYaml(text);
-  } catch (err: unknown) {
-    throw actionError(
-      "CONNECTIONS_INVALID",
-      `connections input is not valid YAML${yamlLine(err)}. Quote values that come from secrets, ` +
-        `e.g. apiKey: "\${{ secrets.ANTHROPIC_API_KEY }}". See ${CONNECTIONS_DOCS}#the-actions-connections-input`,
-    );
-  }
+  const obj = parseConnectionsYaml(text);
   const record = (s: string) => {
     if (s.trim() === "") return;
     mask(s);

@@ -22,9 +22,10 @@ import { CONNECTIONS_REQUIRED, parseConnections } from "./connections.js";
 import { actionError, ghExpr } from "./errors.js";
 import { resolveTrigger } from "./event.js";
 import { type ActionInputs, readInputs } from "./inputs.js";
-import { runMergeGroup } from "./merge-group.js";
+import { anyOfStores, runMergeGroup } from "./merge-group.js";
 import { type ActionOutputs, reviewOutputs, reviewSummary } from "./outputs.js";
 import { hardenForFork, loadActionPolicy } from "./policy.js";
+import { ACTION_VERSION } from "./version.js";
 
 /** The slice of @actions/core the Action uses. */
 export interface ActionCore {
@@ -54,8 +55,8 @@ export interface RunDeps {
   readFile(path: string): Promise<string | null>;
   github(token: string): ActionGithub;
   gateFactory: GateFactory;
-  /** Store holding PR verdicts, for merge-queue lookups. Default: the check-run store. */
-  verdictStore?(octokit: OctokitLike, policy: Policy, logger: Logger): VerdictStore;
+  /** Store holding PR verdicts written by any of `appSlugs`, for merge-queue lookups. Default: check-run stores. */
+  verdictStore?(octokit: OctokitLike, policy: Policy, logger: Logger, appSlugs: string[]): VerdictStore;
   now?(): Date;
   /** Register a handler for job cancellation (SIGINT/SIGTERM): closes out the pending check run. */
   onCancel?(fn: () => Promise<void>): void;
@@ -85,8 +86,42 @@ export function actionLogger(core: ActionCore, secrets: SecretSet): Logger {
   };
 }
 
-function setOutputs(core: ActionCore, outputs: Partial<ActionOutputs>): void {
-  for (const [k, v] of Object.entries(outputs)) core.setOutput(k, v ?? "");
+/** Outputs can carry model-written text (finding titles in verdict-json): scrub them like the summary. */
+function setOutputs(core: ActionCore, outputs: Partial<ActionOutputs>, secrets: SecretSet): void {
+  for (const [k, v] of Object.entries(outputs)) core.setOutput(k, v ? secrets.scrub(v) : "");
+}
+
+/** Our own app (GET /app works for App JWT-backed clients; the workflow token falls back to github-actions). */
+async function trustedSlugs(octokit: OctokitLike, configured: string[], logger: Logger): Promise<string[]> {
+  let own: string | undefined;
+  try {
+    own = (await resolveIdentity(octokit, {}, logger)).appSlug.toLowerCase();
+  } catch (_err: unknown) {
+    own = undefined;
+  }
+  return [...new Set([...configured, ...(own ? [own] : [])])];
+}
+
+/** Ceilings a single job cannot enforce: they need spend across jobs, which only the App's ledger sees. */
+export const ACTION_ADVISORY_CEILINGS = ["window", "all-time", "monthly"] as const;
+
+export function advisoryCeilingWarning(policy: Policy): string | undefined {
+  const b = policy.budget;
+  const set = [
+    b.windowUsd !== null ? "budget.windowUsd" : undefined,
+    b.spendLimitUsd !== null ? "budget.spendLimitUsd" : undefined,
+    b.perInstallationMonthlyUsd !== null ? "budget.perInstallationMonthlyUsd" : undefined,
+  ].filter((x): x is string => x !== undefined);
+  if (set.length === 0) return undefined;
+  return (
+    `${set.join(", ")} ${set.length === 1 ? "is" : "are"} not enforceable in the Action: spend across jobs is not ` +
+    "visible to a single job, so these ceilings are reported as advisory only; use the App for enforced " +
+    "installation-wide budgets. budget.perSeatUsd and budget.perChangeUsd are enforced."
+  );
+}
+
+function isHeadMoved(err: unknown): boolean {
+  return isRecord(err) && err.code === "head-moved";
 }
 
 async function readEvent(deps: RunDeps): Promise<Record<string, unknown>> {
@@ -199,6 +234,13 @@ export function conclude(
   }
 }
 
+/** The PR moved past the commit this run was for. Not a failure: the newer push has its own run. */
+function standDown(core: ActionCore, secrets: SecretSet, liveHead: string, pinned: string): number {
+  core.notice(`Merge Safely: ${pinned.slice(0, 7)} was superseded by ${liveHead}; that push gets its own review`);
+  setOutputs(core, { decision: "skipped" }, secrets);
+  return EXIT.pass;
+}
+
 async function main(deps: RunDeps, secrets: SecretSet, logger: Logger): Promise<number> {
   const { core, env } = deps;
   const inputs = readInputs(core.getInput);
@@ -219,7 +261,7 @@ async function main(deps: RunDeps, secrets: SecretSet, logger: Logger): Promise<
   const trigger = resolveTrigger(eventName, payload, inputs, env);
   if (trigger.kind === "skip") {
     core.notice(`Merge Safely: ${trigger.message}`);
-    setOutputs(core, { decision: "skipped" });
+    setOutputs(core, { decision: "skipped" }, secrets);
     return EXIT.pass;
   }
   if (!inputs.githubToken) {
@@ -247,11 +289,13 @@ async function main(deps: RunDeps, secrets: SecretSet, logger: Logger): Promise<
       sources,
       ...policyLog,
     });
-    const store = (deps.verdictStore ?? ((octokit, p, l) => checkRunStore({ octokit, policy: p, logger: l })))(
-      gh.octokit,
-      policy.policy,
-      logger,
-    );
+    const slugs = await trustedSlugs(gh.octokit, inputs.verdictAppSlugs, logger);
+    core.info(`merge queue: verdicts from ${slugs.join(", ")} count`);
+    const store = (
+      deps.verdictStore ??
+      ((octokit, p, l, appSlugs) =>
+        anyOfStores(appSlugs.map((appSlug) => checkRunStore({ octokit, policy: p, logger: l, appSlug }))))
+    )(gh.octokit, policy.policy, logger, slugs);
     const detailsUrl = workflowRunUrl(env);
     const r = await github("merge queue check", () =>
       runMergeGroup({
@@ -270,11 +314,15 @@ async function main(deps: RunDeps, secrets: SecretSet, logger: Logger): Promise<
       r.checkRunId !== undefined
         ? `${serverUrl(env, trigger.repo)}/${trigger.repo.owner}/${trigger.repo.name}/runs/${r.checkRunId}`
         : "";
-    setOutputs(core, {
-      decision: r.ok ? "pass" : "block",
-      "check-url": checkUrl,
-      "verdict-json": JSON.stringify({ mergeGroup: trigger.headSha, ok: r.ok, prs: r.entries }),
-    });
+    setOutputs(
+      core,
+      {
+        decision: r.ok ? "pass" : "block",
+        "check-url": checkUrl,
+        "verdict-json": JSON.stringify({ mergeGroup: trigger.headSha, ok: r.ok, prs: r.entries }),
+      },
+      secrets,
+    );
     await core.writeSummary(`## ${r.title}\n\n${r.summary}\n`);
     if (r.ok) return EXIT.pass;
     if (!inputs.failOnBlock) {
@@ -298,7 +346,18 @@ async function main(deps: RunDeps, secrets: SecretSet, logger: Logger): Promise<
     // Defensive: the payload check normally catches this first.
     throw actionError("FORK_PULL_REQUEST", "this pull request comes from a fork; see pull_request_target in the docs");
   }
-  const headSha = inputs.headSha ?? trigger.headSha ?? pull.head.sha;
+  const pinned = inputs.headSha ?? trigger.headSha;
+  if (pinned && pinned.toLowerCase() !== pull.head.sha.toLowerCase()) {
+    if (trigger.event === "workflow_dispatch" && inputs.headSha) {
+      throw actionError(
+        "HEAD_MOVED",
+        `head-sha ${inputs.headSha} is not the head of PR #${ref.number} (now ${pull.head.sha}). Verdicts are bound to ` +
+          "the PR head, so only the current head can be reviewed; leave head-sha empty to review it",
+      );
+    }
+    return standDown(core, secrets, pull.head.sha, pinned);
+  }
+  const headSha = pull.head.sha;
   core.info(`Merge Safely: reviewing ${ref.repo.owner}/${ref.repo.name}#${ref.number} at ${headSha}`);
   if (fork) core.info("fork PR: policy from the base branch, runner commands disabled");
 
@@ -314,6 +373,26 @@ async function main(deps: RunDeps, secrets: SecretSet, logger: Logger): Promise<
     ...policyLog,
   });
   const policy = hardenForFork(loaded, fork, (m) => core.warning(m));
+
+  if (trigger.checkRun) {
+    const want = policy.policy.reporting.checkName;
+    if (trigger.checkRun.name !== want) {
+      core.notice(`Merge Safely: check_run "${trigger.checkRun.name}" is not ${want}; nothing to do`);
+      setOutputs(core, { decision: "skipped" }, secrets);
+      return EXIT.pass;
+    }
+    const slugs = await trustedSlugs(gh.octokit, inputs.verdictAppSlugs, logger);
+    if (!trigger.checkRun.appSlug || !slugs.includes(trigger.checkRun.appSlug)) {
+      core.notice(
+        `Merge Safely: ${want} re-run requested on a check from ${trigger.checkRun.appSlug ?? "an unknown app"}, ` +
+          `not a trusted app (${slugs.join(", ")}); nothing to do`,
+      );
+      setOutputs(core, { decision: "skipped" }, secrets);
+      return EXIT.pass;
+    }
+  }
+  const ceilingWarning = advisoryCeilingWarning(policy.policy);
+  if (ceilingWarning) core.warning(ceilingWarning);
 
   const connections = parseConnections(inputs.connections, env, mask, secrets);
   core.info(`connections: ${connections.map((c) => `${c.id} (${c.provider})`).join(", ")}`);
@@ -343,14 +422,26 @@ async function main(deps: RunDeps, secrets: SecretSet, logger: Logger): Promise<
     concurrency: inputs.concurrency,
     // Design 7.4: validate each key on the run and fail with the connection id and the fix before seating anyone.
     validateConnections: true,
+    advisoryCeilings: [...ACTION_ADVISORY_CEILINGS],
+    producedBy: `merge-safely-action@${ACTION_VERSION}`,
     ...(inputs.slackWebhook ? { slackWebhook: inputs.slackWebhook } : {}),
   });
   deps.onCancel?.(async () => {
     await gate.abort?.("the workflow run was cancelled");
   });
-  const result = await gate.review(ref, { headSha, trigger: `action:${trigger.event}` });
+  let result: CliReviewResult;
+  try {
+    result = await gate.review(ref, { headSha, trigger: `action:${trigger.event}` });
+  } catch (err: unknown) {
+    // A push landed while this job ran: the newer head has its own run.
+    if (!isHeadMoved(err)) throw err;
+    const { data: now } = await github(`pull request #${ref.number}`, () =>
+      gh.octokit.pulls.get({ owner: ref.repo.owner, repo: ref.repo.name, pull_number: ref.number }),
+    );
+    return standDown(core, secrets, now.head.sha, headSha);
+  }
   const checkUrl = await findCheckUrl(gh.octokit, ref.repo, headSha, policy.policy, env, logger);
-  setOutputs(core, reviewOutputs(result, checkUrl));
+  setOutputs(core, reviewOutputs(result, checkUrl), secrets);
   await core.writeSummary(secrets.scrub(reviewSummary(result, checkUrl)));
   return conclude(core, result, inputs);
 }
@@ -363,10 +454,11 @@ export async function run(deps: RunDeps): Promise<number> {
     return await main(deps, secrets, logger);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
+    const code0 = isRecord(err) && typeof err.exitCode === "number" ? err.exitCode : EXIT.error;
+    deps.core.setOutput("decision", code0 === EXIT.budgetBlocked ? "budget-blocked" : "error");
     deps.core.setFailed(`error [${errorCode(err)}]: ${secrets.scrub(msg)}`);
     // Expected failures (CliError: configuration, events, GitHub refusals) carry the whole story in the message.
     if (!(err instanceof CliError) && err instanceof Error && err.stack) deps.core.debug(secrets.scrub(err.stack));
-    const code = isRecord(err) && typeof err.exitCode === "number" ? err.exitCode : EXIT.error;
-    return code === EXIT.pass ? EXIT.error : code;
+    return code0 === EXIT.pass ? EXIT.error : code0;
   }
 }

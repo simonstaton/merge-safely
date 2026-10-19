@@ -173,9 +173,18 @@ export function fakeGithub(pull: PullRequestData = pullData()): FakeGithub {
 export class FakeGate implements CliGate {
   reviewResult: CliReviewResult = result("pass");
   calls: Array<{ ref: unknown; opts: unknown }> = [];
-  async review(ref: Parameters<CliGate["review"]>[0], opts: { headSha?: string }) {
+  aborted: string[] = [];
+  reviewError: unknown;
+  /** Runs inside review(), e.g. to simulate a cancellation mid-review. */
+  during?: () => Promise<void>;
+  async review(ref: Parameters<CliGate["review"]>[0], opts: { headSha?: string; trigger?: string }) {
     this.calls.push({ ref, opts });
+    await this.during?.();
+    if (this.reviewError) throw this.reviewError;
     return this.reviewResult;
+  }
+  async abort(reason: string) {
+    this.aborted.push(reason);
   }
   async reviewChange(): Promise<CliReviewResult> {
     throw new Error("not used");

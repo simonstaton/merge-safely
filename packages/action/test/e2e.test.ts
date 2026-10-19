@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -29,9 +29,11 @@ function runNode(env: Record<string, string>): Promise<{ code: number | null; st
 describe("bundled action end to end (fake GitHub + fake model endpoint, no network)", () => {
   let gh: FakeGithubServer | undefined;
   let models: FakeModelServer | undefined;
+  const dirs: string[] = [];
   afterEach(async () => {
     await gh?.close();
     await models?.close();
+    for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
   });
 
   it("a docs-only PR is triaged to a pass: success check run, outputs and summary, no model completions", async () => {
@@ -53,6 +55,7 @@ describe("bundled action end to end (fake GitHub + fake model endpoint, no netwo
     });
     models = await fakeModelServer();
     const dir = mkdtempSync(join(tmpdir(), "ms-e2e-"));
+    dirs.push(dir);
     const event = fixture("pull_request.synchronize");
     const pr = event.pull_request as { head: { sha: string }; base: { sha: string } };
     pr.head.sha = HEAD;
@@ -82,7 +85,7 @@ describe("bundled action end to end (fake GitHub + fake model endpoint, no netwo
 
     const output = readFileSync(join(dir, "output"), "utf8");
     const summary = readFileSync(join(dir, "summary"), "utf8");
-    expect({ code: r.code, stderr: r.stderr, unhandled: gh.unhandled }).toMatchObject({ code: 0, stderr: "" });
+    expect({ code: r.code, stderr: r.stderr, unhandled: gh.unhandled }).toEqual({ code: 0, stderr: "", unhandled: [] });
     const printed = r.stdout
       .split("\n")
       .filter((l) => !l.startsWith("::add-mask::"))
@@ -102,6 +105,7 @@ describe("bundled action end to end (fake GitHub + fake model endpoint, no netwo
     expect(output).toMatch(/tier<<\S+\n0\n/);
     expect(output).toMatch(new RegExp(`check-url<<\\S+\\nhttps://github.com/acme/app/runs/${run?.id}\\n`));
     expect(summary).toMatch(/PASS/);
+    expect(String((run?.output as { text?: string } | undefined)?.text)).toContain("merge-safely-action@0.1.0");
 
     // Key validated against the models endpoint; triage meant no completion calls.
     expect(models.requests.some((q) => q.path.endsWith("/models"))).toBe(true);

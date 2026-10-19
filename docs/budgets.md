@@ -16,6 +16,10 @@ Five ceilings are evaluated against a proposed panel before anything runs:
 
 "The installation" is the App installation in the App. In the Action and the CLI's PR mode it is the repository (`owner/name`), and `run --local` uses one scope called `local`.
 
+### In the GitHub Action
+
+The Action enforces the per-seat and per-change ceilings. It treats the rolling-window, all-time and monthly ceilings as **advisory**: they are reported on the verdict and never block. Each Actions job starts with an empty ledger and cannot see spend from other jobs or repositories. Enforcing those ceilings there would compare one job's spend against an installation-wide limit, which fails open without saying so. When any of `budget.windowUsd`, `budget.spendLimitUsd` or `budget.perInstallationMonthlyUsd` is set, the Action logs one warning: "not enforceable in the Action: spend across jobs is not visible; use the App". For enforced installation-wide budgets, use the GitHub App, which keeps a shared ledger.
+
 ### Semantics
 
 - `null` (or absent) means never configured. `0` means explicitly disabled. Neither ever breaches.

@@ -4,6 +4,7 @@
  * real providers.
  */
 import type {
+  CeilingKind,
   Change,
   ChangeRef,
   Connection,
@@ -129,6 +130,10 @@ export interface GateSetup {
   validateConnections?: boolean;
   /** Per-connection validation timeout. Default 15 s. */
   validateTimeoutMs?: number;
+  /** Ceilings reported but never enforced (embedders that cannot see installation-wide spend). Default ["monthly"]. */
+  advisoryCeilings?: CeilingKind[];
+  /** Recorded on every verdict. Default `merge-safely-cli@<version>`. */
+  producedBy?: string;
   logger: Logger;
 }
 

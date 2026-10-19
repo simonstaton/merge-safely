@@ -6,7 +6,9 @@ name: merge-safely
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    # `edited` re-reviews a PR retargeted to another base branch, under that branch's policy
+    # (title and body edits are ignored).
+    types: [opened, synchronize, reopened, ready_for_review, edited]
   merge_group:
     types: [checks_requested]
   workflow_dispatch:

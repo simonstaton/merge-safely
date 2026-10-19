@@ -61,9 +61,28 @@ describe("resolveTrigger", () => {
     );
   });
 
-  it.each(["check_run", "check_suite"])("%s rerequested -> review of that head", (name) => {
-    const t = resolveTrigger(name, fixture(`${name}.rerequested`), {}, env);
-    expect(t).toMatchObject({ kind: "review", event: name, ref: { repo, number: 7 }, headSha: HEAD });
+  it("check_run rerequested -> review of that head, carrying the check's name and app for verification", () => {
+    const t = resolveTrigger("check_run", fixture("check_run.rerequested"), {}, env);
+    expect(t).toMatchObject({
+      kind: "review",
+      event: "check_run",
+      ref: { repo, number: 7 },
+      headSha: HEAD,
+      checkRun: { name: "merge-safely/verdict", appSlug: "github-actions" },
+    });
+  });
+
+  it("check_run with a custom check name is passed on for the policy to decide", () => {
+    const p = fixture("check_run.rerequested");
+    (p.check_run as { name: string }).name = "gate/ai";
+    expect(resolveTrigger("check_run", p, {}, env)).toMatchObject({ checkRun: { name: "gate/ai" } });
+  });
+
+  it("check_suite events are ignored entirely", () => {
+    expect(resolveTrigger("check_suite", fixture("check_suite.rerequested"), {}, env)).toMatchObject({
+      kind: "skip",
+      message: expect.stringMatching(/check_suite events are ignored/),
+    });
   });
 
   it("check_run rerequested for a fork PR (no pull_requests) is skipped", () => {

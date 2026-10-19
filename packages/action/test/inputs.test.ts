@@ -16,6 +16,14 @@ describe("readInputs", () => {
     expect(i.prNumber).toBeUndefined();
     expect(i.headSha).toBeUndefined();
     expect(i.slackWebhook).toBeUndefined();
+    expect(i.verdictAppSlugs).toEqual(["github-actions"]);
+  });
+
+  it("parses verdict-app-slugs", () => {
+    expect(
+      readInputs(get({ "verdict-app-slugs": "merge-safely, github-actions ,Merge-Safely" })).verdictAppSlugs,
+    ).toEqual(["merge-safely", "github-actions"]);
+    expect(() => readInputs(get({ "verdict-app-slugs": "bad slug!" }))).toThrow(/not a GitHub App slug/);
   });
 
   it("parses every input", () => {
@@ -47,7 +55,7 @@ describe("readInputs", () => {
     [{ concurrency: "0" }, /concurrency must be an integer from 1 to 16/],
     [{ concurrency: "2.5" }, /concurrency/],
     [{ "pr-number": "-3" }, /pr-number/],
-    [{ "head-sha": "abc123" }, /head-sha must be a full commit SHA/],
+    [{ "head-sha": "abc123" }, /head-sha must be a full commit SHA \(40 or 64 hex characters\)/],
     [{ store: "sqlite" }, /store must be one of: checkrun/],
     [{ policy: "../secrets.yml" }, /policy must be a path inside the repository/],
     [{ policy: "/etc/passwd" }, /policy must be a path inside the repository/],

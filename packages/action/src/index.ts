@@ -7,3 +7,4 @@ export * from "./merge-group.js";
 export * from "./outputs.js";
 export * from "./policy.js";
 export * from "./run.js";
+export * from "./version.js";

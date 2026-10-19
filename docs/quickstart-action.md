@@ -15,7 +15,8 @@ Any supported provider works. See [connections.md](connections.md).
 name: merge-safely
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    # `edited` re-reviews a PR retargeted to another base branch (title/body edits are ignored).
+    types: [opened, synchronize, reopened, ready_for_review, edited]
 permissions:
   checks: write
   pull-requests: write
@@ -49,7 +50,8 @@ The `concurrency` block cancels a review when a newer commit arrives. The newer 
 | `slack-webhook` | none | Slack incoming-webhook URL for escalations, from a secret. |
 | `concurrency` | `2` | Reviewer seats run in parallel (1-16). |
 | `pr-number` | none | The PR to review on `workflow_dispatch`. |
-| `head-sha` | PR head | Review this commit instead of the PR head. |
+| `head-sha` | PR head | Pin the expected PR head. If the PR has moved, a `workflow_dispatch` run fails. |
+| `verdict-app-slugs` | `github-actions` | App slugs whose verdicts count in merge-queue runs and `check_run` re-runs (plus the token's own app). |
 
 Outputs: `decision`, `tier`, `round`, `cost-usd`, `check-url`, `verdict-json`. The job summary carries the digest and the cost line. Full reference: [packages/action/README.md](../packages/action/README.md).
 
@@ -108,7 +110,7 @@ Full workflow: [examples/action-multi-provider/](../examples/action-multi-provid
 
 The verdict check run is the verdict store, so verdicts are kept per head SHA and rounds work without a database. A new push gets a new check run on the new SHA; the old one stays attached to the old SHA.
 
-Budgets: per-seat and per-change ceilings are enforced. The monthly installation ceiling (`budget.perInstallationMonthlyUsd`) is evaluated as advisory only, because a single job cannot see spend across all your repositories. Use the GitHub App for enforced installation-wide budgets. See [budgets.md](budgets.md).
+Budgets: per-seat and per-change ceilings are enforced. The rolling-window (`budget.windowUsd`), all-time (`budget.spendLimitUsd`) and monthly (`budget.perInstallationMonthlyUsd`) ceilings are advisory only. A single job cannot see spend across jobs and repositories, so the Action reports them, never blocks on them, and logs a warning when any of them is set. Use the GitHub App for enforced installation-wide budgets. See [budgets.md](budgets.md).
 
 ## When the key is wrong
 

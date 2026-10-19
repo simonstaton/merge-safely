@@ -22,9 +22,31 @@ export interface ActionInputs {
   concurrency: number;
   prNumber?: number;
   headSha?: string;
+  /**
+   * GitHub App slugs whose merge-safely check runs count as verdicts when this run reads them (merge queue,
+   * check_run re-runs). The slug of the token's own app is always added at run time.
+   */
+  verdictAppSlugs: string[];
 }
 
 export const DEFAULT_CONCURRENCY = 2;
+export const DEFAULT_VERDICT_APP_SLUGS = ["github-actions"];
+
+/** `a, b ,c` -> ["a","b","c"]; each a GitHub App slug. */
+export function parseSlugs(raw: string): string[] {
+  const v = raw.trim();
+  if (v === "") return [...DEFAULT_VERDICT_APP_SLUGS];
+  const out: string[] = [];
+  for (const part of v.split(/[,\s]+/)) {
+    const s = part.trim().toLowerCase();
+    if (s === "") continue;
+    if (!/^[a-z0-9][a-z0-9-]{0,99}$/.test(s)) {
+      throw actionError("INPUT", `verdict-app-slugs: "${part}" is not a GitHub App slug (letters, digits, dashes)`);
+    }
+    if (!out.includes(s)) out.push(s);
+  }
+  return out.length ? out : [...DEFAULT_VERDICT_APP_SLUGS];
+}
 export const MAX_CONCURRENCY = 16;
 export const STORES = ["checkrun"] as const;
 
@@ -70,7 +92,7 @@ export function readInputs(getInput: GetInput): ActionInputs {
   }
   const headSha = getInput("head-sha").trim();
   if (headSha !== "" && !/^[0-9a-f]{40}([0-9a-f]{24})?$/i.test(headSha)) {
-    throw actionError("INPUT", "head-sha must be a full commit SHA (40 hex characters)");
+    throw actionError("INPUT", "head-sha must be a full commit SHA (40 or 64 hex characters)");
   }
   const prNumber = int("pr-number", getInput("pr-number"), 1, Number.MAX_SAFE_INTEGER);
   const slackWebhook = getInput("slack-webhook").trim();
@@ -85,5 +107,6 @@ export function readInputs(getInput: GetInput): ActionInputs {
     concurrency: int("concurrency", getInput("concurrency"), 1, MAX_CONCURRENCY) ?? DEFAULT_CONCURRENCY,
     ...(prNumber !== undefined ? { prNumber } : {}),
     ...(headSha ? { headSha: headSha.toLowerCase() } : {}),
+    verdictAppSlugs: parseSlugs(getInput("verdict-app-slugs")),
   };
 }

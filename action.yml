@@ -44,8 +44,17 @@ inputs:
     description: The PR to review on workflow_dispatch runs.
     required: false
   head-sha:
-    description: Review this commit instead of the PR's head (full SHA). Mostly for workflow_dispatch re-runs.
+    description: >-
+      Pin the expected PR head (full SHA). The review runs only if it is still the head; on workflow_dispatch a
+      mismatch fails with an explanation. Verdicts are bound to the PR head, so older commits cannot be reviewed.
     required: false
+  verdict-app-slugs:
+    description: >-
+      Comma-separated GitHub App slugs whose merge-safely check runs count as verdicts in merge-queue runs and as
+      trusted check_run re-runs. The slug of this token's own app is always included. Set it to your App's slug
+      (e.g. merge-safely) when the App reviews PRs and this Action only handles merge_group.
+    required: false
+    default: github-actions
 
 outputs:
   decision:

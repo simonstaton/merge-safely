@@ -1,6 +1,6 @@
 import { DEFAULT_POLICY } from "@merge-safely/core";
 import { describe, expect, it } from "vitest";
-import { evaluateMergeGroup, type MergeGroupPr, runMergeGroup } from "../src/merge-group.js";
+import { anyOfStores, evaluateMergeGroup, type MergeGroupPr, runMergeGroup } from "../src/merge-group.js";
 import { run } from "../src/run.js";
 import { fakeGithub, HEAD, harness, memoryStore, QUEUE, verdict } from "./helpers.js";
 
@@ -128,5 +128,41 @@ describe("run: merge_group", () => {
     );
     expect(await run(h.deps)).toBe(0);
     expect(h.gh.created[0]).toMatchObject({ conclusion: "failure" });
+  });
+});
+
+describe("anyOfStores", () => {
+  it("returns the newest verdict any trusted app holds and merges history", async () => {
+    const older = verdict({ createdAt: "2026-10-01T00:00:00.000Z", decision: "block" });
+    const newer = verdict({ createdAt: "2026-10-02T00:00:00.000Z" });
+    const s = anyOfStores([memoryStore([older]), memoryStore([newer])]);
+    expect((await s.get({ repo: newer.repo, number: 7, headSha: HEAD }))?.verdict.decision).toBe("pass");
+    expect(await s.listForChange(newer.repo, 7)).toHaveLength(2);
+    await expect(s.put(newer, { version: null })).rejects.toThrow(/read-only/);
+  });
+});
+
+describe("run: merge_group trust", () => {
+  it("passes verdict-app-slugs plus the token's own app to the verdict lookup", async () => {
+    const seen: string[][] = [];
+    const h = harness("merge_group", "merge_group.checks_requested", { "verdict-app-slugs": "merge-safely" });
+    h.deps.verdictStore = (_o, _p, _l, slugs) => {
+      seen.push(slugs);
+      return memoryStore([verdict()]);
+    };
+    expect(await run(h.deps)).toBe(0);
+    expect(seen).toEqual([["merge-safely", "github-actions"]]);
+  });
+
+  it("a block on the PR head fails the queue check with the reason", async () => {
+    const h = harness(
+      "merge_group",
+      "merge_group.checks_requested",
+      {},
+      { store: memoryStore([verdict({ decision: "block" })]) },
+    );
+    expect(await run(h.deps)).toBe(1);
+    expect(h.gh.created[0]).toMatchObject({ conclusion: "failure" });
+    expect(String(h.gh.created[0]?.output?.summary)).toMatch(/#7: machine verdict on 1111111 is block/);
   });
 });

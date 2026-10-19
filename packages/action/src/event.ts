@@ -4,7 +4,8 @@
  * - pull_request / pull_request_target: opened, synchronize, reopened, ready_for_review (and `edited` with a base
  *   change). Drafts are skipped. `pull_request` from a fork is refused: its token is read-only and it has no secrets.
  * - workflow_dispatch: the `pr-number` input names the PR (re-run by hand, or from another workflow).
- * - check_run / check_suite `rerequested`: the "Re-run" button on a merge-safely check.
+ * - check_run `rerequested`: the "Re-run" button on the verdict check (named per policy, from a trusted app).
+ *   check_suite events are ignored.
  * - merge_group `checks_requested`: the merge-queue commit (see merge-group.ts).
  */
 import type { ChangeRef, RepoRef } from "@merge-safely/core";
@@ -21,6 +22,8 @@ export type Trigger =
       headSha?: string;
       /** PR head and base repositories differ, as far as the payload says (re-checked against the API). */
       forkHint?: boolean;
+      /** check_run re-runs: the re-requested check, verified against the policy and trusted apps before acting. */
+      checkRun?: { name: string; appSlug?: string };
     }
   | {
       kind: "merge-group";
@@ -160,22 +163,29 @@ export function resolveTrigger(
       }
       return { kind: "review", event: name, ref: { repo: repoOf(payload, env), number: inputs.prNumber } };
     }
-    case "check_run":
-    case "check_suite": {
-      const hit = changeRefFromEvent(name, payload);
+    case "check_suite":
+      // Never ours: GitHub does not trigger workflows for suites created by Actions, so a check_suite event here
+      // is another app's suite (a third-party CI's "Re-run all"), which must not start a paid re-review.
+      return { kind: "skip", message: "check_suite events are ignored; re-run with workflow_dispatch and pr-number" };
+    case "check_run": {
+      // Any name here; run.ts matches it exactly against the base-branch policy's reporting.checkName.
+      const hit = changeRefFromEvent(name, payload, { checkNamePrefix: "" });
+      const cr = isRecord(payload.check_run) ? payload.check_run : {};
       if (!hit) {
         return {
           kind: "skip",
           message:
-            `${name}.${str(payload.action) ?? "?"} is not a re-run of a merge-safely check on a same-repository PR; ` +
+            `check_run.${str(payload.action) ?? "?"} is not a re-run of a check on a same-repository PR; ` +
             "nothing to do (fork PRs: re-run with workflow_dispatch and pr-number)",
         };
       }
+      const appSlug = isRecord(cr.app) ? str(cr.app.slug) : undefined;
       return {
         kind: "review",
         event: name,
         ref: hit.ref,
         ...(hit.headSha ? { headSha: hit.headSha } : {}),
+        checkRun: { name: str(cr.name) ?? "", ...(appSlug ? { appSlug: appSlug.toLowerCase() } : {}) },
       };
     }
     case "merge_group": {

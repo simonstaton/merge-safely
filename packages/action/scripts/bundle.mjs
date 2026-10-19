@@ -1,4 +1,5 @@
-// Builds dist/index.js, the single file GitHub runs (action.yml -> runs.main). Committed; CI fails on a stale copy.
+// Builds dist/index.js, the file GitHub runs (action.yml -> runs.main), and dist/git-wrapper.js. Both are committed;
+// CI fails on a stale copy.
 //
 //   esbuild src/main.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/index.js
 //
@@ -16,8 +17,10 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 await build({
   absWorkingDir: root,
-  entryPoints: ["src/main.ts"],
-  outfile: "dist/index.js",
+  // index.js is the Action; git-wrapper.js is the `ms-git` guard the Claude Code CLI runner (`runner: cli`) launches.
+  // provider-anthropic resolves it as new URL("./git-wrapper.js", import.meta.url), i.e. next to index.js.
+  entryPoints: { index: "src/main.ts", "git-wrapper": "../provider-anthropic/dist/git-wrapper.js" },
+  outdir: "dist",
   bundle: true,
   platform: "node",
   target: "node20",

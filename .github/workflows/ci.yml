@@ -19,5 +19,5 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
       - name: Action bundle is up to date
-        run: npm run bundle -w @merge-safely/action && git diff --exit-code packages/action/dist
+        run: npm run bundle -w @merge-safely/action && git diff --exit-code packages/action/dist && test -z "$(git status --porcelain packages/action/dist)"
       - run: npm test
