@@ -33,8 +33,11 @@ import type {
 
 export interface SourceProvider {
   getChange(ref: ChangeRef): Promise<Change>;
-  /** Full unified diff base..head, or the delta since `sinceSha` when given. */
-  getDiff(ref: ChangeRef, opts?: { sinceSha?: string }): Promise<string>;
+  /**
+   * Full unified diff base...head, or the delta since `sinceSha` when given.
+   * Pass `headSha` to pin the diff to the commit the verdict is bound to (the PR head may move between calls).
+   */
+  getDiff(ref: ChangeRef, opts?: { sinceSha?: string; headSha?: string }): Promise<string>;
   /** Commit messages and review comments on the change. Untrusted text. */
   getUntrustedContext?(ref: ChangeRef): Promise<{ commitMessages: string[]; comments: string[] }>;
   listOpenChanges?(repo: RepoRef): AsyncIterable<ChangeRef>;
