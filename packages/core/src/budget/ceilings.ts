@@ -6,7 +6,7 @@
  *   per-change budget.perChangeUsd                one PR across all rounds (spent so far + panel estimate)
  *   window     budget.windowUsd                   installation, rolling window of budget.windowDays
  *   all-time   budget.spendLimitUsd               installation, against the gate's own ledger
- *   monthly    budget.perInstallationMonthlyUsd   installation, calendar month
+ *   monthly    budget.perInstallationMonthlyUsd   installation, rolling 30 days
  *
  * Limit semantics: `null`/`undefined` = never configured (unset), `0` = explicitly disabled. Neither ever breaches.
  * A ceiling breaches when projected spend strictly exceeds the limit, so a zero-cost panel never trips a ceiling
