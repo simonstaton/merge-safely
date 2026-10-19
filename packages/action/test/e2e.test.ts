@@ -36,7 +36,7 @@ describe("bundled action end to end (fake GitHub + fake model endpoint, no netwo
     for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
   });
 
-  it("a docs-only PR is triaged to a pass: success check run, outputs and summary, no model completions", async () => {
+  it("a docs-only PR is triaged to a pass: success check run, outputs and summary, no model calls", async () => {
     gh = await fakeGithubServer({
       owner: "acme",
       repo: "app",
@@ -107,8 +107,7 @@ describe("bundled action end to end (fake GitHub + fake model endpoint, no netwo
     expect(summary).toMatch(/PASS/);
     expect(String((run?.output as { text?: string } | undefined)?.text)).toContain("merge-safely-action@0.1.0");
 
-    // Key validated against the models endpoint; triage meant no completion calls.
-    expect(models.requests.some((q) => q.path.endsWith("/models"))).toBe(true);
-    expect(models.requests.filter((q) => !q.path.endsWith("/models"))).toEqual([]);
+    // Triage runs before connections are checked, so a docs-only PR never touches the model endpoint.
+    expect(models.requests).toEqual([]);
   }, 60_000);
 });

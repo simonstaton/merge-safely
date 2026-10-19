@@ -58128,11 +58128,10 @@ var policySchema = external_exports.object({
   }).strict().default({}),
   rounds: external_exports.object({
     max: external_exports.number().int().min(1).default(3),
-    diffOnlyAfterRound: external_exports.number().int().min(0).default(1),
-    neverRepeatFindings: external_exports.boolean().default(true)
+    diffOnlyAfterRound: external_exports.number().int().min(0).default(1)
   }).strict().default({}),
   trust: external_exports.object({
-    provider: external_exports.enum(["none", "github-teams", "allowlist", "codeowners"]).default("none"),
+    provider: external_exports.enum(["none", "github-teams", "allowlist"]).default("none"),
     trusted: external_exports.array(external_exports.string()).default([]),
     blocked: external_exports.array(external_exports.string()).default([]),
     trustedBypassMaxTier: external_exports.number().int().min(0).max(3).default(2),
@@ -102312,30 +102311,99 @@ function namedConnections(policy) {
     ids.push(sel.connection);
   return [...new Set(ids.filter((x2) => typeof x2 === "string"))];
 }
-async function preflightConnections(registry, connections, policy, logger, timeoutMs = DEFAULT_VALIDATE_TIMEOUT_MS) {
-  const cache = /* @__PURE__ */ new Map();
-  const results = await Promise.all(connections.map(async (conn) => {
+async function validateEach(registry, connections, timeoutMs) {
+  return Promise.all(connections.map(async (conn) => {
     try {
       const v = await withTimeoutMs(registry.forConnection(conn).validate(conn), timeoutMs, `validating ${conn.id}`);
-      if (v.ok && v.models && v.models.length > 0)
-        cache.set(conn.id, v.models);
-      return { conn, ok: v.ok, message: v.message ?? "validation failed" };
+      return {
+        conn,
+        ok: v.ok,
+        message: v.message ?? "validation failed",
+        ...v.ok && v.models && v.models.length > 0 ? { models: v.models } : {}
+      };
     } catch (err) {
       return { conn, ok: false, message: err instanceof Error ? err.message : String(err) };
     }
   }));
+}
+function unreachable(r2) {
+  return new CliError("CONNECTION_UNREACHABLE", `connection ${r2.conn.id} is unreachable or rejected (${r2.message}). Fix: check its key, base URL and network, then run \`merge-safely connections test ${r2.conn.id}\``);
+}
+async function preflightConnections(registry, connections, policy, logger, timeoutMs = DEFAULT_VALIDATE_TIMEOUT_MS) {
+  const cache = /* @__PURE__ */ new Map();
+  const results = await validateEach(registry, connections, timeoutMs);
+  for (const r2 of results)
+    if (r2.models)
+      cache.set(r2.conn.id, r2.models);
   const failed = results.filter((r2) => !r2.ok);
-  const fail2 = (r2) => new CliError("CONNECTION_UNREACHABLE", `connection ${r2.conn.id} is unreachable or rejected (${r2.message}). Fix: check its key, base URL and network, then run \`merge-safely connections test ${r2.conn.id}\``);
   const named = new Set(namedConnections(policy));
   const namedFailure = failed.find((r2) => named.has(r2.conn.id));
   if (namedFailure)
-    throw fail2(namedFailure);
+    throw unreachable(namedFailure);
   const ok = results.filter((r2) => r2.ok).map((r2) => r2.conn);
   if (ok.length === 0 && failed[0])
-    throw fail2(failed[0]);
+    throw unreachable(failed[0]);
   for (const r2 of failed)
     logger.warn(`connection ${r2.conn.id} skipped: ${r2.message}`);
   return { connections: ok, cache };
+}
+async function gateForReview(base, registry, target, opts = {}) {
+  const { policy, logger } = base;
+  const triageGate = createGate({ ...base, catalog: () => [] });
+  try {
+    const est = await triageGate.estimate(target);
+    if (est.seats.length === 0)
+      return triageGate;
+  } catch (_err) {
+  }
+  const named = new Set(namedConnections(policy));
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_VALIDATE_TIMEOUT_MS;
+  const cache = /* @__PURE__ */ new Map();
+  const validated = /* @__PURE__ */ new Set();
+  const warned = /* @__PURE__ */ new Set();
+  let connections = base.connections;
+  let firstFailure;
+  for (; ; ) {
+    const catalogData = await buildCatalog(registry, connections, { cache });
+    for (const p of catalogData.problems) {
+      if (warned.has(p.connectionId))
+        continue;
+      warned.add(p.connectionId);
+      logger?.warn(`connection ${p.connectionId}: ${p.message}`);
+    }
+    const gate = createGate({ ...base, connections, catalog: catalogLookup(catalogData) });
+    let toCheck;
+    try {
+      const est = await gate.estimate(target);
+      const seated = new Set(est.seats.map((s2) => s2.model.connectionId));
+      toCheck = connections.filter((c) => seated.has(c.id) && !validated.has(c.id));
+    } catch (_err) {
+      toCheck = connections.filter((c) => !validated.has(c.id));
+    }
+    if (toCheck.length === 0)
+      return gate;
+    const results = await validateEach(registry, toCheck, timeoutMs);
+    const namedFailure = results.find((r2) => !r2.ok && named.has(r2.conn.id));
+    if (namedFailure)
+      throw unreachable(namedFailure);
+    const failed = /* @__PURE__ */ new Set();
+    for (const r2 of results) {
+      validated.add(r2.conn.id);
+      if (r2.ok) {
+        if (r2.models)
+          cache.set(r2.conn.id, r2.models);
+        continue;
+      }
+      firstFailure ??= r2;
+      failed.add(r2.conn.id);
+      logger?.warn(`connection ${r2.conn.id} skipped: ${r2.message}`);
+    }
+    if (failed.size === 0)
+      return gate;
+    connections = connections.filter((c) => !failed.has(c.id));
+    if (connections.length === 0 && firstFailure)
+      throw unreachable(firstFailure);
+  }
 }
 var FINAL_EVENTS = /* @__PURE__ */ new Set(["verdict", "escalated", "budget-blocked", "error"]);
 async function buildGateDeps(setup, registry, overrides = {}) {
@@ -102536,11 +102604,13 @@ function toCliEstimate(e2) {
     warnings: []
   };
 }
-function adaptGate(g, policy, abort) {
+function adaptGate(g, policy, abort, forReview) {
+  const pick = (target) => forReview ? forReview(target) : Promise.resolve(g);
   return {
     ...abort ? { abort } : {},
     async review(ref, opts) {
-      return toCliResult(await g.review(ref, {
+      const gate = await pick(ref);
+      return toCliResult(await gate.review(ref, {
         ...opts.headSha ? { headSha: opts.headSha } : {},
         trigger: opts.trigger ?? "cli"
       }));
@@ -102550,7 +102620,8 @@ function adaptGate(g, policy, abort) {
         ...input.untrusted.commitMessages ? { commitMessages: input.untrusted.commitMessages } : {},
         ...input.untrusted.comments ? { comments: input.untrusted.comments } : {}
       };
-      return toCliResult(await g.reviewChange(input.change, { diff: input.diff, untrusted }, { persist: false, trigger: "cli-local" }));
+      const gate = await pick(input.change);
+      return toCliResult(await gate.reviewChange(input.change, { diff: input.diff, untrusted }, { persist: false, trigger: "cli-local" }));
     },
     async estimate(target) {
       return toCliEstimate(await g.estimate(isChangeRef(target) ? target : target.change));
@@ -102568,7 +102639,13 @@ function adaptGate(g, policy, abort) {
 }
 function realGateFactory(registry = defaultProviderRegistry, overrides = {}) {
   return async (setup) => {
-    const { deps: deps2, abort } = await buildGateDeps(setup, registry(), overrides);
+    const reg = registry();
+    if (setup.validateConnections && setup.catalog !== false) {
+      const { deps: deps3, abort: abort2 } = await buildGateDeps({ ...setup, catalog: false, validateConnections: false }, reg, overrides);
+      const timeout = setup.validateTimeoutMs !== void 0 ? { timeoutMs: setup.validateTimeoutMs } : {};
+      return adaptGate(createGate(deps3), setup.policy.policy, abort2, (target) => gateForReview(deps3, reg, target, timeout));
+    }
+    const { deps: deps2, abort } = await buildGateDeps(setup, reg, overrides);
     return adaptGate(createGate(deps2), setup.policy.policy, abort);
   };
 }

@@ -63,7 +63,7 @@ Outputs: `decision`, `tier`, `round`, `cost-usd`, `check-url`, `verdict-json`. T
 | `pull-requests: write` | Post the PR review and inline comments. |
 | `contents: read` | Check out the head SHA for reviewers to read. |
 
-Nothing else is needed. The `github-teams` trust provider needs to read organisation team membership, which the default `GITHUB_TOKEN` cannot do. Use the `allowlist` or `codeowners` trust provider with the Action, or the GitHub App.
+Nothing else is needed. The `github-teams` trust provider needs to read organisation team membership, which the default `GITHUB_TOKEN` cannot do. Use the `allowlist` trust provider with the Action. For `github-teams`, pass a token that can read organisation members, or use the GitHub App.
 
 ## Add a policy (optional)
 

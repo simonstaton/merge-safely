@@ -35,7 +35,7 @@ The Action enforces the per-seat and per-change ceilings. It treats the rolling-
 
 Every ceiling is checked at admission, when a review is about to be seated, on every surface. `merge-safely estimate` runs the same check without calling a model.
 
-- The App also re-evaluates the installation ceilings at webhook intake, after each job and every minute, and alerts (see below). Its setup page and alerts measure the monthly figure over the calendar month (UTC); admission uses the last 30 days.
+- The App also re-evaluates the installation ceilings at webhook intake, after each job and every minute, and alerts (see below). Its setup page, alerts and admission all measure the monthly figure over the same rolling 30 days.
 
 ## The downgrade ladder
 
