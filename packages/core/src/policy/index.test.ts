@@ -1,5 +1,6 @@
-import { describe, it, expect } from "vitest";
-import { DEFAULT_POLICY, policyHash, parsePolicy } from "./index.js";
+import { describe, expect, it } from "vitest";
+import { DEFAULT_POLICY, parsePolicy, policyHash } from "./index.js";
+
 describe("policy", () => {
   it("hashes stably", () => {
     expect(policyHash(DEFAULT_POLICY)).toHaveLength(16);
