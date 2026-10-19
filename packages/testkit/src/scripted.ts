@@ -53,13 +53,19 @@ function lookup<T>(table: Record<string, T> | undefined, seat: Seat): T | undefi
   return undefined;
 }
 
-function failure(kind: "timeout" | "error" | "insufficient-work" | "budget-exceeded", seat: Seat): ScriptResult {
+function failure(
+  kind: "timeout" | "error" | "insufficient-work" | "budget-exceeded",
+  seat: Seat,
+  input: ReviewerInput,
+): ScriptResult {
+  const judge = seat.role === "judge";
   switch (kind) {
     case "timeout":
       return {
         status: "timeout",
         output: null,
-        error: `seat ${seat.id} hit its ${seat.budget.deadlineMs}ms deadline`,
+        ...(judge ? { judgeOutput: null } : {}),
+        error: `seat deadline of ${seat.budget.deadlineMs}ms exceeded`,
         audit: {
           substantiveCalls: 2,
           totalCalls: 3,
@@ -73,11 +79,13 @@ function failure(kind: "timeout" | "error" | "insufficient-work" | "budget-excee
     case "error":
       return new Error(`fake provider error for seat ${seat.id}`);
     case "insufficient-work":
+      // Real runners never emit "insufficient-work": they return ok with what they observed and core
+      // attest() downgrades it. The model claims a pass (or votes) without having investigated.
       return {
-        status: "insufficient-work",
-        // The model claimed a pass without investigating; the runner-observed audit says otherwise.
-        output: passOutput("Looks fine to me."),
-        error: "0 substantive tool calls, 0 files read",
+        status: "ok",
+        ...(judge
+          ? { output: null, judgeOutput: confirmAll(input.candidateFindings) }
+          : { output: passOutput("Looks fine to me.") }),
         audit: {
           substantiveCalls: 0,
           totalCalls: 1,
@@ -93,7 +101,8 @@ function failure(kind: "timeout" | "error" | "insufficient-work" | "budget-excee
       return {
         status: "budget-exceeded",
         output: null,
-        error: `seat ${seat.id} exceeded its $${maxUsd} budget`,
+        ...(judge ? { judgeOutput: null } : {}),
+        error: `seat budget of $${maxUsd} exceeded`,
         audit: {
           substantiveCalls: 7,
           totalCalls: 9,
@@ -129,7 +138,7 @@ export function scriptedRuns(spec: ScriptedRunsSpec = {}): Script {
       if (typeof b !== "string") return b;
       if (b === "confirm") return confirmAll(input.candidateFindings);
       if (b === "refute" || b === "downgrade") return judgeVotes(b, input);
-      return failure(b, seat);
+      return failure(b, seat, input);
     }
     const b = lookup(spec.hunters, seat) ?? "pass";
     if (typeof b === "function") return b(seat, input);
@@ -143,7 +152,7 @@ export function scriptedRuns(spec: ScriptedRunsSpec = {}): Script {
       };
       return out;
     }
-    return failure(b, seat);
+    return failure(b, seat, input);
   };
 }
 

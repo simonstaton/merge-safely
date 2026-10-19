@@ -7,10 +7,17 @@ import type { Change, Workspace, WorkspaceHandle } from "@merge-safely/core";
 
 const run = promisify(execFile);
 
+type Files = Record<string, string> | ((change: Change) => Record<string, string>);
+
 export interface FakeWorkspaceOptions {
-  /** Files to write into every checkout, or a function of the change (e.g. a fixture's head contents). */
-  files?: Record<string, string> | ((change: Change) => Record<string, string>);
-  /** `git init` and commit the files so git-based tools work. Default true when `files` is given. */
+  /** Head contents written into every checkout, or a function of the change (e.g. a fixture's `headFiles`). */
+  files?: Files;
+  /** Base contents (e.g. a fixture's `baseFiles`), committed before the head so `git_diff` shows the change. */
+  baseFiles?: Files;
+  /**
+   * `git init` with two commits, base (`baseFiles`, or empty) then head (`files`), so git-based tools work and
+   * `handle.baseSha` is the real base commit. Default true when `files` or `baseFiles` is given.
+   */
   git?: boolean;
   /** Parent directory for checkouts. Default the OS temp dir. */
   baseDir?: string;
@@ -18,7 +25,7 @@ export interface FakeWorkspaceOptions {
 
 export interface FakeWorkspaceHandle extends WorkspaceHandle {
   seatId?: string;
-  /** The real commit in the temp repo (differs from `headSha`, which mirrors the change). */
+  /** The real head commit in the temp repo (differs from `headSha`, which mirrors the change). */
   commitSha?: string;
   disposed: boolean;
 }
@@ -70,7 +77,8 @@ export function fakeWorkspace(opts: FakeWorkspaceOptions = {}): FakeWorkspace {
   const handles: FakeWorkspaceHandle[] = [];
   let acquired = 0;
   let disposed = 0;
-  const useGit = opts.git ?? opts.files !== undefined;
+  const useGit = opts.git ?? (opts.files !== undefined || opts.baseFiles !== undefined);
+  const resolveFiles = (f: Files | undefined, change: Change) => (typeof f === "function" ? f(change) : (f ?? {}));
 
   return {
     handles,
@@ -87,23 +95,36 @@ export function fakeWorkspace(opts: FakeWorkspaceOptions = {}): FakeWorkspace {
     async acquire(change, acquireOpts) {
       const cwd = await mkdtemp(join(opts.baseDir ?? tmpdir(), "merge-safely-ws-"));
       try {
-        const files = typeof opts.files === "function" ? opts.files(change) : (opts.files ?? {});
-        for (const [path, content] of Object.entries(files)) {
-          const full = inside(cwd, path);
-          await mkdir(dirname(full), { recursive: true });
-          await writeFile(full, content);
-        }
+        const head = resolveFiles(opts.files, change);
+        const write = async (files: Record<string, string>) => {
+          for (const [path, content] of Object.entries(files)) {
+            const full = inside(cwd, path);
+            await mkdir(dirname(full), { recursive: true });
+            await writeFile(full, content);
+          }
+        };
         let commitSha: string | undefined;
+        let baseCommit: string | undefined;
         if (useGit) {
+          const base = resolveFiles(opts.baseFiles, change);
           await git(cwd, ["init", "-q", "-b", change.headRef || "main"]);
+          await write(base);
           await git(cwd, ["add", "-A"]);
-          await git(cwd, ["commit", "-q", "--allow-empty", "-m", `fixture for #${change.number}`]);
+          await git(cwd, ["commit", "-q", "--allow-empty", "-m", `base of #${change.number}`]);
+          baseCommit = await git(cwd, ["rev-parse", "HEAD"]);
+          for (const path of Object.keys(base)) if (!Object.hasOwn(head, path)) await rm(inside(cwd, path));
+          await write(head);
+          await git(cwd, ["add", "-A"]);
+          await git(cwd, ["commit", "-q", "--allow-empty", "-m", `head of #${change.number}`]);
           commitSha = await git(cwd, ["rev-parse", "HEAD"]);
+        } else {
+          await write(head);
         }
         const handle: FakeWorkspaceHandle = {
           cwd,
           headSha: change.headSha,
-          baseSha: change.baseSha,
+          // Only a commit that exists in this repo: tools resolve it for git_diff.
+          ...(baseCommit ? { baseSha: baseCommit } : {}),
           disposed: false,
           ...(acquireOpts?.seatId ? { seatId: acquireOpts.seatId } : {}),
           ...(commitSha ? { commitSha } : {}),

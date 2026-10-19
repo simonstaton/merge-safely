@@ -64,7 +64,7 @@ describe("anthropicCompatibleProvider", () => {
 
     const v = await p.validate(c);
     expect(v.ok).toBe(true);
-    expect(v.models?.map((m) => m.name)).toEqual(["claude-sonnet-5-5"]);
+    expect(v.models?.map((m) => [m.name, m.provider])).toEqual([["claude-sonnet-5-5", "anthropic-compatible"]]);
 
     const run = await p.createRunner(c, model()).run(seat(), input(), ws());
     expect(run.output?.verdict).toBe("pass");
@@ -91,7 +91,8 @@ describe("anthropicCompatibleProvider", () => {
       },
     });
     const models = await p.models(proxy());
-    expect(models.map((m) => m.name)).toEqual(["claude-haiku-4-5"]);
+    expect(models.map((m) => [m.name, m.provider])).toEqual([["claude-haiku-4-5", "anthropic-compatible"]]);
+    expect(models[0]?.pricing).toBeDefined();
     expect(got[0]?.secret).toMatchObject({
       kind: "anthropic-compatible",
       baseUrl: "https://gateway.example/anthropic",

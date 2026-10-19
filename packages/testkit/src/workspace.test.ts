@@ -41,17 +41,33 @@ describe("fakeWorkspace", () => {
     expect([wsp.acquired, wsp.disposed, wsp.active]).toEqual([2, 1, 1]);
   });
 
-  it("git-inits with one commit so git-based tools work", async () => {
+  it("commits base then head so baseSha is real and git diff shows the change", async () => {
     const f = sampleFixtures.authMigration;
-    wsp = fakeWorkspace({ files: f.headFiles });
+    wsp = fakeWorkspace({ baseFiles: f.baseFiles, files: f.headFiles });
     const h = await wsp.acquire(f.change);
-    const { stdout: log } = await run("git", ["log", "--oneline"], { cwd: h.cwd });
-    expect(log.trim().split("\n")).toHaveLength(1);
-    const { stdout: tracked } = await run("git", ["ls-files"], { cwd: h.cwd });
-    expect(tracked).toContain("src/auth/session.ts");
+    const { stdout: log } = await run("git", ["log", "--format=%H"], { cwd: h.cwd });
+    expect(log.trim().split("\n")).toEqual([h.commitSha, h.baseSha]);
+    expect(h.headSha).toBe(f.change.headSha);
+    const { stdout: names } = await run("git", ["diff", "--name-only", `${h.baseSha}`, "HEAD"], { cwd: h.cwd });
+    expect(names.trim().split("\n").sort()).toEqual(f.change.files.map((x) => x.path).sort());
     const { stdout: status } = await run("git", ["status", "--porcelain"], { cwd: h.cwd });
     expect(status.trim()).toBe("");
-    expect(h.commitSha).toMatch(/^[0-9a-f]{40}$/);
+  });
+
+  it("removes base-only files from the head commit", async () => {
+    wsp = fakeWorkspace({ baseFiles: { "gone.txt": "x\n", "kept.txt": "k\n" }, files: { "kept.txt": "k2\n" } });
+    const h = await wsp.acquire(makeChange());
+    expect(await exists(join(h.cwd, "gone.txt"))).toBe(false);
+    const { stdout } = await run("git", ["diff", "--name-status", `${h.baseSha}`, "HEAD"], { cwd: h.cwd });
+    expect(stdout.trim().split("\n").sort()).toEqual(["D\tgone.txt", "M\tkept.txt"]);
+  });
+
+  it("without base files the base commit is empty but still resolves", async () => {
+    wsp = fakeWorkspace({ files: { "a.txt": "a\n" } });
+    const h = await wsp.acquire(makeChange());
+    expect(h.baseSha).toMatch(/^[0-9a-f]{40}$/);
+    const { stdout } = await run("git", ["cat-file", "-t", h.baseSha as string], { cwd: h.cwd });
+    expect(stdout.trim()).toBe("commit");
   });
 
   it("accepts files as a function of the change and can skip git", async () => {
@@ -60,6 +76,7 @@ describe("fakeWorkspace", () => {
     expect(await readFile(join(h.cwd, "PR.txt"), "utf8")).toBe("#42\n");
     expect(await exists(join(h.cwd, ".git"))).toBe(false);
     expect(h.commitSha).toBeUndefined();
+    expect(h.baseSha).toBeUndefined();
   });
 
   it("refuses paths that escape the checkout and leaves nothing behind", async () => {

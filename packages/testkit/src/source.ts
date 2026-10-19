@@ -2,8 +2,10 @@ import type { Change, ChangedFile, ChangeRef, RepoRef, SourceProvider } from "@m
 
 export interface SourceFixture {
   change: Change;
-  /** Full base...head diff. */
+  /** Full base...head diff for `change.headSha`. */
   diff: string;
+  /** Full base...head diffs for other (older or newer) head SHAs, for `getDiff(ref, { headSha })`. */
+  diffs?: Record<string, string>;
   /** Delta diffs keyed by `sinceSha`. */
   deltas?: Record<string, string>;
   commitMessages?: string[];
@@ -19,7 +21,7 @@ export type SourceCall =
 export interface FakeSource extends SourceProvider {
   /** Every call, in order. */
   readonly calls: SourceCall[];
-  /** The live fixtures; mutate `fixtures[i].change.headSha` to simulate a push between calls. */
+  /** The live fixtures; change `fixtures[i].change.headSha` (and add the old head to `diffs`) to simulate a push. */
   readonly fixtures: SourceFixture[];
   getUntrustedContext(ref: ChangeRef): Promise<{ commitMessages: string[]; comments: string[] }>;
   listOpenChanges(repo: RepoRef): AsyncIterable<ChangeRef>;
@@ -31,8 +33,9 @@ const sameRepo = (a: RepoRef, b: RepoRef) => a.host === b.host && a.owner === b.
 
 /**
  * A SourceProvider over in-memory fixtures. Values are cloned on the way out so a pipeline cannot mutate the
- * fixture. `getDiff` with `headSha` throws when it does not match the fixture head (the PR moved), and with a
- * `sinceSha` that has no delta fixture.
+ * fixture. Like the GitHub source, `getDiff` with a pinned `headSha` returns the diff for that SHA: the
+ * fixture `diff` when it is the current head, else `diffs[headSha]`. It throws only for a SHA it has no
+ * diff for, and for a `sinceSha` with no `deltas` entry.
  */
 export function fakeSource(fixture: SourceFixture | SourceFixture[]): FakeSource {
   const fixtures = Array.isArray(fixture) ? fixture : [fixture];
@@ -52,15 +55,16 @@ export function fakeSource(fixture: SourceFixture | SourceFixture[]): FakeSource
     async getDiff(ref, opts) {
       calls.push({ method: "getDiff", ref, ...(opts ? { opts } : {}) });
       const f = find(ref);
-      if (opts?.headSha && opts.headSha !== f.change.headSha) {
-        throw new Error(`fake source: head moved (asked for ${opts.headSha}, head is ${f.change.headSha})`);
-      }
       if (opts?.sinceSha) {
         const delta = f.deltas?.[opts.sinceSha];
         if (delta === undefined) throw new Error(`fake source: no delta fixture since ${opts.sinceSha}`);
         return delta;
       }
-      return f.diff;
+      const head = opts?.headSha ?? f.change.headSha;
+      const pinned = f.diffs?.[head];
+      if (pinned !== undefined) return pinned;
+      if (head === f.change.headSha) return f.diff;
+      throw new Error(`fake source: no diff fixture for head ${head}`);
     },
     async getUntrustedContext(ref) {
       calls.push({ method: "getUntrustedContext", ref });

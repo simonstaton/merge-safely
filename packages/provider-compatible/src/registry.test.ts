@@ -33,7 +33,7 @@ const EXPECTED: Record<keyof typeof INPUT, { kind: string; provider: string }> =
   openrouter: { kind: "openai-compatible", provider: "openai-compatible" },
   groq: { kind: "openai-compatible", provider: "openai-compatible" },
   ollama: { kind: "openai-compatible", provider: "ollama" },
-  lmstudio: { kind: "openai-compatible", provider: "openai-compatible" },
+  lmstudio: { kind: "openai-compatible", provider: "lmstudio" },
   gemini: { kind: "api-key", provider: "gemini" },
 };
 
@@ -62,14 +62,11 @@ describe("allProviders + ProviderRegistry", () => {
     expect(groq?.label).toBe("groq");
   });
 
-  it("a connection naming provider lmstudio directly resolves to the lmstudio preset", () => {
-    const p = registry.forConnection({
-      id: "lms",
-      provider: "lmstudio",
-      kind: "openai-compatible",
-      createdAt: NOW().toISOString(),
-    });
-    expect(p.id).toBe("lmstudio");
+  it("local gateways keep their own provider id and default base URL", () => {
+    const lms = connections.find((c) => c.id === "lmstudio");
+    expect(lms?.provider).toBe("lmstudio");
+    expect(lms?.secret).toMatchObject({ kind: "openai-compatible", baseUrl: "http://localhost:1234/v1" });
+    expect(connections.find((c) => c.id === "ollama")?.provider).toBe("ollama");
   });
 
   it("registers each provider id exactly once", () => {

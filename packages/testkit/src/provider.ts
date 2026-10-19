@@ -13,6 +13,8 @@ import type {
   RunnerOptions,
   Seat,
   TokenUsage,
+  ToolCall,
+  ToolResult,
   ToolUseAudit,
   ValidationResult,
   WorkspaceHandle,
@@ -37,8 +39,11 @@ export interface FakeProviderOptions {
   tokens?: TokenUsage;
   /** Usage is streamed to `onUsage` in this many deltas summing to the run total. Default 2. */
   usageChunks?: number;
-  /** Simulated latency per run, honouring the abort signal (an aborted run returns status "timeout"). */
-  delayMs?: number;
+  /**
+   * Simulated latency per run (real time), fixed or per seat. It races `seat.budget.deadlineMs` (status
+   * "timeout" with partial usage) and the caller's abort signal (status "error" with partial usage).
+   */
+  delayMs?: number | ((seat: Seat, input: ReviewerInput) => number);
   /** Clock for `startedAt`. Default the real clock. */
   now?: () => Date;
 }
@@ -53,6 +58,8 @@ export interface FakeCall {
   run: ReviewerRun;
   /** Every usage delta streamed for this run, in order. */
   usage: Array<{ tokens: TokenUsage; usd?: number }>;
+  /** Every tool event emitted to `onToolCall` (one per `audit.totalCalls`). */
+  toolCalls: ToolCall[];
 }
 
 export interface FakeProvider extends ModelProvider {
@@ -61,7 +68,7 @@ export interface FakeProvider extends ModelProvider {
   /** Connections passed to `validate()`. */
   readonly validated: Connection[];
   /** Number of `createRunner()` calls. */
-  runnersCreated: number;
+  readonly runnersCreated: number;
   /** Clear `calls`, `validated` and `runnersCreated`. */
   reset(): void;
 }
@@ -127,18 +134,22 @@ export function confirmAll(candidates: Finding[] = []): JudgeOutput {
 const defaultScript: Script = (seat, input) =>
   seat.role === "judge" ? confirmAll(input.candidateFindings) : passOutput();
 
-function abortableDelay(ms: number, signal?: AbortSignal): Promise<boolean> {
+type RaceOutcome = { kind: "done" } | { kind: "deadline" } | { kind: "abort"; elapsedMs: number };
+
+/** Wait `delayMs`, unless the seat deadline or the caller's abort comes first. */
+function race(delayMs: number, deadlineMs: number, signal?: AbortSignal): Promise<RaceOutcome> {
   return new Promise((resolve) => {
-    if (signal?.aborted) return resolve(false);
-    const t = setTimeout(() => {
+    const t0 = Date.now();
+    const timers: ReturnType<typeof setTimeout>[] = [];
+    const finish = (o: RaceOutcome) => {
+      for (const t of timers) clearTimeout(t);
       signal?.removeEventListener("abort", onAbort);
-      resolve(true);
-    }, ms);
-    const onAbort = () => {
-      clearTimeout(t);
-      resolve(false);
+      resolve(o);
     };
+    const onAbort = () => finish({ kind: "abort", elapsedMs: Date.now() - t0 });
     signal?.addEventListener("abort", onAbort, { once: true });
+    timers.push(setTimeout(() => finish({ kind: "done" }), delayMs));
+    if (deadlineMs > 0 && deadlineMs < delayMs) timers.push(setTimeout(() => finish({ kind: "deadline" }), deadlineMs));
   });
 }
 
@@ -160,55 +171,110 @@ function splitUsage(tokens: TokenUsage, usd: number, chunks: number): Array<{ to
 
 const hasTokens = (t: TokenUsage) => t.in + t.out + (t.cachedIn ?? 0) + (t.cacheWrite ?? 0) > 0;
 
+/** The work a run did before it was cut off after `fraction` (0..1) of its simulated latency. */
+function partialAudit(input: ReviewerInput, tokens: TokenUsage, fraction: number, wallMs: number): ToolUseAudit {
+  const f = Math.min(1, Math.max(0, fraction));
+  const full = passingAudit(input, tokens);
+  return {
+    substantiveCalls: Math.floor(full.substantiveCalls * f),
+    totalCalls: Math.floor(full.totalCalls * f),
+    filesRead: full.filesRead.slice(0, Math.floor(full.filesRead.length * f)),
+    commandsRun: [],
+    tokens: { in: Math.floor(tokens.in * f), out: Math.floor(tokens.out * f) },
+    wallMs: Math.round(wallMs),
+    turns: Math.floor(full.turns * f),
+  };
+}
+
+/** Tool events consistent with the audit: reads for filesRead, searches up to substantiveCalls, list_dir after. */
+function toolEvents(audit: ToolUseAudit): Array<[ToolCall, ToolResult]> {
+  const out: Array<[ToolCall, ToolResult]> = [];
+  for (let i = 0; i < audit.totalCalls; i++) {
+    const path = audit.filesRead[i];
+    if (path !== undefined && i < audit.substantiveCalls) {
+      out.push([
+        { id: `fake_${i}`, name: "read_file", input: { path } },
+        { ok: true, output: `(fake contents of ${path})`, filesRead: [path] },
+      ]);
+    } else if (i < audit.substantiveCalls) {
+      out.push([
+        { id: `fake_${i}`, name: "search", input: { pattern: "TODO" } },
+        { ok: true, output: "" },
+      ]);
+    } else {
+      out.push([
+        { id: `fake_${i}`, name: "list_dir", input: { path: "." } },
+        { ok: true, output: "src/" },
+      ]);
+    }
+  }
+  return out;
+}
+
+/**
+ * Give the run the shape a real runner would: judges carry `judgeOutput` (null on failure) and never a hunter
+ * `output`; hunters never carry `judgeOutput`. Output of the wrong role is `schema-invalid`.
+ */
+function shapeForRole(seat: Seat, run: ReviewerRun): ReviewerRun {
+  const r: ReviewerRun = { ...run };
+  if (seat.role === "judge") {
+    if (r.status === "ok" && r.judgeOutput == null) {
+      r.status = "schema-invalid";
+      r.error = r.output ? "judge seat returned a hunter review" : "judge seat returned no votes";
+    }
+    r.output = null;
+    r.judgeOutput = r.judgeOutput ?? null;
+  } else {
+    if (r.status === "ok" && r.output === null) {
+      r.status = "schema-invalid";
+      r.error = r.judgeOutput ? "hunter seat returned judge votes" : "hunter seat returned no review";
+    }
+    delete r.judgeOutput;
+  }
+  return r;
+}
+
 /**
  * A scriptable ModelProvider. Each `run()` asks the script for the seat's result, fills the rest of the
- * `ReviewerRun` with defaults that pass attestation, streams usage through `onUsage`, and records the call.
+ * `ReviewerRun` with defaults that pass attestation, enforces the seat deadline and `maxUsd` like the real
+ * runners, streams usage through `onUsage`, emits tool events, and records the call.
  */
 export function fakeProvider(opts: FakeProviderOptions = {}): FakeProvider {
   const id = opts.id ?? "fake";
   const models = opts.models ?? [fakeModel({ provider: id })];
   const script = opts.script ?? defaultScript;
   const now = opts.now ?? (() => new Date());
+  const tokens = opts.tokens ?? DEFAULT_TOKENS;
   const calls: FakeCall[] = [];
   const validated: Connection[] = [];
+  let runnersCreated = 0;
 
-  function buildRun(seat: Seat, input: ReviewerInput, result: ScriptResult, startedAt: Date): ReviewerRun {
-    const base = (status: ReviewerRun["status"], audit: ToolUseAudit): ReviewerRun => ({
+  function skeleton(seat: Seat, input: ReviewerInput, audit: ToolUseAudit, startedAt: Date): ReviewerRun {
+    return {
       seat,
       headSha: input.change.headSha,
       round: input.round,
       output: null,
       audit,
-      status,
+      status: "ok",
       startedAt: startedAt.toISOString(),
       finishedAt: new Date(startedAt.getTime() + audit.wallMs).toISOString(),
-    });
-    const tokens = opts.tokens ?? DEFAULT_TOKENS;
+    };
+  }
 
+  function fromScript(seat: Seat, input: ReviewerInput, result: ScriptResult, startedAt: Date): ReviewerRun {
     if (result instanceof Error) {
       // Failed before doing any work: nothing read, nothing spent.
-      const audit: ToolUseAudit = {
-        ...passingAudit(input, { in: 0, out: 0 }),
-        substantiveCalls: 0,
-        totalCalls: 0,
-        filesRead: [],
-        turns: 0,
-      };
-      return {
-        ...base("error", audit),
-        error: result.message,
-        ...(seat.role === "judge" ? { judgeOutput: null } : {}),
-      };
+      const audit = partialAudit(input, tokens, 0, 0);
+      return { ...skeleton(seat, input, audit, startedAt), status: "error", error: result.message };
     }
-    if (isJudgeOutput(result)) {
-      return { ...base("ok", passingAudit(input, tokens)), judgeOutput: result };
-    }
-    if (isReviewerOutput(result)) {
-      return { ...base("ok", passingAudit(input, tokens)), output: result };
-    }
+    if (isJudgeOutput(result))
+      return { ...skeleton(seat, input, passingAudit(input, tokens), startedAt), judgeOutput: result };
+    if (isReviewerOutput(result))
+      return { ...skeleton(seat, input, passingAudit(input, tokens), startedAt), output: result };
     // Partial run: merge over the defaults (audit merged field by field).
     const audit = { ...passingAudit(input, tokens), ...(result.audit ?? {}) };
-    const merged: ReviewerRun = { ...base("ok", audit), ...result, audit };
+    const merged: ReviewerRun = { ...skeleton(seat, input, audit, startedAt), ...result, audit };
     if (result.startedAt && !result.finishedAt) {
       merged.finishedAt = new Date(Date.parse(result.startedAt) + audit.wallMs).toISOString();
     }
@@ -219,7 +285,45 @@ export function fakeProvider(opts: FakeProviderOptions = {}): FakeProvider {
     return merged;
   }
 
-  return {
+  async function execute(seat: Seat, input: ReviewerInput, signal?: AbortSignal): Promise<ReviewerRun> {
+    const startedAt = now();
+    if (signal?.aborted) {
+      return {
+        ...skeleton(seat, input, partialAudit(input, tokens, 0, 0), startedAt),
+        status: "error",
+        error: "run aborted by caller",
+      };
+    }
+    const delay = typeof opts.delayMs === "function" ? opts.delayMs(seat, input) : (opts.delayMs ?? 0);
+    if (delay > 0) {
+      const outcome = await race(delay, seat.budget.deadlineMs, signal);
+      if (outcome.kind === "deadline") {
+        const d = seat.budget.deadlineMs;
+        return {
+          ...skeleton(seat, input, partialAudit(input, tokens, d / delay, d), startedAt),
+          status: "timeout",
+          error: `seat deadline of ${d}ms exceeded`,
+        };
+      }
+      if (outcome.kind === "abort") {
+        const e = outcome.elapsedMs;
+        return {
+          ...skeleton(seat, input, partialAudit(input, tokens, e / delay, e), startedAt),
+          status: "error",
+          error: "run aborted by caller",
+        };
+      }
+    }
+    let result: ScriptResult;
+    try {
+      result = await script(seat, input);
+    } catch (err: unknown) {
+      result = err instanceof Error ? err : new Error(String(err));
+    }
+    return fromScript(seat, input, result, startedAt);
+  }
+
+  const provider: FakeProvider = {
     id,
     connectionKinds: opts.connectionKinds ?? [
       "api-key",
@@ -231,61 +335,62 @@ export function fakeProvider(opts: FakeProviderOptions = {}): FakeProvider {
     ],
     calls,
     validated,
-    runnersCreated: 0,
-
-    reset() {
-      calls.length = 0;
-      validated.length = 0;
-      this.runnersCreated = 0;
+    get runnersCreated() {
+      return runnersCreated;
     },
 
-    async validate(conn: Connection): Promise<ValidationResult> {
+    reset: () => {
+      calls.length = 0;
+      validated.length = 0;
+      runnersCreated = 0;
+    },
+
+    validate: async (conn: Connection): Promise<ValidationResult> => {
       validated.push(conn);
       if (typeof opts.validate === "function") return opts.validate(conn);
       return opts.validate ?? { ok: true, message: "fake provider", models, latencyMs: 1 };
     },
 
-    async models(): Promise<ModelInfo[]> {
-      return models.map((m) => ({ ...m }));
-    },
+    models: async (): Promise<ModelInfo[]> => models.map((m) => ({ ...m })),
 
-    createRunner(conn: Connection, model: ModelInfo, runnerOpts: RunnerOptions = {}): ModelRunner {
-      this.runnersCreated++;
-      return {
-        async run(seat: Seat, input: ReviewerInput, ws: WorkspaceHandle, signal?: AbortSignal): Promise<ReviewerRun> {
-          const startedAt = now();
-          let run: ReviewerRun;
-          const completed = opts.delayMs ? await abortableDelay(opts.delayMs, signal) : !signal?.aborted;
-          if (!completed) {
-            run = buildRun(seat, input, { status: "timeout", output: null, error: "aborted" }, startedAt);
-          } else {
-            let result: ScriptResult;
-            try {
-              result = await script(seat, input);
-            } catch (err: unknown) {
-              result = err instanceof Error ? err : new Error(String(err));
-            }
-            run = buildRun(seat, input, result, startedAt);
-          }
-          if (run.audit.costUsd === undefined) run.audit = { ...run.audit, costUsd: fakeUsd(model, run.audit.tokens) };
+    createRunner: (conn: Connection, model: ModelInfo, runnerOpts: RunnerOptions = {}): ModelRunner => {
+      runnersCreated++;
+      const run = async (
+        seat: Seat,
+        input: ReviewerInput,
+        ws: WorkspaceHandle,
+        signal?: AbortSignal,
+      ): Promise<ReviewerRun> => {
+        let r = shapeForRole(seat, await execute(seat, input, signal));
+        if (r.audit.costUsd === undefined) r.audit = { ...r.audit, costUsd: fakeUsd(model, r.audit.tokens) };
+        const maxUsd = seat.budget.maxUsd;
+        if (r.status === "ok" && maxUsd !== undefined && (r.audit.costUsd ?? 0) > maxUsd) {
+          r = {
+            ...r,
+            status: "budget-exceeded",
+            output: null,
+            ...(seat.role === "judge" ? { judgeOutput: null } : {}),
+            error: `seat budget of $${maxUsd} exceeded ($${(r.audit.costUsd ?? 0).toFixed(4)})`,
+          };
+        }
 
-          const usage: FakeCall["usage"] = [];
-          if (hasTokens(run.audit.tokens)) {
-            for (const d of splitUsage(run.audit.tokens, run.audit.costUsd ?? 0, opts.usageChunks ?? 2)) {
-              usage.push(d);
-              runnerOpts.onUsage?.(d);
-            }
+        const usage: FakeCall["usage"] = [];
+        if (hasTokens(r.audit.tokens)) {
+          for (const d of splitUsage(r.audit.tokens, r.audit.costUsd ?? 0, opts.usageChunks ?? 2)) {
+            usage.push(d);
+            runnerOpts.onUsage?.(d);
           }
-          for (const path of run.audit.filesRead) {
-            runnerOpts.onToolCall?.(
-              { name: "read_file", input: { path } },
-              { ok: true, output: `(fake contents of ${path})`, filesRead: [path] },
-            );
-          }
-          calls.push({ seat, input, ws, connection: conn, model, run, usage });
-          return run;
-        },
+        }
+        const toolCalls: ToolCall[] = [];
+        for (const [call, result] of toolEvents(r.audit)) {
+          toolCalls.push(call);
+          runnerOpts.onToolCall?.(call, result);
+        }
+        calls.push({ seat, input, ws, connection: conn, model, run: r, usage, toolCalls });
+        return r;
       };
+      return { run };
     },
   };
+  return provider;
 }

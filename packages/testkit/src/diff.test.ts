@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { DEFAULT_POLICY, tier, triage } from "@merge-safely/core";
 import { describe, expect, it } from "vitest";
 import { diffFromFiles, type FileContents, hunksFor, parseUnifiedDiff } from "./diff.js";
 import { sampleFixtures } from "./fixtures.js";
@@ -122,11 +123,21 @@ describe("sampleFixtures", () => {
     }
   });
 
-  it("covers tiers 0, 1 and 3, with the auth fixture on critical paths", () => {
-    expect(sampleFixtures.all().map((f) => f.expectedTier)).toEqual([0, 1, 3]);
-    const paths = sampleFixtures.authMigration.change.files.map((f) => f.path);
-    expect(paths).toContain("src/auth/session.ts");
-    expect(paths.some((p) => p.startsWith("migrations/") && p.endsWith(".sql"))).toBe(true);
+  it.each(sampleFixtures.all().map((f) => [f.name, f] as const))(
+    "%s gets its expected tier and triage from the real core stages",
+    (_n, f) => {
+      const t = tier(f.change, DEFAULT_POLICY);
+      expect(t.level).toBe(f.expectedTier);
+      expect(triage(f.change, t, DEFAULT_POLICY).decision).toBe(f.expectedTier === 0 ? "auto-pass" : "review");
+    },
+  );
+
+  it("tier 1 is on size and spread alone, tier 3 on critical paths", () => {
+    const small = tier(sampleFixtures.smallLogic.change, DEFAULT_POLICY);
+    expect(small.factors.criticalPathHits).toEqual([]);
+    expect(small.score).toBeGreaterThanOrEqual(DEFAULT_POLICY.tiers.thresholds.t1 + 1);
+    const auth = tier(sampleFixtures.authMigration.change, DEFAULT_POLICY);
+    expect(auth.factors.criticalPathHits).toEqual(expect.arrayContaining(["**/auth/**", "**/migrations/**"]));
     expect(sampleFixtures.docsOnly.change.files.every((f) => f.path.endsWith(".md"))).toBe(true);
   });
 

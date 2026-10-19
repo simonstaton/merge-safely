@@ -30,11 +30,19 @@ describe("fakeSource", () => {
     ]);
   });
 
-  it("throws when the head moved, for an unknown delta and for an unknown change", async () => {
+  it("serves the diff for a pinned older head, like the GitHub source", async () => {
+    const f = { ...fixture(), diffs: { [fakeSha("old-head")]: "diff --git a/old b/old\n" } };
+    const src = fakeSource(f);
+    const ref = changeRef(f.change);
+    expect(await src.getDiff(ref, { headSha: fakeSha("old-head") })).toBe("diff --git a/old b/old\n");
+    expect(await src.getDiff(ref, { headSha: f.change.headSha })).toBe(f.diff);
+  });
+
+  it("throws only for an unknown head, an unknown delta or an unknown change", async () => {
     const f = fixture();
     const src = fakeSource(f);
     const ref = changeRef(f.change);
-    await expect(src.getDiff(ref, { headSha: fakeSha("other") })).rejects.toThrow(/head moved/);
+    await expect(src.getDiff(ref, { headSha: fakeSha("other") })).rejects.toThrow(/no diff fixture for head/);
     await expect(src.getDiff(ref, { sinceSha: "nope" })).rejects.toThrow(/no delta/);
     await expect(src.getChange({ ...ref, number: 999 })).rejects.toThrow(/no change/);
   });

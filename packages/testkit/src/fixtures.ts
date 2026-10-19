@@ -77,19 +77,140 @@ const DISCOUNT_AFTER = `export interface Cart {
   items: number;
 }
 
-export const BULK_MIN_ITEMS = 10;
+export interface DiscountTier {
+  minItems: number;
+  rate: number;
+}
+
+/** Bulk tiers, highest first. Each tier's rate applies to the whole subtotal. */
+export const BULK_TIERS: readonly DiscountTier[] = [
+  { minItems: 50, rate: 0.2 },
+  { minItems: 25, rate: 0.15 },
+  { minItems: 10, rate: 0.1 },
+];
+
 export const BULK_CAP_CENTS = 5_000;
 
-/** Bulk discount: 10% off carts of 10 or more items, capped at $50. Never discounts an empty subtotal. */
+export function tierFor(items: number): DiscountTier | undefined {
+  return BULK_TIERS.find((t) => items >= t.minItems);
+}
+
+/**
+ * Bulk discount for a cart, capped at $50. Floors to whole cents so the discount never exceeds the rate,
+ * and never discounts an empty or negative subtotal.
+ */
 export function bulkDiscountCents(cart: Cart): number {
-  if (cart.items < BULK_MIN_ITEMS || cart.subtotalCents <= 0) return 0;
-  const discount = Math.floor(cart.subtotalCents * 0.1);
+  if (cart.subtotalCents <= 0) return 0;
+  const tier = tierFor(cart.items);
+  if (!tier) return 0;
+  const discount = Math.floor(cart.subtotalCents * tier.rate);
   return Math.min(discount, BULK_CAP_CENTS);
 }
 
 export function totalCents(cart: Cart): number {
-  return cart.subtotalCents - bulkDiscountCents(cart);
+  return Math.max(0, cart.subtotalCents - bulkDiscountCents(cart));
 }
+`;
+
+const TOTALS_BEFORE = `import { type Cart, totalCents } from "../pricing/discount.js";
+
+export interface LineItem {
+  sku: string;
+  unitCents: number;
+  quantity: number;
+}
+
+export function cartOf(lines: LineItem[]): Cart {
+  return {
+    subtotalCents: lines.reduce((n, l) => n + l.unitCents * l.quantity, 0),
+    items: lines.reduce((n, l) => n + l.quantity, 0),
+  };
+}
+
+export function orderTotalCents(lines: LineItem[]): number {
+  return totalCents(cartOf(lines));
+}
+`;
+
+const TOTALS_AFTER = `import { bulkDiscountCents, type Cart, tierFor, totalCents } from "../pricing/discount.js";
+
+export interface LineItem {
+  sku: string;
+  unitCents: number;
+  quantity: number;
+}
+
+export interface OrderSummary {
+  subtotalCents: number;
+  discountCents: number;
+  totalCents: number;
+  /** The bulk tier applied, as a whole-number percentage, or 0. */
+  discountPercent: number;
+}
+
+export function cartOf(lines: LineItem[]): Cart {
+  // Ignore zero and negative quantities: they come from cleared basket rows, not returns.
+  const counted = lines.filter((l) => l.quantity > 0);
+  return {
+    subtotalCents: counted.reduce((n, l) => n + l.unitCents * l.quantity, 0),
+    items: counted.reduce((n, l) => n + l.quantity, 0),
+  };
+}
+
+export function orderTotalCents(lines: LineItem[]): number {
+  return totalCents(cartOf(lines));
+}
+
+export function summarise(lines: LineItem[]): OrderSummary {
+  const cart = cartOf(lines);
+  const discountCents = bulkDiscountCents(cart);
+  return {
+    subtotalCents: cart.subtotalCents,
+    discountCents,
+    totalCents: totalCents(cart),
+    discountPercent: Math.round((tierFor(cart.items)?.rate ?? 0) * 100),
+  };
+}
+`;
+
+const DISCOUNT_TEST = `import { describe, expect, it } from "vitest";
+import { summarise } from "../../src/checkout/totals.js";
+import { BULK_CAP_CENTS, bulkDiscountCents, tierFor, totalCents } from "../../src/pricing/discount.js";
+
+describe("bulkDiscountCents", () => {
+  it("gives nothing below ten items", () => {
+    expect(bulkDiscountCents({ subtotalCents: 10_000, items: 9 })).toBe(0);
+  });
+
+  it("picks the highest tier the cart reaches", () => {
+    expect(tierFor(10)?.rate).toBe(0.1);
+    expect(tierFor(25)?.rate).toBe(0.15);
+    expect(tierFor(80)?.rate).toBe(0.2);
+  });
+
+  it("floors to whole cents", () => {
+    expect(bulkDiscountCents({ subtotalCents: 1_005, items: 10 })).toBe(100);
+  });
+
+  it("is capped", () => {
+    expect(bulkDiscountCents({ subtotalCents: 1_000_000, items: 60 })).toBe(BULK_CAP_CENTS);
+  });
+
+  it("never discounts an empty subtotal or goes negative", () => {
+    expect(bulkDiscountCents({ subtotalCents: 0, items: 12 })).toBe(0);
+    expect(totalCents({ subtotalCents: -50, items: 12 })).toBe(0);
+  });
+});
+
+describe("summarise", () => {
+  it("ignores cleared rows and reports the tier", () => {
+    const s = summarise([
+      { sku: "a", unitCents: 400, quantity: 30 },
+      { sku: "b", unitCents: 999, quantity: 0 },
+    ]);
+    expect(s).toEqual({ subtotalCents: 12_000, discountCents: 1_800, totalCents: 10_200, discountPercent: 15 });
+  });
+});
 `;
 
 const SESSION_BEFORE = `import { randomBytes } from "node:crypto";
@@ -222,7 +343,11 @@ function docsOnly(): SampleFixture {
     title: "docs: document dev server port and SESSION_TTL_HOURS",
     body: "Docs only. No code changes.",
     labels: ["documentation"],
-    unchanged: { "package.json": PACKAGE_JSON, "src/pricing/discount.ts": DISCOUNT_BEFORE },
+    unchanged: {
+      "package.json": PACKAGE_JSON,
+      "src/pricing/discount.ts": DISCOUNT_BEFORE,
+      "src/checkout/totals.ts": TOTALS_BEFORE,
+    },
     files: [{ path: "README.md", before: README_BEFORE, after: README_AFTER }],
     commitMessages: ["docs: document dev server port and SESSION_TTL_HOURS"],
   });
@@ -231,14 +356,19 @@ function docsOnly(): SampleFixture {
 function smallLogic(): SampleFixture {
   return build({
     name: "small-logic",
-    description: "A boundary fix in one pricing file: small, no critical paths (tier 1).",
+    description:
+      "Tiered bulk discounts across pricing, checkout and a new test file: ~100 lines, 3 modules, no critical paths (tier 1).",
     expectedTier: 1,
     number: 102,
-    title: "pricing: never discount an empty subtotal; floor instead of round",
-    body: "Fixes a 1-cent over-discount on odd subtotals and a negative total for zero-value carts.",
+    title: "pricing: tiered bulk discounts; floor instead of round",
+    body: "Adds 15% and 20% tiers, floors to whole cents, ignores cleared basket rows, and adds an order summary.",
     unchanged: { "package.json": PACKAGE_JSON, "README.md": README_BEFORE },
-    files: [{ path: "src/pricing/discount.ts", before: DISCOUNT_BEFORE, after: DISCOUNT_AFTER }],
-    commitMessages: ["pricing: floor bulk discount and guard empty subtotal"],
+    files: [
+      { path: "src/pricing/discount.ts", before: DISCOUNT_BEFORE, after: DISCOUNT_AFTER },
+      { path: "src/checkout/totals.ts", before: TOTALS_BEFORE, after: TOTALS_AFTER },
+      { path: "test/pricing/discount.test.ts", after: DISCOUNT_TEST },
+    ],
+    commitMessages: ["pricing: tiered bulk discounts", "checkout: order summary; ignore cleared rows"],
     comments: ["Can we get a test for the 0-cent case?"],
   });
 }

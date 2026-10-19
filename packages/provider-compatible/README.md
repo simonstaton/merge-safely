@@ -26,18 +26,30 @@ const provider = registry.forConnection(conn); // anthropic, openai, gemini, or 
 | `allProviders(opts?)` | | | `anthropic`, `openai`, `gemini` plus `compatibleProviders()`. Options: `{ anthropic?, openai?, gemini? }`. |
 
 Local presets:
+- accept only `openai-compatible` secrets: `validate` returns `ok: false`, and `models` / `createRunner` throw for any
+  other kind, so an `api-key` secret is never sent to api.openai.com under a "local" (zero-cost) label;
 - fill the default base URL when the secret's is empty, and send the `KEYLESS_PLACEHOLDER` key (never `OPENAI_API_KEY`
   from the environment);
 - use Chat Completions unless the connection sets `options.api: "responses"`;
-- mark every model `zeroCost: true` with no pricing, tier from the registry's local table when the family is known,
-  else `"mid"`. A `-cloud` / `:cloud` tag (served remotely by the vendor) is never free and is priced pessimistically
-  when it has no pricing.
+- report models under the connection's provider id, with the tier from the registry entry for that id when known,
+  else `"mid"`.
+
+**Zero cost rule.** Models are `zeroCost: true` (no pricing) only when the base URL host is local: `localhost` /
+`*.localhost`, IPv4 loopback, RFC 1918 (10/8, 172.16/12, 192.168/16) and link-local (169.254/16), IPv6 `::1`,
+unique-local `fc00::/7` and link-local `fe80::/10`. Any other host, for example `https://ollama.com/v1` or a
+hostname like `gpu-box.lan` (not resolved), keeps the registry pricing or gets the pessimistic fallback, so budgets
+and the ledger still enforce. `options.zeroCost: true` opts a self-hosted box in; `options.zeroCost: false` forces
+pricing even on localhost. A `-cloud` / `:cloud` tag is served remotely and is always priced.
+
+`anthropicCompatibleProvider` reports models under the connection's provider id too (the Anthropic adapter stamps
+`anthropic`); pricing comes from the registry's Anthropic family.
 
 ## Gateways
 
-Gateway names are normalised by `@merge-safely/providers`: `openrouter`, `together`, `fireworks`, `groq`, `lmstudio`
-and `vllm` become provider `openai-compatible` (vendor kept in `label`, default `baseUrl` filled where one exists, vllm
-has none). `ollama` keeps its own id. A `baseUrl` on an `anthropic` connection makes it `anthropic-compatible`.
+Gateway names are normalised by `@merge-safely/providers`: `openrouter`, `together`, `fireworks`, `groq` and `vllm`
+become provider `openai-compatible` (vendor kept in `label`, default `baseUrl` filled where one exists, vllm has none).
+`ollama` and `lmstudio` keep their own ids and are served by the local presets. A `baseUrl` on an `anthropic`
+connection makes it `anthropic-compatible`.
 
 | Gateway | Served by | Default base URL |
 |---|---|---|
@@ -46,7 +58,7 @@ has none). `ollama` keeps its own id. A `baseUrl` on an `anthropic` connection m
 | Groq | `openai-compatible` | `https://api.groq.com/openai/v1` |
 | Fireworks | `openai-compatible` | `https://api.fireworks.ai/inference/v1` |
 | vLLM | `openai-compatible` | none, give `baseUrl` |
-| LM Studio | `openai-compatible` (or `lmstudio` when the connection names it directly) | `http://localhost:1234/v1` |
+| LM Studio | `lmstudio` | `http://localhost:1234/v1` |
 | Ollama | `ollama` | `http://localhost:11434/v1` |
 | Anthropic-compatible proxy | `anthropic` (provider `anthropic` + `baseUrl`) or `anthropic-compatible` | none, give `baseUrl` |
 

@@ -5,6 +5,8 @@ export { type AllProvidersOptions, allProviders, compatibleProviders } from "./a
 export { anthropicCompatibleProvider } from "./anthropic-compatible.js";
 export {
   asLocalModel,
+  isLocalConnection,
+  isPrivateHost,
   LMSTUDIO_BASE_URL,
   type LocalProviderOptions,
   lmstudioProvider,

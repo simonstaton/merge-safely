@@ -1,5 +1,5 @@
 import type { Connection, Finding, ReviewerInput, Seat, WorkspaceHandle } from "@merge-safely/core";
-import { parseJudgeOutput, parseReviewerOutput } from "@merge-safely/core";
+import { attest, DEFAULT_POLICY, parseJudgeOutput, parseReviewerOutput } from "@merge-safely/core";
 import { describe, expect, it } from "vitest";
 import { FALLBACK_USD, fakeModel, fakeProvider } from "./provider.js";
 import { scenarios, scriptedRuns } from "./scripted.js";
@@ -115,14 +115,82 @@ describe("fakeProvider", () => {
     expect(p.calls[0]?.usage).toHaveLength(3);
   });
 
-  it("returns timeout when the signal aborts during the simulated latency", async () => {
-    const p = fakeProvider({ delayMs: 5_000 });
+  it("a run aborted before it starts is an error with no work and no usage", async () => {
+    const p = fakeProvider();
     const ctl = new AbortController();
-    const pending = p.createRunner(conn, fakeModel()).run(seat("hunter"), input(), ws, ctl.signal);
     ctl.abort();
+    const usage: unknown[] = [];
+    const run = await p
+      .createRunner(conn, fakeModel(), { onUsage: (d) => usage.push(d) })
+      .run(seat("hunter"), input(), ws, ctl.signal);
+    expect(run).toMatchObject({ status: "error", error: "run aborted by caller", output: null });
+    expect(run.audit).toMatchObject({ substantiveCalls: 0, totalCalls: 0, tokens: { in: 0, out: 0 }, costUsd: 0 });
+    expect(usage).toEqual([]);
+  });
+
+  it("a caller abort mid-run is an error with partial usage, not a timeout", async () => {
+    const p = fakeProvider({ delayMs: 400 });
+    const ctl = new AbortController();
+    const usage: number[] = [];
+    const pending = p
+      .createRunner(conn, fakeModel(), { onUsage: (d) => usage.push(d.tokens.in) })
+      .run(seat("hunter"), input(), ws, ctl.signal);
+    setTimeout(() => ctl.abort(), 200);
     const run = await pending;
-    expect(run.status).toBe("timeout");
-    expect(run.output).toBeNull();
+    expect(run.status).toBe("error");
+    expect(run.audit.tokens.in).toBeGreaterThan(0);
+    expect(run.audit.tokens.in).toBeLessThan(1000);
+    expect(usage.reduce((a, b) => a + b, 0)).toBe(run.audit.tokens.in);
+  });
+
+  it("enforces the seat deadline: timeout with partial usage", async () => {
+    const p = fakeProvider({ delayMs: (s) => (s.lens === "slow" ? 200 : 0) });
+    const slow = { ...seat("hunter", "slow"), budget: { maxTurns: 8, deadlineMs: 50 } };
+    const run = await runOnce(p, slow);
+    expect(run).toMatchObject({ status: "timeout", output: null });
+    expect(run.audit.wallMs).toBe(50);
+    expect(run.audit.tokens.in).toBe(250);
+    expect(p.calls[0]?.usage.length).toBeGreaterThan(0);
+    expect((await runOnce(p, seat("hunter"))).status).toBe("ok");
+  });
+
+  it("enforces maxUsd: budget-exceeded when the run costs more", async () => {
+    const p = fakeProvider();
+    const tight = { ...seat("judge"), budget: { maxTurns: 8, deadlineMs: 60_000, maxUsd: 0.0001 } };
+    const run = await runOnce(p, tight);
+    expect(run).toMatchObject({ status: "budget-exceeded", output: null, judgeOutput: null });
+    expect(run.audit.costUsd).toBeCloseTo(0.002, 10);
+  });
+
+  it("checks the output role like a real runner", async () => {
+    const judgeVotes = fakeProvider({ script: () => ({ votes: [] }) });
+    const h = await runOnce(judgeVotes, seat("hunter"));
+    expect(h).toMatchObject({ status: "schema-invalid", output: null });
+    expect("judgeOutput" in h).toBe(false);
+    const review = fakeProvider({ script: () => ({ verdict: "pass", summary: "", findings: [] }) });
+    const j = await runOnce(review, seat("judge"));
+    expect(j).toMatchObject({ status: "schema-invalid", output: null, judgeOutput: null });
+    const failed = await runOnce(fakeProvider({ script: scenarios.seatTimesOut("*") }), seat("judge"));
+    expect(failed.judgeOutput).toBeNull();
+  });
+
+  it("works when methods are destructured", async () => {
+    const p = fakeProvider();
+    const { createRunner, reset } = p;
+    await createRunner(conn, fakeModel()).run(seat("hunter"), input(), ws);
+    expect(p.runnersCreated).toBe(1);
+    reset();
+    expect(p.runnersCreated).toBe(0);
+  });
+
+  it("emits one tool event per audit.totalCalls, substantive ones first", async () => {
+    const p = fakeProvider();
+    const names: string[] = [];
+    const run = await p
+      .createRunner(conn, fakeModel(), { onToolCall: (c) => names.push(c.name) })
+      .run(seat("hunter"), input(), ws);
+    expect(names).toHaveLength(run.audit.totalCalls);
+    expect(names).toEqual(["read_file", "read_file", "read_file", "search", "search", "list_dir"]);
   });
 
   it("validate and models", async () => {
@@ -179,7 +247,6 @@ describe("scriptedRuns", () => {
   it.each([
     ["seatTimesOut", scenarios.seatTimesOut, "timeout"],
     ["seatErrors", scenarios.seatErrors, "error"],
-    ["insufficientWork", scenarios.insufficientWork, "insufficient-work"],
     ["budgetExceeded", scenarios.budgetExceeded, "budget-exceeded"],
   ] as const)("%s affects only the keyed seat", async (_name, make, status) => {
     const p = fakeProvider({ script: make("hunter:perf:1") });
@@ -189,13 +256,24 @@ describe("scriptedRuns", () => {
     expect(other.status).toBe("ok");
   });
 
-  it("failure audits look like what a runner would observe", async () => {
-    const p = fakeProvider({
-      script: scriptedRuns({ hunters: { perf: "insufficient-work", security: "budget-exceeded" } }),
-    });
-    const lazy = await runOnce(p, seat("hunter", "perf"));
-    expect(lazy.audit.substantiveCalls).toBe(0);
-    expect(lazy.audit.filesRead).toEqual([]);
+  it("insufficientWork returns ok with a weak audit so core attest() downgrades it", async () => {
+    const p = fakeProvider({ script: scenarios.insufficientWork("perf") });
+    const hunter = await runOnce(p, seat("hunter", "perf"));
+    expect(hunter).toMatchObject({ status: "ok", output: { verdict: "pass" } });
+    expect(hunter.audit).toMatchObject({ substantiveCalls: 0, filesRead: [] });
+    expect(attest(hunter, DEFAULT_POLICY).status).toBe("insufficient-work");
+
+    const judge = await runOnce(p, seat("judge", "perf"), input(candidates));
+    expect(judge).toMatchObject({ status: "ok", output: null });
+    expect(judge.judgeOutput?.votes).toHaveLength(2);
+    expect(attest(judge, DEFAULT_POLICY).status).toBe("insufficient-work");
+
+    const diligent = await runOnce(p, seat("hunter", "security"));
+    expect(attest(diligent, DEFAULT_POLICY).status).toBe("ok");
+  });
+
+  it("budget-exceeded audits look like what a runner would observe", async () => {
+    const p = fakeProvider({ script: scriptedRuns({ hunters: { security: "budget-exceeded" } }) });
     const spent = await runOnce(p, seat("hunter", "security"));
     expect(spent.audit.costUsd).toBe(0.25);
     expect(spent.output).toBeNull();

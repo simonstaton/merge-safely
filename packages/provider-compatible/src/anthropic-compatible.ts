@@ -24,12 +24,13 @@ export function anthropicCompatibleProvider(opts: AnthropicProviderOptions = {})
 
     async validate(conn: Connection): Promise<ValidationResult> {
       if (conn.secret.kind !== "anthropic-compatible") return { ok: false, message: unsupported(conn) };
-      return inner.validate(conn);
+      const v = await inner.validate(conn);
+      return v.models ? { ...v, models: v.models.map((m) => restamp(conn, m)) } : v;
     },
 
-    models(conn: Connection): Promise<ModelInfo[]> {
-      if (conn.secret.kind !== "anthropic-compatible") return Promise.reject(new Error(unsupported(conn)));
-      return inner.models(conn);
+    async models(conn: Connection): Promise<ModelInfo[]> {
+      if (conn.secret.kind !== "anthropic-compatible") throw new Error(unsupported(conn));
+      return (await inner.models(conn)).map((m) => restamp(conn, m));
     },
 
     createRunner(conn: Connection, model: ModelInfo, runnerOpts?: RunnerOptions): ModelRunner {
@@ -38,6 +39,11 @@ export function anthropicCompatibleProvider(opts: AnthropicProviderOptions = {})
       return inner.createRunner(conn, model, runnerOpts);
     },
   };
+}
+
+/** The inner adapter stamps "anthropic"; report models under the connection's provider, like the other presets. */
+function restamp(conn: Connection, m: ModelInfo): ModelInfo {
+  return m.provider === conn.provider ? m : { ...m, provider: conn.provider };
 }
 
 function unsupported(conn: Connection): string {
