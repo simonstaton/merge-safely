@@ -126,3 +126,16 @@ describe("redactConnection / describeConnection / maskSecret", () => {
     expect(maskSecret("sk-ant-abcdefk3Fd")).toBe("…k3Fd");
   });
 });
+
+describe("resolveModelRef with discovery problems", () => {
+  it("names the discovery failure in the warning", () => {
+    const warnings: string[] = [];
+    resolveModelRef(
+      { connection: "local", model: "qwen3-coder" },
+      [local],
+      { byConnection: new Map([["local", []]]), problems: [{ connectionId: "local", message: "ECONNREFUSED" }] },
+      { onWarning: (w) => warnings.push(w) },
+    );
+    expect(warnings[0]).toContain("model discovery failed (ECONNREFUSED)");
+  });
+});

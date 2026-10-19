@@ -73,3 +73,30 @@ describe("ProviderRegistry", () => {
     expect(r.list()).toHaveLength(1);
   });
 });
+
+describe("ProviderRegistry kind fallback", () => {
+  const c = (provider: string, kind: ConnectionKind): Connection => ({ ...conn(provider, kind), id: "gw" });
+
+  it("falls back to the adapter registered under the compatible kind id", () => {
+    const oc = fakeProvider("openai-compatible", ["openai-compatible"]);
+    const ac = fakeProvider("anthropic-compatible", ["anthropic-compatible"]);
+    const r = createProviderRegistry([oc, ac]);
+    expect(r.forConnection(c("openrouter", "openai-compatible"))).toBe(oc);
+    expect(r.forConnection(c("my-proxy", "anthropic-compatible"))).toBe(ac);
+  });
+
+  it("prefers a provider registered under conn.provider", () => {
+    const oc = fakeProvider("openai-compatible", ["openai-compatible"]);
+    const ollama = fakeProvider("ollama", ["openai-compatible"]);
+    expect(createProviderRegistry([oc, ollama]).forConnection(c("ollama", "openai-compatible"))).toBe(ollama);
+  });
+
+  it("errors only when neither exists, and never falls back for other kinds", () => {
+    const r = createProviderRegistry([fakeProvider("anthropic", ["api-key"])]);
+    expect(() => r.forConnection(c("openrouter", "openai-compatible"))).toThrow(
+      'no provider registered for "openrouter" or "openai-compatible" (connection gw); registered: anthropic',
+    );
+    const r2 = createProviderRegistry([fakeProvider("openai-compatible", ["openai-compatible", "api-key"])]);
+    expect(() => r2.forConnection(c("groq", "api-key"))).toThrow('no provider registered for "groq" (connection gw)');
+  });
+});

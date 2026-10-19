@@ -7,12 +7,13 @@
  */
 import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { chmod, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readFile, realpath, rename, stat, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { Connection, ConnectionKind, ConnectionSecret } from "@merge-safely/core";
 import type { z } from "zod";
 import { decryptSecret, encryptSecret } from "./crypto.js";
+import { checkKindForProvider, inferConnectionKind, normaliseProvider, unexpectedInlineFields } from "./kinds.js";
 import {
   type ConnectionFileEntry,
   type ConnectionsFile,
@@ -51,31 +52,6 @@ function isRecord(x: unknown): x is Record<string, unknown> {
   return typeof x === "object" && x !== null && !Array.isArray(x);
 }
 
-const CLOUD_PROVIDERS = new Set(["bedrock", "vertex", "azure-openai"]);
-
-/** Infer the connection kind of an inline entry (design 6.1). Returns an error string when ambiguous. */
-export function inferConnectionKind(c: InlineConnection): ConnectionKind | { error: string } {
-  if (c.kind) return c.kind;
-  const hasKey = c.apiKey !== undefined || c.apiKeyEnv !== undefined;
-  const hasToken = c.accessToken !== undefined || c.accessTokenEnv !== undefined;
-  if (c.baseUrl !== undefined) {
-    if (c.provider === "anthropic" || c.provider === "anthropic-compatible") return "anthropic-compatible";
-    // openai, openai-compatible, and every other gateway (openrouter, ollama, vllm...) speak the OpenAI API.
-    return "openai-compatible";
-  }
-  if (c.subscription === true) {
-    if (hasKey || hasToken) return { error: "subscription: true cannot be combined with apiKey or accessToken" };
-    return "subscription";
-  }
-  if (hasToken) {
-    if (hasKey) return { error: "give either apiKey or accessToken, not both" };
-    return "oauth";
-  }
-  if (hasKey) return "api-key";
-  if (CLOUD_PROVIDERS.has(c.provider) || c.region || c.projectOrResource || c.credentialsRef) return "cloud";
-  return { error: "cannot infer the connection kind: give apiKey, apiKeyEnv, baseUrl, accessToken or kind" };
-}
-
 /** Resolve a literal-or-env value. Errors name the variable, never its value. */
 function literalOrEnv(
   label: string,
@@ -108,6 +84,10 @@ function inlineToConnection(
   const p = `connections.${id}: `;
   const kind = inferConnectionKind(c);
   if (typeof kind !== "string") return { errors: [p + kind.error] };
+  const unexpected = unexpectedInlineFields(c, kind);
+  if (unexpected.length) return { errors: [`${p}${unexpected.join(", ")} not used by kind ${kind}; remove or fix`] };
+  const norm = normaliseProvider(c.provider, c.label);
+  const baseUrl = c.baseUrl ?? norm.defaultBaseUrl;
   const errors: string[] = [];
   let secret: ConnectionSecret | undefined;
   const key = () => literalOrEnv("apiKey", c.apiKey, c.apiKeyEnv, env, kind !== "openai-compatible");
@@ -120,18 +100,18 @@ function inlineToConnection(
     }
     case "openai-compatible":
     case "anthropic-compatible": {
-      if (!c.baseUrl) {
+      if (!baseUrl) {
         errors.push(`${p}baseUrl is required for kind ${kind}`);
         break;
       }
       const k = key();
       if (k.error) errors.push(p + k.error);
       else if (kind === "anthropic-compatible") {
-        secret = { kind, baseUrl: c.baseUrl, apiKey: k.value ?? "", ...(c.headers ? { headers: c.headers } : {}) };
+        secret = { kind, baseUrl, apiKey: k.value ?? "", ...(c.headers ? { headers: c.headers } : {}) };
       } else {
         secret = {
           kind,
-          baseUrl: c.baseUrl,
+          baseUrl,
           ...(k.value ? { apiKey: k.value } : {}),
           ...(c.headers ? { headers: c.headers } : {}),
         };
@@ -171,10 +151,10 @@ function inlineToConnection(
     errors: [],
     connection: {
       id,
-      provider: c.provider,
+      provider: norm.provider,
       kind,
       createdAt: now().toISOString(),
-      ...(c.label ? { label: c.label } : {}),
+      ...(norm.label ? { label: norm.label } : {}),
       ...(c.model ? { defaultModel: c.model } : {}),
       ...(c.runner ? { options: { runner: c.runner } } : {}),
       secret: checked.data,
@@ -203,17 +183,31 @@ function secretFromValue(
 }
 
 function fileEntryToConnection(
-  e: ConnectionFileEntry,
+  entry: ConnectionFileEntry,
   env: Env,
   opts: ParseConnectionsOptions,
   now: () => Date,
 ): { connection?: Connection; errors: string[] } {
+  let e = entry;
   const p = `connections.${e.id}: `;
   const refCount = [e.secret, e.secretRef, e.apiKeyEnv].filter((x) => x !== undefined).length;
   if (refCount > 1) return { errors: [`${p}give only one of secret, secretRef or apiKeyEnv`] };
-  if (e.secret && (e.baseUrl || e.headers)) {
-    return { errors: [`${p}baseUrl/headers belong inside secret when secret is given inline`] };
+  const kindError = checkKindForProvider(e.provider, e.kind);
+  if (kindError) return { errors: [p + kindError] };
+  const inlineParts = [e.baseUrl !== undefined ? "baseUrl" : "", e.headers !== undefined ? "headers" : ""].filter(
+    Boolean,
+  );
+  if (inlineParts.length) {
+    if (e.kind !== "openai-compatible" && e.kind !== "anthropic-compatible") {
+      return { errors: [`${p}${inlineParts.join(", ")} not used by kind ${e.kind}; remove or fix`] };
+    }
+    if (e.secret) return { errors: [`${p}baseUrl/headers belong inside secret when secret is given inline`] };
+    if (e.secretRef && "encrypted" in e.secretRef) {
+      return { errors: [`${p}baseUrl/headers are ignored next to an encrypted secret; remove them`] };
+    }
   }
+  const norm = normaliseProvider(e.provider, e.label);
+  if (e.baseUrl === undefined && norm.defaultBaseUrl !== undefined) e = { ...e, baseUrl: norm.defaultBaseUrl };
 
   const ref = e.apiKeyEnv !== undefined ? { env: e.apiKeyEnv } : e.secretRef;
   let secret: ConnectionSecret | undefined;
@@ -274,10 +268,10 @@ function fileEntryToConnection(
     errors: [],
     connection: {
       id: e.id,
-      provider: e.provider,
+      provider: norm.provider,
       kind: e.kind,
       createdAt: e.createdAt ?? now().toISOString(),
-      ...(e.label !== undefined ? { label: e.label } : {}),
+      ...(norm.label !== undefined ? { label: norm.label } : {}),
       ...(e.createdBy !== undefined ? { createdBy: e.createdBy } : {}),
       ...(e.lastValidatedAt !== undefined ? { lastValidatedAt: e.lastValidatedAt } : {}),
       ...(e.scopes !== undefined ? { scopes: e.scopes } : {}),
@@ -289,7 +283,9 @@ function fileEntryToConnection(
 }
 
 /**
- * Parse user-supplied connections in either shape. A JSON string is accepted too.
+ * Parse user-supplied connections in either shape. A JSON string is accepted too, but YAML is not: the Action
+ * and CLI parse YAML at the edge and pass the parsed object, so parser errors (which quote source lines that may
+ * hold keys) never come from here.
  * Bad entries are reported in `errors` and left out; good entries are still returned.
  */
 export function parseConnectionsInput(
@@ -304,7 +300,12 @@ export function parseConnectionsInput(
     try {
       input = JSON.parse(input);
     } catch (_err: unknown) {
-      return { connections: [], errors: ["connections input is a string but not valid JSON"] };
+      return {
+        connections: [],
+        errors: [
+          "connections input is a string but not valid JSON; YAML must be parsed at the edge; pass the parsed object",
+        ],
+      };
     }
   }
   if (input === undefined || input === null) return { connections: [], errors: [] };
@@ -350,6 +351,12 @@ export function parseConnectionsInput(
     if (c) push(inlineToConnection(id, c, env, now));
   }
   return { connections, errors };
+}
+
+/** `~/x` expands to the home directory; other relative paths resolve against the connections file's directory. */
+export function resolveSecretPath(p: string, baseDir: string): string {
+  if (p === "~" || p.startsWith("~/")) return join(homedir(), p.slice(1));
+  return isAbsolute(p) ? p : resolve(baseDir, p);
 }
 
 /** `$MERGE_SAFELY_HOME/connections.json`, defaulting to `~/.merge-safely/connections.json`. */
@@ -409,7 +416,7 @@ export async function readConnectionsFile(
   const base = dirname(resolve(file));
   const parsed = parseConnectionsInput(json, env, {
     ...opts,
-    readFile: (p) => readFileSync(isAbsolute(p) ? p : resolve(base, p), "utf8"),
+    readFile: (p) => readFileSync(resolveSecretPath(p, base), "utf8"),
   });
   return { ...parsed, warnings, path: file, missing: false };
 }
@@ -430,6 +437,8 @@ export async function loadConnectionsFile(
 }
 
 export interface SaveConnectionsOptions {
+  /** Used to recognise the merge-safely home directory (`MERGE_SAFELY_HOME`). Default `process.env`. */
+  env?: Env;
   /** When given, every secret is written envelope-encrypted (`secretRef.encrypted`). */
   masterKey?: string | Buffer;
   /** Connection id -> env var name. Used when no master key: the secret is written as `secretRef.env`. */
@@ -439,6 +448,15 @@ export interface SaveConnectionsOptions {
 export interface SaveConnectionsResult {
   path: string;
   warnings: string[];
+}
+
+function baseUrlHasCredentials(url: string): boolean {
+  try {
+    const u = new URL(url);
+    return u.username !== "" || u.password !== "" || u.search !== "";
+  } catch (_err: unknown) {
+    return false;
+  }
 }
 
 function toFileEntry(conn: Connection, opts: SaveConnectionsOptions, warnings: string[]): ConnectionFileEntry {
@@ -456,6 +474,11 @@ function toFileEntry(conn: Connection, opts: SaveConnectionsOptions, warnings: s
     if (secret.kind === "openai-compatible" || secret.kind === "anthropic-compatible") {
       if (secret.headers && Object.keys(secret.headers).length) {
         warnings.push(`connection ${conn.id}: headers are stored in plaintext next to the env reference`);
+      }
+      if (baseUrlHasCredentials(secret.baseUrl)) {
+        warnings.push(
+          `connection ${conn.id}: baseUrl contains credentials (userinfo or query string) stored in plaintext next to the env reference`,
+        );
       }
       return {
         ...base,
@@ -498,18 +521,66 @@ export async function saveConnectionsFile(
       `refusing to write an invalid connections file:\n  - ${formatZodError("", checked.error).join("\n  - ")}`,
     );
   }
-  const dir = dirname(resolve(path));
+  // Write through a symlinked connections.json (dotfile managers) instead of replacing the link.
+  let target = resolve(path);
+  try {
+    if ((await lstat(target)).isSymbolicLink()) target = await realpath(target);
+  } catch (_err: unknown) {
+    // does not exist yet
+  }
+  const dir = dirname(target);
   await mkdir(dir, { recursive: true, mode: 0o700 });
+  warnings.push(...(await tightenDir(dir, opts.env ?? process.env)));
   const tmp = join(dir, `.connections.${process.pid}.${randomBytes(4).toString("hex")}.tmp`);
   try {
-    await writeFile(tmp, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600, flag: "wx" });
-    await chmod(tmp, 0o600);
-    await rename(tmp, path);
+    const fh = await open(tmp, "wx", 0o600);
+    try {
+      await fh.writeFile(`${JSON.stringify(file, null, 2)}\n`, "utf8");
+      await fh.chmod(0o600);
+      await fh.sync();
+    } finally {
+      await fh.close();
+    }
+    await rename(tmp, target);
   } catch (err: unknown) {
     await unlink(tmp).catch(() => undefined);
     const code = isRecord(err) && typeof err.code === "string" ? ` (${err.code})` : "";
     throw new Error(`could not write connections file ${path}${code}`);
   }
-  await chmod(path, 0o600);
+  await chmod(target, 0o600);
+  await syncDir(dir);
   return { path, warnings };
+}
+
+/** Make the merge-safely home directory 0700; for any other directory only warn (never chmod e.g. $HOME or /tmp). */
+async function tightenDir(dir: string, env: Env): Promise<string[]> {
+  if (process.platform === "win32") return [];
+  try {
+    const st = await stat(dir);
+    if ((st.mode & 0o077) === 0) return [];
+    const home = env[HOME_ENV];
+    const isHome = basename(dir) === ".merge-safely" || (home !== undefined && home !== "" && resolve(home) === dir);
+    const ours = typeof process.getuid !== "function" || st.uid === process.getuid();
+    if (isHome && ours) {
+      await chmod(dir, 0o700);
+      return [];
+    }
+    return [`directory ${dir} is accessible by other users; consider: chmod 700 ${dir}`];
+  } catch (_err: unknown) {
+    return [];
+  }
+}
+
+/** Best effort: persist the rename. Some platforms cannot open a directory for sync. */
+async function syncDir(dir: string): Promise<void> {
+  try {
+    const fh = await open(dir, "r");
+    try {
+      await fh.sync();
+    } finally {
+      await fh.close();
+    }
+  } catch (_err: unknown) {
+    // ignore
+  }
 }

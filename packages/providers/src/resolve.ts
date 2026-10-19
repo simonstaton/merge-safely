@@ -37,8 +37,12 @@ export function resolveModelRef(
   const models = lookup(catalog, conn.id);
   let name = sel.model;
   if (models.length === 0) {
+    const problem =
+      typeof catalog === "function" ? undefined : catalog.problems.find((x) => x.connectionId === conn.id);
     opts.onWarning?.(
-      `connection ${conn.id} has no known models; using "${sel.model}" unchecked (pricing unknown, budgets use the fallback rate)`,
+      problem
+        ? `connection ${conn.id} model discovery failed (${problem.message}); using "${sel.model}" unchecked`
+        : `connection ${conn.id} has no known models; using "${sel.model}" unchecked (pricing unknown, budgets use the fallback rate)`,
     );
   } else {
     const exact = models.find((m) => m.name === sel.model);

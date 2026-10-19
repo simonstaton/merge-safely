@@ -44,17 +44,30 @@ export function assertWebhookUrl(webhookUrl: string): void {
   if (u.protocol !== "https:") throw new SlackWebhookError("Slack webhook URL must use https");
 }
 
+export const MAX_RETRY_AFTER_MS = 10_000;
+const DEFAULT_RETRY_AFTER_MS = 1_000;
+
 export interface PostOptions {
   fetch?: FetchLike;
   timeoutMs?: number;
+  /** Injectable delay, for tests. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
-async function once(
-  webhookUrl: string,
-  body: string,
-  f: FetchLike,
-  timeoutMs: number,
-): Promise<{ ok: true } | { ok: false; retryable: boolean; message: string; status?: number }> {
+const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/** Retry-After in ms (seconds or an HTTP date), capped at 10 s; 1 s when absent or unparsable. */
+export function retryAfterMs(header: string | null, now = Date.now()): number {
+  if (!header) return DEFAULT_RETRY_AFTER_MS;
+  const secs = Number(header.trim());
+  let ms = Number.isFinite(secs) ? secs * 1000 : Date.parse(header) - now;
+  if (!Number.isFinite(ms) || ms < 0) ms = DEFAULT_RETRY_AFTER_MS;
+  return Math.min(ms, MAX_RETRY_AFTER_MS);
+}
+
+type Attempt = { ok: true } | { ok: false; retryable: boolean; message: string; status?: number; waitMs?: number };
+
+async function once(webhookUrl: string, body: string, f: FetchLike, timeoutMs: number): Promise<Attempt> {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), timeoutMs);
   try {
@@ -73,8 +86,9 @@ async function once(
     }
     return {
       ok: false,
-      retryable: res.status >= 500,
+      retryable: res.status >= 500 || res.status === 429,
       status: res.status,
+      ...(res.status === 429 ? { waitMs: retryAfterMs(res.headers.get("retry-after")) } : {}),
       message: `HTTP ${res.status}${detail ? ` (${detail})` : ""}`,
     };
   } catch (err: unknown) {
@@ -87,15 +101,22 @@ async function once(
 }
 
 /**
- * POST a JSON payload to a Slack incoming webhook. Retries once on a 5xx or a network error;
- * each attempt times out after `timeoutMs` (default 10 s). Throws `SlackWebhookError` on failure.
+ * POST a JSON payload to a Slack incoming webhook. Retries once on a 5xx, a network error, or a 429 (after
+ * Retry-After, capped at 10 s); 4xx and timeouts are not retried. Each attempt times out after `timeoutMs`
+ * (default 10 s). Throws `SlackWebhookError` on failure.
+ *
+ * A network-error retry can double-post if the first request reached Slack; for notifications that is the
+ * better failure than silence.
  */
 export async function postToWebhook(webhookUrl: string, payload: unknown, opts: PostOptions = {}): Promise<void> {
   const f = opts.fetch ?? globalThis.fetch;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const body = JSON.stringify(payload);
   let last = await once(webhookUrl, body, f, timeoutMs);
-  if (!last.ok && last.retryable) last = await once(webhookUrl, body, f, timeoutMs);
+  if (!last.ok && last.retryable) {
+    if (last.waitMs) await (opts.sleep ?? defaultSleep)(last.waitMs);
+    last = await once(webhookUrl, body, f, timeoutMs);
+  }
   if (last.ok) return;
   throw new SlackWebhookError(scrubWebhook(`Slack webhook post failed: ${last.message}`, webhookUrl), last.status);
 }

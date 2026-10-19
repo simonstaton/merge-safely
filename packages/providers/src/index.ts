@@ -2,7 +2,8 @@
 export * from "./catalog.js";
 export * from "./connections.js";
 export * from "./crypto.js";
-export { maskSecret, scrubText, secretValues } from "./mask.js";
+export * from "./kinds.js";
+export { maskSecret, scrubText, secretValues, urlCredentials } from "./mask.js";
 export * from "./registry.js";
 export * from "./resolve.js";
 export * from "./schema.js";

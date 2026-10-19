@@ -16,9 +16,13 @@
  *     "iv": "...", "ct": "...", "tag": "..."              // secret JSON sealed by the data key, aad "merge-safely:secret:v1:" + aad
  *   }
  *
- * Master keys: a 32-byte Buffer, a 64-char hex string, or base64 that decodes to exactly 32 bytes are used
- * as-is. Any other string is treated as a passphrase and stretched with scrypt using a random salt that is
- * stored in the blob (`kdf`), so the blob stays self-describing.
+ * Master keys: a 32-byte Buffer, exactly 64 hex characters, or `base64:` followed by base64 that decodes to
+ * exactly 32 bytes are used as-is. Every other string is a passphrase (at least 12 characters) stretched with
+ * scrypt using a random salt stored in the blob (`kdf`), so the blob stays self-describing.
+ *
+ * Decryption checks the envelope strictly before touching any key: 12-byte IVs, 16-byte GCM tags (decipher is
+ * created with `authTagLength: 16`, so truncated tags are rejected), and scrypt parameters limited to
+ * N a power of two in [2^14, 2^20], r = 8, p in [1, 4]. Every failure is a `SecretDecryptError`.
  */
 import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from "node:crypto";
 import type { ConnectionSecret } from "@merge-safely/core";
@@ -27,7 +31,10 @@ import { connectionSecretSchema } from "./schema.js";
 const PREFIX = "v1:";
 const KEY_BYTES = 32;
 const IV_BYTES = 12;
+const TAG_BYTES = 16;
 const SCRYPT = { N: 32768, r: 8, p: 1 } as const;
+const SCRYPT_LIMITS = { minN: 2 ** 14, maxN: 2 ** 20, r: 8, minP: 1, maxP: 4 } as const;
+const BASE64_PREFIX = "base64:";
 const MIN_PASSPHRASE = 12;
 
 interface Sealed {
@@ -65,35 +72,59 @@ function classifyMasterKey(masterKey: string | Buffer): RawKey {
   }
   const s = masterKey.trim();
   if (/^[0-9a-fA-F]{64}$/.test(s)) return { kind: "raw", key: Buffer.from(s, "hex") };
-  if (/^[A-Za-z0-9+/_-]{43}={0,1}$/.test(s)) {
-    const b = Buffer.from(s.replace(/-/g, "+").replace(/_/g, "/"), "base64");
-    if (b.length === KEY_BYTES) return { kind: "raw", key: b };
+  if (s.startsWith(BASE64_PREFIX)) {
+    const body = s.slice(BASE64_PREFIX.length);
+    const b = /^[A-Za-z0-9+/_-]+={0,2}$/.test(body)
+      ? Buffer.from(body.replace(/-/g, "+").replace(/_/g, "/"), "base64")
+      : Buffer.alloc(0);
+    if (b.length !== KEY_BYTES) throw new Error(`a base64: master key must decode to exactly ${KEY_BYTES} bytes`);
+    return { kind: "raw", key: b };
   }
   if (s.length < MIN_PASSPHRASE) {
     throw new Error(
-      `master key must be 32 bytes as hex or base64, or a passphrase of at least ${MIN_PASSPHRASE} characters`,
+      `master key must be 64 hex characters, base64:<32 bytes>, or a passphrase of at least ${MIN_PASSPHRASE} characters`,
     );
   }
   return { kind: "passphrase", passphrase: s };
 }
 
 function scryptKey(passphrase: string, salt: Buffer, params: { N: number; r: number; p: number }): Buffer {
-  return scryptSync(passphrase, salt, KEY_BYTES, { ...params, maxmem: 128 * params.N * params.r * 2 });
+  // scrypt needs about 128 * N * r bytes (plus 128 * r * p); leave 1 MiB headroom and no more.
+  const maxmem = 128 * params.N * params.r + 128 * params.r * params.p + 1024 * 1024;
+  return scryptSync(passphrase, salt, KEY_BYTES, { ...params, maxmem });
+}
+
+function checkScryptParams(k: { N: number; r: number; p: number }): void {
+  const { minN, maxN, r, minP, maxP } = SCRYPT_LIMITS;
+  const powerOfTwo = Number.isInteger(k.N) && k.N > 0 && (k.N & (k.N - 1)) === 0;
+  if (!powerOfTwo || k.N < minN || k.N > maxN || k.r !== r || !Number.isInteger(k.p) || k.p < minP || k.p > maxP) {
+    throw new SecretDecryptError("secret blob has out-of-range key derivation parameters");
+  }
 }
 
 function seal(key: Buffer, plaintext: Buffer, aad: string): Sealed {
   const iv = randomBytes(IV_BYTES);
-  const cipher = createCipheriv("aes-256-gcm", key, iv);
+  const cipher = createCipheriv("aes-256-gcm", key, iv, { authTagLength: TAG_BYTES });
   cipher.setAAD(Buffer.from(aad, "utf8"));
   const ct = Buffer.concat([cipher.update(plaintext), cipher.final()]);
   return { iv: iv.toString("base64"), ct: ct.toString("base64"), tag: cipher.getAuthTag().toString("base64") };
 }
 
-function open(key: Buffer, sealed: Sealed, aad: string): Buffer {
-  const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(sealed.iv, "base64"));
+/** Decode and length-check a sealed box before any crypto runs. */
+function decodeSealed(sealed: Sealed, what: string): { iv: Buffer; ct: Buffer; tag: Buffer } {
+  const iv = Buffer.from(sealed.iv, "base64");
+  const tag = Buffer.from(sealed.tag, "base64");
+  if (iv.length !== IV_BYTES || tag.length !== TAG_BYTES) {
+    throw new SecretDecryptError(`secret blob ${what} has an invalid iv or tag length`);
+  }
+  return { iv, tag, ct: Buffer.from(sealed.ct, "base64") };
+}
+
+function open(key: Buffer, box: { iv: Buffer; ct: Buffer; tag: Buffer }, aad: string): Buffer {
+  const decipher = createDecipheriv("aes-256-gcm", key, box.iv, { authTagLength: TAG_BYTES });
   decipher.setAAD(Buffer.from(aad, "utf8"));
-  decipher.setAuthTag(Buffer.from(sealed.tag, "base64"));
-  return Buffer.concat([decipher.update(Buffer.from(sealed.ct, "base64")), decipher.final()]);
+  decipher.setAuthTag(box.tag);
+  return Buffer.concat([decipher.update(box.ct), decipher.final()]);
 }
 
 const dkAad = (aad: string) => `merge-safely:dk:v1:${aad}`;
@@ -161,16 +192,35 @@ function parseEnvelope(blob: string): Envelope {
 
 /** Decrypt a blob produced by `encryptSecret`. Throws `SecretDecryptError` on a wrong key, wrong aad or tampering. */
 export function decryptSecret(blob: string, masterKey: string | Buffer, aad: string): ConnectionSecret {
+  try {
+    return decryptInner(blob, masterKey, aad);
+  } catch (err: unknown) {
+    if (err instanceof SecretDecryptError) throw err;
+    // Anything else (bad master key format, a crypto RangeError) is reported without its original text.
+    throw new SecretDecryptError(
+      err instanceof Error && /master key/.test(err.message) ? err.message : "could not decrypt secret",
+    );
+  }
+}
+
+function decryptInner(blob: string, masterKey: string | Buffer, aad: string): ConnectionSecret {
   const env = parseEnvelope(blob);
+  const wkBox = decodeSealed(env.wk, "key wrap");
+  const bodyBox = decodeSealed(env, "body");
+  if (env.kdf) checkScryptParams(env.kdf);
   const mk = classifyMasterKey(masterKey);
   let kek: Buffer;
   if (env.kdf) {
     if (mk.kind !== "passphrase") {
       throw new SecretDecryptError("secret was encrypted with a passphrase but a raw master key was given");
     }
-    const { N, r, p } = env.kdf;
-    if (N > 2 ** 20 || r > 32 || p > 16) throw new SecretDecryptError("secret blob key derivation cost is too high");
-    kek = scryptKey(mk.passphrase, Buffer.from(env.kdf.salt, "base64"), { N, r, p });
+    const salt = Buffer.from(env.kdf.salt, "base64");
+    if (salt.length < 16) throw new SecretDecryptError("secret blob has an invalid key derivation salt");
+    try {
+      kek = scryptKey(mk.passphrase, salt, env.kdf);
+    } catch (_err: unknown) {
+      throw new SecretDecryptError("could not derive the key from the passphrase");
+    }
   } else {
     if (mk.kind !== "raw") {
       throw new SecretDecryptError("secret was encrypted with a raw master key but a passphrase was given");
@@ -179,7 +229,7 @@ export function decryptSecret(blob: string, masterKey: string | Buffer, aad: str
   }
   let dataKey: Buffer;
   try {
-    dataKey = open(kek, env.wk, dkAad(aad));
+    dataKey = open(kek, wkBox, dkAad(aad));
   } catch (_err: unknown) {
     throw new SecretDecryptError(
       "could not decrypt secret: wrong master key, wrong connection id, or the blob was modified",
@@ -187,7 +237,8 @@ export function decryptSecret(blob: string, masterKey: string | Buffer, aad: str
   }
   let plaintext: Buffer;
   try {
-    plaintext = open(dataKey, env, secretAad(aad));
+    if (dataKey.length !== KEY_BYTES) throw new Error("bad data key");
+    plaintext = open(dataKey, bodyBox, secretAad(aad));
   } catch (_err: unknown) {
     throw new SecretDecryptError("could not decrypt secret: the blob was modified or belongs to another connection");
   } finally {

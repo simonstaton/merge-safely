@@ -101,3 +101,31 @@ describe("buildCatalog", () => {
     expect(cat.byConnection.get("o")?.[0]?.name).toBe("gpt-x");
   });
 });
+
+describe("secretValues / URL credentials", () => {
+  it("masks userinfo and query values from baseUrl in problems", async () => {
+    const { secretValues } = await import("./mask.js");
+    const secret = {
+      kind: "openai-compatible" as const,
+      baseUrl: "https://gwuser:hunter2password@gw.test/v1?api-key=query-secret-1&x=y%2Fz-encoded",
+    };
+    const values = secretValues(secret);
+    expect(values).toEqual(
+      expect.arrayContaining(["gwuser", "hunter2password", "query-secret-1", "y/z-encoded", "y%2Fz-encoded"]),
+    );
+    const reg = createProviderRegistry([
+      provider("openai-compatible", ["openai-compatible"], {
+        models: async () => {
+          throw new Error(`GET ${secret.baseUrl} failed; key query-secret-1`);
+        },
+      }),
+    ]);
+    const cat = await buildCatalog(reg, [
+      { id: "gw", provider: "openai-compatible", kind: "openai-compatible", createdAt: "x", secret },
+    ]);
+    const msg = cat.problems[0]?.message ?? "";
+    expect(msg).not.toContain("hunter2password");
+    expect(msg).not.toContain("query-secret-1");
+    expect(msg).toContain("gw.test");
+  });
+});

@@ -9,7 +9,7 @@ import type {
   Reporter,
   Verdict,
 } from "@merge-safely/core";
-import { escalationMessage, reportMessage } from "./format.js";
+import { escalationMessage, type ResolveHint, reportMessage } from "./format.js";
 import { assertWebhookUrl, type FetchLike, postToWebhook, scrubWebhook } from "./webhook.js";
 
 export * from "./format.js";
@@ -23,6 +23,11 @@ export interface SlackEscalationOptions {
   channelHint?: string;
   /** Per-attempt timeout, default 10 s. */
   timeoutMs?: number;
+  /**
+   * Replaces the resolve instruction. Default:
+   * `merge-safely verdict --repo owner/name --pr <n> --sha <sha> --decision pass|block --reason "…"`.
+   */
+  resolveHint?: ResolveHint;
 }
 
 /**
@@ -35,10 +40,17 @@ export function slackEscalation(opts: SlackEscalationOptions): Escalation {
   return {
     async request(v: Verdict, digest: HumanDigest): Promise<EscalationHandle> {
       const handle: EscalationHandle = { id: randomUUID(), createdAt: new Date().toISOString() };
-      await postToWebhook(opts.webhookUrl, escalationMessage(v, digest, { channelHint: opts.channelHint }), {
-        ...(opts.fetch ? { fetch: opts.fetch } : {}),
-        ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
-      });
+      await postToWebhook(
+        opts.webhookUrl,
+        escalationMessage(v, digest, {
+          ...(opts.channelHint !== undefined ? { channelHint: opts.channelHint } : {}),
+          ...(opts.resolveHint !== undefined ? { resolveHint: opts.resolveHint } : {}),
+        }),
+        {
+          ...(opts.fetch ? { fetch: opts.fetch } : {}),
+          ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
+        },
+      );
       return handle;
     },
     // resolve is deliberately absent: incoming webhooks are write-only.
@@ -47,12 +59,16 @@ export function slackEscalation(opts: SlackEscalationOptions): Escalation {
 
 export type ReportEventType = ReportEvent["type"];
 
-export const DEFAULT_REPORT_EVENTS: readonly ReportEventType[] = ["verdict", "escalated", "budget-blocked", "error"];
+/**
+ * Default events. `escalated` is left out because `slackEscalation` already posts the full escalation message;
+ * add it when the reporter and the escalation go to different webhooks.
+ */
+export const DEFAULT_REPORT_EVENTS: readonly ReportEventType[] = ["verdict", "budget-blocked", "error"];
 
 export interface SlackReporterOptions {
   webhookUrl: string;
   fetch?: FetchLike;
-  /** Event types to post. Default: verdict, escalated, budget-blocked, error. `pending` is never posted. */
+  /** Event types to post. Default: verdict, budget-blocked, error. `pending` is never posted. */
   events?: ReportEventType[];
   timeoutMs?: number;
   /** Where failures are logged. Default: console.warn. Messages never include the webhook URL. */

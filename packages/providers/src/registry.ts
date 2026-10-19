@@ -19,13 +19,22 @@ export class ProviderRegistry {
     return this.providers.has(id);
   }
 
-  /** The provider for a connection. Throws when none is registered or it does not accept the connection kind. */
+  /**
+   * The provider for a connection. Looks up `conn.provider`; when nothing is registered under it and the
+   * connection is a compatible kind, falls back to the adapter registered under the kind id
+   * (`openai-compatible` / `anthropic-compatible`). Throws when neither exists or the kind is not accepted.
+   */
   forConnection(conn: Connection | ConnectionRecord): ModelProvider {
-    const p = this.providers.get(conn.provider);
+    let p = this.providers.get(conn.provider);
+    if (!p && (conn.kind === "openai-compatible" || conn.kind === "anthropic-compatible")) {
+      p = this.providers.get(conn.kind);
+    }
     if (!p) {
       const known = this.ids();
+      const fallback =
+        conn.kind === "openai-compatible" || conn.kind === "anthropic-compatible" ? ` or "${conn.kind}"` : "";
       throw new Error(
-        `no provider registered for "${conn.provider}" (connection ${conn.id}); registered: ${
+        `no provider registered for "${conn.provider}"${fallback} (connection ${conn.id}); registered: ${
           known.length ? known.join(", ") : "none"
         }`,
       );

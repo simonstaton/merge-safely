@@ -9,6 +9,33 @@ export function maskSecret(s: string): string {
   return `…${s.slice(-4)}`;
 }
 
+/** Userinfo and query-string values embedded in a URL (e.g. `https://u:pw@gw/v1?api-key=…`), raw and decoded. */
+export function urlCredentials(url: string): string[] {
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch (_err: unknown) {
+    return [];
+  }
+  const out = new Set<string>();
+  const add = (raw: string) => {
+    if (!raw) return;
+    out.add(raw);
+    try {
+      out.add(decodeURIComponent(raw));
+    } catch (_err: unknown) {
+      // keep the raw form only
+    }
+  };
+  add(u.username);
+  add(u.password);
+  for (const [, v] of u.searchParams) {
+    out.add(v);
+    add(encodeURIComponent(v));
+  }
+  return [...out].filter((v) => v !== "");
+}
+
 /** The secret strings inside a connection secret (keys, tokens, header values). */
 export function secretValues(secret: ConnectionSecret | undefined): string[] {
   if (!secret) return [];
@@ -20,6 +47,7 @@ export function secretValues(secret: ConnectionSecret | undefined): string[] {
     case "openai-compatible":
     case "anthropic-compatible":
       if (secret.apiKey) out.push(secret.apiKey);
+      out.push(...urlCredentials(secret.baseUrl));
       for (const v of Object.values(secret.headers ?? {})) out.push(v);
       break;
     case "oauth":
