@@ -1,0 +1,105 @@
+# Strict policy for a large monorepo with several teams and production data.
+# Copy to .merge-safely.yml at the repo root.
+version: 1
+
+tiers:
+  # Lower thresholds than the defaults (20/50/80): more changes reach tiers 2 and 3.
+  thresholds: { t1: 15, t2: 40, t3: 70 }
+  # Setting criticalPaths replaces the default list, so the defaults are repeated here, then extended.
+  criticalPaths:
+    - "**/migrations/**"
+    - "**/migration/**"
+    - "**/schema.prisma"
+    - "**/*.sql"
+    - "**/jobs/**/backfill*"
+    - "**/backfill*/**"
+    - "**/queries/**/*Raw.*"
+    - "**/auth/**"
+    - "**/authz/**"
+    - "**/permissions/**"
+    - "**/payments/**"
+    - "**/billing/**"
+    - "**/payouts/**"
+    - "**/webhooks/**"
+    - "**/crypto/**"
+    - "**/secrets/**"
+    - ".github/workflows/**"
+    - ".github/actions/**"
+    - ".claude/**"
+    - ".cursor/**"
+    - ".codex/**"
+    - "**/CLAUDE.md"
+    - "**/AGENTS.md"
+    - ".merge-safely.yml"
+    - "**/Dockerfile"
+    - "**/docker-compose*.yml"
+    - "**/infra/**"
+    - "**/terraform/**"
+    - "**/*.tf"
+    - "**/layouts/**"
+    # Repo-specific additions.
+    - "packages/shared-ui/**"
+    - "services/*/src/routes/**"
+    - "**/feature-flags/**"
+    - "**/CODEOWNERS"
+  flagRemovalIsCritical: true
+
+triage:
+  # Smaller auto-pass window than the default (30 lines, 3 files).
+  maxLines: 15
+  maxFiles: 2
+
+panel:
+  t1: { hunters: [correctness, repro, security], judges: 1 }
+  t2: { hunters: [intent, correctness, repro, security, blast-radius, design-fidelity], judges: 2 }
+  t3:
+    hunters: [intent, correctness, repro, security, perf, rollout, blast-radius]
+    judges: 3
+    secondJudgeRound: true
+
+models:
+  hunters:  { connection: anthropic-main, model: claude-sonnet-5-5 }
+  judges:   { connection: anthropic-main, model: claude-opus-5-5 }
+  fallback: { connection: openai-main,    model: gpt-5 }
+  decorrelate: true
+  perLens:
+    security: { connection: anthropic-main, model: claude-opus-5-5 }
+
+quorum:
+  t1: 2
+  t2: 3
+  t3: 3
+  judgeAgreement: 0.67
+
+proofOfWork:
+  minSubstantiveCalls: 5
+  requireFilesRead: true
+
+rounds:
+  max: 3
+
+trust:
+  provider: github-teams
+  trusted: ["my-org/platform"]
+  trustedBypassMaxTier: 1
+  escalateTier3ForStandardAuthors: true
+  botsAreStandard: true
+
+reporting:
+  checkName: "merge-safely/verdict"
+  requestChangesOnBlock: true
+
+budget:
+  perSeatUsd: 5
+  perChangeUsd: 40
+  perInstallationMonthlyUsd: 1500
+  windowUsd: 600
+  windowDays: 7
+  onOverBudget: block            # never run a cheaper panel than the policy asks for
+
+runner:
+  # Reviewers may run the test suite. This executes PR code: run the gate in a container or sandbox.
+  allowedCommands:
+    - "npm test"
+    - "npx vitest run *"
+  commandTimeoutMs: 300000

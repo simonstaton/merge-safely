@@ -1,0 +1,41 @@
+# Policy for a small open source library with one or two maintainers.
+# Copy to .merge-safely.yml at the repo root.
+version: 1
+
+tiers:
+  # A library's risk is in its public API and its release machinery, not in database paths.
+  criticalPaths:
+    - "src/index.ts"
+    - "package.json"
+    - ".github/workflows/**"
+    - ".github/actions/**"
+    - ".merge-safely.yml"
+    - ".claude/**"
+    - ".cursor/**"
+    - ".codex/**"
+    - "**/CLAUDE.md"
+    - "**/AGENTS.md"
+    - "scripts/release*"
+
+panel:
+  t1: { hunters: [correctness], judges: 1 }
+  t2: { hunters: [correctness, repro, blast-radius], judges: 1 }
+  t3: { hunters: [intent, correctness, repro, security, blast-radius], judges: 2 }
+
+models:
+  hunters: { connection: openai-main, model: gpt-5-mini }
+  judges:  { connection: openai-main, model: gpt-5 }
+
+quorum:
+  t1: 1
+  t2: 1
+  t3: 2
+
+trust:
+  provider: allowlist
+  trusted: ["my-handle"]
+  trustedBypassMaxTier: 2
+
+budget:
+  perSeatUsd: 2
+  perChangeUsd: 8

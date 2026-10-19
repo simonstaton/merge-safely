@@ -1,0 +1,25 @@
+# Minimal Merge Safely gate: one Anthropic key, default policy.
+# Needs one repository secret: ANTHROPIC_API_KEY.
+name: merge-safely
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  checks: write
+  pull-requests: write
+  contents: read
+
+concurrency:
+  group: merge-safely-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: simonstaton/merge-safely@v0
+        with:
+          connections: |
+            anthropic-main: { provider: anthropic, apiKey: "${{ secrets.ANTHROPIC_API_KEY }}" }

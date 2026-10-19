@@ -1,0 +1,33 @@
+# Self-hosted Merge Safely GitHub App.
+# Usage: cp .env.example .env, fill it in, then `docker compose up -d`.
+# See docs/quickstart-app.md.
+services:
+  merge-safely:
+    build:
+      # Build from a checkout of this repository.
+      context: ../..
+      dockerfile: packages/app/Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE: /data/merge-safely.db
+      PORT: "3000"
+    ports:
+      # Put a TLS-terminating reverse proxy in front. Only /webhooks/github needs to be public.
+      - "127.0.0.1:3000:3000"
+    volumes:
+      # Local disk only: SQLite WAL does not work over network filesystems.
+      - merge-safely-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  merge-safely-data:
