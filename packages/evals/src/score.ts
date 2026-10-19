@@ -65,7 +65,9 @@ export function evaluateCase(spec: CaseSpec, actual: CaseActual): { passed: bool
   } else if (actual.contested === true) {
     fail.push(`unresolved: verdict ${actual.decision} is contested (an unresolved stored block for this SHA)`);
   } else if (actual.decision === "pending" || actual.decision === "not-run") {
-    fail.push(`unresolved: the gate returned ${actual.decision} instead of a decision`);
+    fail.push(
+      `unresolved: the gate returned ${actual.decision} instead of a decision${actual.pendingReason ? ` (${actual.pendingReason})` : ""}`,
+    );
   } else if (actual.decision !== exp.decision) {
     fail.push(`expected ${exp.decision}, got ${actual.decision}`);
   } else {

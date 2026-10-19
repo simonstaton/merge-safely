@@ -36,6 +36,8 @@ export interface CaseActual {
   status: CaseStatus;
   /** Set when the verdict was contested (a stored unresolved block for this SHA). Counts as unresolved. */
   contested?: boolean;
+  /** Why the gate could not decide this run, when it says so. */
+  pendingReason?: string;
   error?: string;
   /** Seat runs that did not finish ok, e.g. "hunter:perf:1=timeout". */
   seatFailures?: string[];

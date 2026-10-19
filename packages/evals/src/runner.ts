@@ -158,6 +158,11 @@ async function runCase(
     if (!opts.dry) {
       const r = await gate.reviewChange(change, { diff: m.diff, untrusted: m.untrusted });
       actual = withVerdict(actual, r.verdict);
+      if (r.contested) actual.contested = true;
+      if (r.pendingReason) {
+        actual.decision = "pending";
+        actual.pendingReason = r.pendingReason;
+      }
     }
   } catch (err: unknown) {
     actual = errorActual(errorMessage(err), actual);

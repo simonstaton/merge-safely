@@ -143,13 +143,12 @@ error.
 Programmatic use:
 
 ```ts
-import { runSuite, renderReport, evaluateBreakers } from "@merge-safely/evals";
-import { createGate } from "@merge-safely/core";
+import { coreGateFactory, renderReport, runSuite } from "@merge-safely/evals";
 
-const result = await runSuite("evals/", {
-  gateFactory: (policy, { store, ledger, workspace }) => createGate({ ...deps, policy, store, ledger, workspace }),
-  concurrency: 4,
-});
+// deps: GateDeps minus policy, store, ledger and workspace (providers, connections, catalog, tools, prompts,
+// pricing, reporters, ...). One createGate per case is built over that case's policy, fresh store and ledger, and
+// the fixture workspace; verdicts are persisted through the store's compare-and-set like production.
+const result = await runSuite("evals/", { gateFactory: coreGateFactory(deps), concurrency: 4 });
 console.log(renderReport(result, "markdown"));
 ```
 

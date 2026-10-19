@@ -30,5 +30,8 @@
     "@merge-safely/workspace-local": "0.1.0",
     "yaml": "^2.5.0",
     "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@merge-safely/testkit": "0.1.0"
   }
 }

@@ -3,8 +3,8 @@
  *
  * `EvalGate` is the structural subset of the core orchestrator's `Gate` (`createGate(deps)` in
  * `@merge-safely/core`) that evals use: `reviewChange` for full runs and `estimate` for tiering, triage and seating.
- * Any real `Gate` satisfies it, so `gateFactory: (policy, ctx) => createGate({ ...deps, policy, store: ctx.store })`
- * plugs straight in. Tests inject scripted gates instead.
+ * Any real `Gate` satisfies it (checked at compile time by `asEvalGate`). `coreGateFactory(deps)` builds one
+ * orchestrator gate per case over the case's fresh store, ledger and workspace. Tests inject scripted gates instead.
  *
  * `estimateOnlyGate` is built from the real pure core stages (tier, triage, seat) with synthetic connections, so dry
  * runs exercise exactly the tiering and triage logic production uses without any model, network or credentials.
@@ -13,6 +13,9 @@ import {
   type Change,
   type ConnectionRecord,
   type CostLedger,
+  createGate,
+  type Gate,
+  type GateDeps,
   type HumanDigest,
   type ModelInfo,
   type Policy,
@@ -38,6 +41,10 @@ export interface GateReviewResult {
   digest: HumanDigest;
   /** Report events emitted during the review; evals only count them. */
   events: readonly unknown[];
+  /** A stored, unresolved block for this SHA prevented this result from replacing it. */
+  contested?: boolean;
+  /** The run could not decide (outage, insufficient seats, budget refusal). */
+  pendingReason?: string;
 }
 
 export interface GateTriage {
@@ -160,3 +167,34 @@ export function estimateOnlyGate(policy: Policy): EvalGate {
 }
 
 export const estimateOnlyGateFactory: GateFactory = (policy) => estimateOnlyGate(policy);
+
+/** Compile-time proof that the orchestrator's Gate satisfies EvalGate. */
+export function asEvalGate(gate: Gate): EvalGate {
+  return {
+    estimate: (change) => gate.estimate(change),
+    // persist: true so the verdict goes through the store's compare-and-set like production (the store is fresh).
+    reviewChange: (change, input) => gate.reviewChange(change, input, { persist: true, trigger: "eval" }),
+  };
+}
+
+/** Deps for `coreGateFactory`: everything except what the runner supplies per case. */
+export type CoreGateDeps = Omit<GateDeps, "policy" | "store" | "ledger" | "workspace"> & {
+  /** Used when the case has no workspace of its own (diff and github cases). */
+  workspace?: Workspace;
+};
+
+/**
+ * A GateFactory over the real orchestrator: one `createGate` per case with that case's policy, fresh store and
+ * ledger, and the case workspace (the fixture repository) or `deps.workspace` as a fallback.
+ */
+export function coreGateFactory(deps: CoreGateDeps): GateFactory {
+  return (policy, ctx) => {
+    const workspace = ctx.workspace ?? deps.workspace;
+    if (!workspace) {
+      throw new GateUnavailableError(
+        `case ${ctx.caseId} has no reviewer workspace (diff or github source); pass deps.workspace or the runner's workspace option`,
+      );
+    }
+    return asEvalGate(createGate({ ...deps, policy, store: ctx.store, ledger: ctx.ledger, workspace }));
+  };
+}
