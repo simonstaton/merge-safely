@@ -53834,7 +53834,12 @@ function titleOverlap(a, b) {
       shared++;
   return shared / (wa.size + wb.size - shared);
 }
-var CROSS_CLASS_TITLE_OVERLAP = 0.8;
+var CROSS_CLASS_TITLE_OVERLAP = 0.3;
+function lensesDisjoint(a, b) {
+  if (!a.lenses?.length || !b.lenses?.length)
+    return true;
+  return !a.lenses.some((l) => b.lenses?.includes(l));
+}
 function mergeCrossClassDuplicates(findings) {
   const out = [];
   const titles = /* @__PURE__ */ new Map();
@@ -53847,6 +53852,8 @@ function mergeCrossClassDuplicates(findings) {
         return false;
       const ow = o.line !== void 0 && o.line > 0 ? Math.floor((o.line - 1) / LINE_WINDOW) : void 0;
       if (ow !== window2)
+        return false;
+      if (!lensesDisjoint(o, f3))
         return false;
       return titleOverlap(titles.get(o) ?? "", titles.get(f3) ?? "") >= CROSS_CLASS_TITLE_OVERLAP;
     });

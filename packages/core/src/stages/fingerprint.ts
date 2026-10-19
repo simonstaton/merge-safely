@@ -132,13 +132,23 @@ function titleOverlap(a: string, b: string): number {
   return shared / (wa.size + wb.size - shared);
 }
 
-/** Two hunters often report one bug under different classes (e.g. logic-error vs failing-path). */
-const CROSS_CLASS_TITLE_OVERLAP = 0.8;
+/**
+ * Two hunters often report one bug under different classes (e.g. logic-error vs failing-path) with reworded
+ * titles. Measured on real runs the same bug scores ~0.35 Jaccard overlap and distinct bugs in the same
+ * window score ~0.1–0.2, so 0.3 separates them; the extra guard is that the two findings must come from
+ * different lenses (one reviewer does not report the same bug twice).
+ */
+const CROSS_CLASS_TITLE_OVERLAP = 0.3;
+
+function lensesDisjoint(a: Finding, b: Finding): boolean {
+  if (!a.lenses?.length || !b.lenses?.length) return true;
+  return !a.lenses.some((l) => b.lenses?.includes(l));
+}
 
 /**
- * Second dedupe pass: findings anchored on the same file and line window whose normalised titles overlap
- * by at least 80% are the same bug reported under two classes. The higher-severity one wins (its id and
- * class are kept); the other class is recorded in evidence so nothing is lost from the provenance.
+ * Second dedupe pass: findings anchored on the same file and line window, raised by different lenses, whose
+ * normalised titles overlap enough are the same bug reported under two classes. The higher-severity one wins
+ * (its id and class are kept); the other class is recorded in evidence so nothing is lost from the provenance.
  */
 export function mergeCrossClassDuplicates(findings: Finding[]): Finding[] {
   const out: Finding[] = [];
@@ -150,6 +160,7 @@ export function mergeCrossClassDuplicates(findings: Finding[]): Finding[] {
       if (!f.file || !o.file || normalisePath(o.file) !== normalisePath(f.file)) return false;
       const ow = o.line !== undefined && o.line > 0 ? Math.floor((o.line - 1) / LINE_WINDOW) : undefined;
       if (ow !== window) return false;
+      if (!lensesDisjoint(o, f)) return false;
       return titleOverlap(titles.get(o) ?? "", titles.get(f) ?? "") >= CROSS_CLASS_TITLE_OVERLAP;
     });
     if (!twin) {

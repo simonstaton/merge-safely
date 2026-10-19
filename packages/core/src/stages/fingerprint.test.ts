@@ -179,6 +179,58 @@ describe("mergeCrossClassDuplicates", () => {
     expect(merged[0]?.lenses?.sort()).toEqual(["correctness", "repro"]);
     expect(merged[0]?.evidence?.some((e) => e.startsWith("also reported as failing-path"))).toBe(true);
   });
+  it("merges the reworded pair seen in a real run and keeps the off-by-one apart", () => {
+    const a = {
+      severity: "important" as const,
+      class: "failing-path",
+      title: "bulkRefund refunds open (unpaid) orders, not just paid ones",
+      detail: "d",
+      file: "src/orders.ts",
+      line: 24,
+      lenses: ["repro"],
+    };
+    const b = {
+      severity: "blocker" as const,
+      class: "logic-error",
+      title: "bulkRefund refunds unpaid (open) orders and inflates the refunded total",
+      detail: "dd",
+      file: "src/orders.ts",
+      line: 24,
+      lenses: ["correctness"],
+    };
+    const c = {
+      severity: "nit" as const,
+      class: "off-by-one",
+      title: "bulkRefund also refunds an order created exactly at the `before` cutoff",
+      detail: "d",
+      file: "src/orders.ts",
+      line: 24,
+      lenses: ["correctness"],
+    };
+    const merged = dedupeFindings([a, b, c]);
+    expect(merged.map((f) => f.class).sort()).toEqual(["logic-error", "off-by-one"]);
+  });
+  it("never merges two findings from the same lens", () => {
+    const a = {
+      severity: "important" as const,
+      class: "failing-path",
+      title: "bulkRefund refunds open unpaid orders",
+      detail: "d",
+      file: "src/orders.ts",
+      line: 24,
+      lenses: ["correctness"],
+    };
+    const b = {
+      severity: "blocker" as const,
+      class: "logic-error",
+      title: "bulkRefund refunds unpaid open orders",
+      detail: "dd",
+      file: "src/orders.ts",
+      line: 24,
+      lenses: ["correctness"],
+    };
+    expect(dedupeFindings([a, b])).toHaveLength(2);
+  });
   it("keeps distinct bugs in the same window apart", () => {
     const a = {
       severity: "nit" as const,
