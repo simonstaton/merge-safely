@@ -109,7 +109,7 @@ export const policySchema = z
         lockfileOnlyAutoPass: z.boolean().default(true),
         docsPatterns: z
           .array(z.string())
-          .default(["**/*.md", "**/*.mdx", "**/*.txt", "**/*.rst", "docs/**", "**/LICENSE*", "**/CHANGELOG*"]),
+          .default(["**/*.md", "**/*.mdx", "**/*.rst", "docs/**", "**/LICENSE", "**/LICENSE.*", "**/CHANGELOG.md", "**/README*"]),
         assetPatterns: z
           .array(z.string())
           .default([
