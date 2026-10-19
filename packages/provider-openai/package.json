@@ -1,7 +1,7 @@
 {
   "name": "@merge-safely/provider-openai",
   "version": "0.1.0",
-  "description": "OpenAI Responses API runner",
+  "description": "OpenAI Responses API and Chat Completions runners (incl. OpenAI-compatible endpoints)",
   "license": "Apache-2.0",
   "type": "module",
   "main": "./dist/index.js",
