@@ -1,0 +1,130 @@
+/**
+ * Turn an eval case into the `Change` and unified diff the gate reviews.
+ */
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+import type { Change, ChangedFile, ChangeRef, Principal, UntrustedText } from "@merge-safely/core";
+import { githubSource, type OctokitLike } from "@merge-safely/github";
+import { diffTrees, parseUnifiedDiff } from "./diff.js";
+import type { LoadedCase } from "./suite.js";
+
+export interface MaterializedCase {
+  change: Change;
+  diff: string;
+  untrusted: UntrustedText;
+}
+
+export interface MaterializeOptions {
+  github?: { octokit: OctokitLike };
+}
+
+export class GithubTokenRequiredError extends Error {
+  constructor(caseId: string) {
+    super(`case ${caseId}: github source requires a GitHub token (token required); pass github.octokit`);
+    this.name = "GithubTokenRequiredError";
+  }
+}
+
+const EVAL_REPO = { host: "evals.local", owner: "evals", name: "suite" };
+
+/** A deterministic fake SHA for diff cases that carry no commit (40 hex chars derived from the case id). */
+export function syntheticSha(seed: string): string {
+  let h1 = 0x811c9dc5;
+  let out = "";
+  for (let round = 0; out.length < 40; round++) {
+    for (const ch of `${seed}:${round}`) h1 = Math.imul(h1 ^ ch.charCodeAt(0), 0x01000193) >>> 0;
+    out += h1.toString(16).padStart(8, "0");
+  }
+  return out.slice(0, 40);
+}
+
+function stats(files: ChangedFile[]): Change["stats"] {
+  return {
+    additions: files.reduce((n, f) => n + f.additions, 0),
+    deletions: files.reduce((n, f) => n + f.deletions, 0),
+    files: files.length,
+  };
+}
+
+function buildChange(lc: LoadedCase, files: ChangedFile[], baseSha: string, headSha: string, index: number): Change {
+  const c = lc.spec.change;
+  const author: Principal = { kind: c?.authorKind ?? "human", login: c?.author ?? "eval-author" };
+  return {
+    repo: EVAL_REPO,
+    number: index + 1,
+    headSha,
+    baseSha,
+    baseRef: c?.baseRef ?? "main",
+    headRef: c?.headRef ?? `evals/${lc.spec.id}`,
+    title: c?.title ?? lc.spec.title,
+    body: c?.body ?? "",
+    author,
+    files,
+    stats: stats(files),
+    labels: c?.labels ?? [],
+    draft: false,
+    ciStatus: "success",
+  };
+}
+
+/** Patches for explicitly listed files are filled from the diff when it has them. */
+function mergeListedFiles(listed: ChangedFile[], parsed: ChangedFile[]): ChangedFile[] {
+  return listed.map((f) => {
+    const p = parsed.find((x) => x.path === f.path);
+    return p?.patch !== undefined && f.patch === undefined ? { ...f, patch: p.patch } : f;
+  });
+}
+
+export async function materializeCase(
+  lc: LoadedCase,
+  index: number,
+  opts: MaterializeOptions = {},
+): Promise<MaterializedCase> {
+  const src = lc.spec.source;
+  if (src.type === "fixture") {
+    const d = await diffTrees(join(lc.dir, src.base), join(lc.dir, src.head));
+    const change = buildChange(lc, d.files, d.baseSha, d.headSha, index);
+    return { change, diff: d.diff, untrusted: { title: change.title, body: change.body } };
+  }
+  if (src.type === "diff") {
+    const diff = await readFile(join(lc.dir, src.diff), "utf8");
+    const parsed = parseUnifiedDiff(diff);
+    const files = src.files ? mergeListedFiles(src.files, parsed) : parsed;
+    const change = buildChange(
+      lc,
+      files,
+      syntheticSha(`${lc.spec.id}:base`),
+      syntheticSha(`${lc.spec.id}:head`),
+      index,
+    );
+    return { change, diff, untrusted: { title: change.title, body: change.body } };
+  }
+  if (!opts.github) throw new GithubTokenRequiredError(lc.spec.id);
+  const [owner, name] = src.repo.split("/") as [string, string];
+  const ref: ChangeRef = { repo: { host: "github.com", owner, name }, number: src.pr };
+  const source = githubSource({ octokit: opts.github.octokit });
+  const fetched = await source.getChange(ref);
+  const headSha = src.headSha ?? fetched.headSha;
+  const diff = await source.getDiff(ref, { headSha });
+  // The PR may have moved since the incident: the file list then describes the wrong head, so derive it from the
+  // pinned diff instead.
+  const pinnedElsewhere = !fetched.headSha.startsWith(headSha) && !headSha.startsWith(fetched.headSha);
+  const files = pinnedElsewhere ? parseUnifiedDiff(diff) : fetched.files;
+  const change: Change = {
+    ...fetched,
+    headSha,
+    files,
+    stats: pinnedElsewhere ? stats(files) : fetched.stats,
+    ...(lc.spec.change ? { title: lc.spec.change.title, body: lc.spec.change.body } : {}),
+  };
+  const ctx = source.getUntrustedContext ? await source.getUntrustedContext(ref) : undefined;
+  return {
+    change,
+    diff,
+    untrusted: {
+      title: change.title,
+      body: change.body,
+      ...(ctx ? { commitMessages: ctx.commitMessages, comments: ctx.comments } : {}),
+    },
+  };
+}

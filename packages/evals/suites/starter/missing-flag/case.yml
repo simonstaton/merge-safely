@@ -1,0 +1,26 @@
+id: missing-flag
+title: Flag read swapped for a flag that was never created
+kind: incident
+expected:
+  decision: block
+  tier: 3
+  triage: review
+  lenses: [rollout]
+  findingClasses: [missing-flag]
+  files: [apps/web/src/checkout/CheckoutPage.tsx, apps/web/src/flags/definitions.ts]
+source:
+  type: fixture
+  base: base/
+  head: head/
+change:
+  title: Remove legacy checkout fallback, add express pay
+  body: |
+    The legacy fallback has been off for months so this removes it, and adds express pay behind
+    checkout-express-pay so we can roll it out gradually.
+  author: checkout-dev
+notes: |
+  Appendix A: "a feature flag removed in code but never created in production, flooding error tracking past plan
+  limits". The change deletes the checkout-legacy-fallback read and reads checkout-express-pay, which is neither
+  declared in flags/definitions.ts nor created in the flag service. flags/client.ts reports every unknown flag
+  read to error tracking, and CheckoutPage reads it on every render. Tiering must force tier 3 because a
+  feature-flag read was removed (policy.tiers.flagRemovalIsCritical), even though no critical path is touched.
