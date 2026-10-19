@@ -91,6 +91,7 @@ If you find a way to break it, report it privately (see [SECURITY.md](SECURITY.m
 - Call out any change to a port, a domain type, the policy schema or a default. Policy defaults change the policy hash on every verdict.
 - Add a line to `CHANGELOG.md` under the unreleased version for anything user-visible, and update the docs that describe it.
 - Keep PRs small. One concern per PR.
+- The GitHub Action ships a committed bundle (`packages/action/dist/`) that embeds every package it uses. If your change touches any package the Action depends on (almost all of them), run `npm run build && npm run bundle -w @merge-safely/action` and commit the regenerated `dist/`. CI fails on a stale bundle, including after `main` moves under your branch.
 
 `main` is protected:
 
