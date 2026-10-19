@@ -1,0 +1,19 @@
+id: lockfile-only-bump
+title: Lockfile-only patch bump
+kind: clean
+expected:
+  decision: pass
+  tier: 0
+  triage: auto-pass
+source:
+  type: fixture
+  base: base/
+  head: head/
+change:
+  title: Bump date-fns to 3.6.1
+  body: Patch release, lockfile only.
+  author: dependency-bot
+  authorKind: bot
+notes: |
+  Known clean. A lockfile-only change within the declared range auto-passes triage (triage.lockfileOnlyAutoPass).
+  The integrity values are placeholders; the fixture only needs to look like a lockfile to the path matcher.

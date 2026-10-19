@@ -1,0 +1,27 @@
+id: shared-layout-prop-drop
+title: Shared layout rebuild silently drops props its consumers pass
+kind: incident
+expected:
+  decision: block
+  tier: 3
+  triage: review
+  lenses: [blast-radius]
+  findingClasses: [silent-prop-drop, breaking-consumer]
+  files: [apps/web/src/layouts/AppShell/AppShell.tsx]
+source:
+  type: fixture
+  base: base/
+  head: head/
+change:
+  title: AppShell redesign with top navigation
+  body: |
+    New shell to match the redesign. Pages are unchanged and still type-check.
+  author: design-eng
+  labels: [ui, redesign]
+notes: |
+  Appendix A: "a shared layout rebuild that would have silently dropped 22 props across 120 routes, caught only
+  because that one repository required an owner". The new AppShellProps intersects with Record<string, unknown>,
+  so consumers that still pass breadcrumbs, actions and sidebarCollapsed keep compiling while the props are
+  ignored: Save and Export buttons and breadcrumbs vanish from every page. None of the consumers is in the diff,
+  so a reviewer has to grep for AppShell usages. The layouts/** critical path must force tier 3 and the
+  blast-radius lens should raise silent-prop-drop or breaking-consumer on AppShell.tsx.

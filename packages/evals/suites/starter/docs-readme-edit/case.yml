@@ -1,0 +1,18 @@
+id: docs-readme-edit
+title: README and setup guide edit
+kind: clean
+expected:
+  decision: pass
+  tier: 0
+  triage: auto-pass
+source:
+  type: fixture
+  base: base/
+  head: head/
+change:
+  title: Improve local setup docs
+  body: Clarifies prerequisites and the test commands.
+  author: docs-writer
+notes: |
+  Known clean. Docs-only changes are auto-passed by deterministic triage with zero seats, so they cost nothing and
+  can never be false-blocked. If this case starts going to a panel, triage has been narrowed.
