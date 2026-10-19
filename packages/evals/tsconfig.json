@@ -3,5 +3,11 @@
   "compilerOptions": { "rootDir": "src", "outDir": "dist" },
   "include": ["src/**/*.ts"],
   "exclude": ["src/**/*.test.ts"],
-  "references": [{ "path": "../core" }, { "path": "../cli" }]
+  "references": [
+    { "path": "../core" },
+    { "path": "../github" },
+    { "path": "../lenses" },
+    { "path": "../store-memory" },
+    { "path": "../workspace-local" }
+  ]
 }

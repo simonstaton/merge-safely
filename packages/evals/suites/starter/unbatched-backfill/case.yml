@@ -1,0 +1,28 @@
+id: unbatched-backfill
+title: Backfill updates a large table in one unbatched transaction
+kind: incident
+expected:
+  decision: block
+  tier: 3
+  triage: review
+  lenses: [perf, rollout]
+  findingClasses: [unbatched-backfill, lock-risk, unbounded-scan]
+  files: [services/api/src/jobs/backfillUserStats.ts]
+source:
+  type: fixture
+  base: base/
+  head: head/
+change:
+  title: Add lifetime value to user stats
+  body: |
+    Adds a lifetime_value_cents column and a one-off job to populate it from order history.
+    Tested locally, runs in a couple of seconds.
+  author: growth-dev
+  labels: [feature]
+notes: |
+  Appendix A: "a backfill that locked production tables for hours". The job updates every user_stats row from an
+  aggregate over all paid orders inside a single transaction: no batching, no LIMIT, no pause between batches,
+  so every touched row stays locked until the whole statement commits. The neighbouring cleanupSessions job shows
+  the house pattern (id-ranged batches of 1000 with a sleep). "Runs in a couple of seconds" was measured on a
+  local database with a few hundred rows. The rollout lens should raise unbatched-backfill and the perf lens
+  lock-risk or unbounded-scan, pointing at backfillUserStats.ts.

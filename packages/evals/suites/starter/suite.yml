@@ -1,0 +1,10 @@
+# Starter eval suite: generic reductions of the incidents in docs/design.md Appendix A, plus known-clean changes.
+version: 1
+name: starter
+description: >-
+  Appendix A incidents (unbatched backfill, missing flag, shared layout prop drop, post-approval auth change)
+  reduced to minimal fixtures, plus clean changes that must pass. Run with --dry to check tiering and triage
+  without model calls.
+gates:
+  minRecall: 0.8
+  maxFalseBlock: 0.1

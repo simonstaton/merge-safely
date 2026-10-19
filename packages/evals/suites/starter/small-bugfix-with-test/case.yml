@@ -1,0 +1,22 @@
+id: small-bugfix-with-test
+title: Price formatting fix for refunds with regression tests
+kind: clean
+expected:
+  decision: pass
+  tier: 0
+  triage: review
+  lenses: [correctness, repro]
+source:
+  type: fixture
+  base: base/
+  head: head/
+change:
+  title: Fix formatPrice for negative amounts
+  body: |
+    Refunds rendered as "$-20.-99". Switches to Intl.NumberFormat and adds tests for refunds, grouping and JPY.
+  author: frontend-dev
+  labels: [bug]
+notes: |
+  Known clean. A small, well-tested bug fix just over the triage size limit, so it reaches a tier-0 panel
+  (seated with the t1 lenses). A block here is a false block: it measures whether hunters invent blockers on a
+  correct change. Note the JPY expectation: amountCents is in minor units, and JPY has none, so 1200 means 1200 yen.
