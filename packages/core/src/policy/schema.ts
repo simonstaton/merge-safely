@@ -49,18 +49,22 @@ export const DEFAULT_CRITICAL_PATHS = [
   "**/layouts/**",
 ];
 
-const modelSelection = z.object({
-  connection: z.string().min(1),
-  model: z.string().min(1),
-  effort: z.string().optional(),
-});
+const modelSelection = z
+  .object({
+    connection: z.string().min(1),
+    model: z.string().min(1),
+    effort: z.string().optional(),
+  })
+  .strict();
 export type ModelSelection = z.infer<typeof modelSelection>;
 
-const panelTier = z.object({
-  hunters: z.array(z.string().min(1)).min(1),
-  judges: z.number().int().min(0).max(5).default(1),
-  secondJudgeRound: z.boolean().default(false),
-});
+const panelTier = z
+  .object({
+    hunters: z.array(z.string().min(1)).min(1),
+    judges: z.number().int().min(0).max(5).default(1),
+    secondJudgeRound: z.boolean().default(false),
+  })
+  .strict();
 export type PanelTierPolicy = z.infer<typeof panelTier>;
 
 export const policySchema = z
@@ -75,6 +79,7 @@ export const policySchema = z
             t2: z.number().min(0).max(100).default(50),
             t3: z.number().min(0).max(100).default(80),
           })
+          .strict()
           .default({}),
         criticalPaths: z.array(z.string()).default(DEFAULT_CRITICAL_PATHS),
         /** Diffs that delete a feature-flag read are tier 3. */
@@ -98,6 +103,7 @@ export const policySchema = z
             "**/generated/**",
           ]),
       })
+      .strict()
       .default({}),
 
     triage: z
@@ -145,6 +151,7 @@ export const policySchema = z
             "**/go.sum",
           ]),
       })
+      .strict()
       .default({}),
 
     panel: z
@@ -170,6 +177,7 @@ export const policySchema = z
           ],
         }),
       })
+      .strict()
       .default({}),
 
     models: z
@@ -181,6 +189,7 @@ export const policySchema = z
         /** Per-lens override, e.g. { security: { connection, model } }. */
         perLens: z.record(z.string(), modelSelection).default({}),
       })
+      .strict()
       .default({}),
 
     quorum: z
@@ -193,6 +202,7 @@ export const policySchema = z
           .array(z.string())
           .default(["style", "formatting", "naming-preference", "comment-style", "whitespace"]),
       })
+      .strict()
       .default({}),
 
     proofOfWork: z
@@ -200,6 +210,7 @@ export const policySchema = z
         minSubstantiveCalls: z.number().int().min(0).default(3),
         requireFilesRead: z.boolean().default(true),
       })
+      .strict()
       .default({}),
 
     rounds: z
@@ -208,6 +219,7 @@ export const policySchema = z
         diffOnlyAfterRound: z.number().int().min(0).default(1),
         neverRepeatFindings: z.boolean().default(true),
       })
+      .strict()
       .default({}),
 
     trust: z
@@ -220,6 +232,7 @@ export const policySchema = z
         /** Treat bot/agent principals as standard (never trusted) regardless of allowlists. */
         botsAreStandard: z.boolean().default(true),
       })
+      .strict()
       .default({}),
 
     reporting: z
@@ -231,6 +244,7 @@ export const policySchema = z
         /** Request changes on block (true) or always comment-only (false). */
         requestChangesOnBlock: z.boolean().default(true),
       })
+      .strict()
       .default({}),
 
     budget: z
@@ -250,6 +264,7 @@ export const policySchema = z
           .default(10 * 60 * 1000),
         alertThresholds: z.array(z.number().min(0).max(2)).default([0.5, 0.8, 1.0]),
       })
+      .strict()
       .default({}),
 
     runner: z
@@ -269,6 +284,7 @@ export const policySchema = z
         /** Redact secret-looking strings from diffs and untrusted text before prompting. */
         redactSecrets: z.boolean().default(true),
       })
+      .strict()
       .default({}),
   })
   .strict();
