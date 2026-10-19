@@ -4,7 +4,7 @@
  */
 import { readFile } from "node:fs/promises";
 import * as core from "@actions/core";
-import { githubApi, realGateFactory } from "@merge-safely/cli";
+import { defaultProviderRegistry, githubApi, realGateFactory } from "@merge-safely/cli";
 import { octokitFromToken } from "@merge-safely/github";
 import { type ActionCore, type RunDeps, run } from "./run.js";
 
@@ -41,17 +41,38 @@ function apiBaseUrl(env: NodeJS.ProcessEnv): string | undefined {
   return url && url !== "https://api.github.com" ? url : undefined;
 }
 
+/** One Octokit construction for the Action and the gate, honouring GITHUB_API_URL (GitHub Enterprise Server). */
+function octokitFor(token: string) {
+  const baseUrl = apiBaseUrl(process.env);
+  const o = octokitFromToken(token, { userAgent: "merge-safely-action", ...(baseUrl ? { baseUrl } : {}) });
+  // Octokit prints every non-2xx (an expected 404 for a missing policy, 403 on GET /app) to the console; the
+  // adapters handle those, so keep them in the debug log only.
+  const quiet = (msg: string) => core.debug(String(msg));
+  o.log = { debug: quiet, info: quiet, warn: quiet, error: quiet };
+  return o;
+}
+
 const deps: RunDeps = {
   core: actionCore,
   env: process.env,
   readFile: readText,
   github(token) {
-    const baseUrl = apiBaseUrl(process.env);
-    const octokit = octokitFromToken(token, baseUrl ? { baseUrl } : {});
+    const octokit = octokitFor(token);
     const api = githubApi(octokit);
     return { octokit, getFile: (repo, path, ref) => api.getFile(repo, path, ref) };
   },
-  gateFactory: realGateFactory(),
+  gateFactory: realGateFactory(defaultProviderRegistry, { octokit: octokitFor }),
+  onCancel(fn) {
+    let done = false;
+    const handler = (signal: NodeJS.Signals) => {
+      if (done) return;
+      done = true;
+      core.warning(`Merge Safely: ${signal} received, closing out the review`);
+      fn().finally(() => process.exit(130));
+    };
+    process.once("SIGINT", handler);
+    process.once("SIGTERM", handler);
+  },
 };
 
 run(deps).then(

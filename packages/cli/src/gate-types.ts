@@ -81,7 +81,8 @@ export interface LocalReviewInput {
 }
 
 export interface CliGate {
-  review(ref: ChangeRef, opts: { headSha?: string }): Promise<CliReviewResult>;
+  /** `trigger` labels the run in the check run ("Review triggered by …"); default "cli". */
+  review(ref: ChangeRef, opts: { headSha?: string; trigger?: string }): Promise<CliReviewResult>;
   reviewChange(input: LocalReviewInput): Promise<CliReviewResult>;
   estimate(target: ChangeRef | LocalReviewInput): Promise<CliEstimate>;
   /** Latest verdict for a change with its digest, or null when there is none. */

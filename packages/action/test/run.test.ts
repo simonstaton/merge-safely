@@ -40,9 +40,13 @@ describe("run: pull_request review", () => {
     expect(setup?.policy.source).toBe("acme/app@main:.merge-safely.yml");
     expect(setup?.connections.map((c) => c.id)).toEqual(["anthropic-main"]);
     expect(setup?.concurrency).toBe(3);
+    expect(setup?.validateConnections).toBe(true);
     expect(setup?.paths.home).toBe("/runner/tmp/merge-safely");
     expect(h.factory.gate.calls).toEqual([
-      { ref: { repo: { host: "github.com", owner: "acme", name: "app" }, number: 7 }, opts: { headSha: HEAD } },
+      {
+        ref: { repo: { host: "github.com", owner: "acme", name: "app" }, number: 7 },
+        opts: { headSha: HEAD, trigger: "action:pull_request" },
+      },
     ]);
     expect(h.gh.fileReads).toEqual(["main:.merge-safely.yml"]);
   });
@@ -228,18 +232,18 @@ describe("run: other review events", () => {
     );
     h.gh.files["release:.merge-safely.yml"] = "budget: { perChangeUsd: 7 }\n";
     expect(await run(h.deps)).toBe(0);
-    expect(h.factory.gate.calls[0]?.opts).toEqual({ headSha: "9".repeat(40) });
+    expect(h.factory.gate.calls[0]?.opts).toMatchObject({ headSha: "9".repeat(40) });
     expect(h.factory.setups[0]?.policy.policy.budget.perChangeUsd).toBe(7);
 
     const h2 = harness("workflow_dispatch", "workflow_dispatch", { "pr-number": "7", "head-sha": "8".repeat(40) });
     await run(h2.deps);
-    expect(h2.factory.gate.calls[0]?.opts).toEqual({ headSha: "8".repeat(40) });
+    expect(h2.factory.gate.calls[0]?.opts).toMatchObject({ headSha: "8".repeat(40) });
   });
 
   it("check_run rerequested re-reviews that head", async () => {
     const h = harness("check_run", fixture("check_run.rerequested"));
     expect(await run(h.deps)).toBe(0);
-    expect(h.factory.gate.calls[0]?.opts).toEqual({ headSha: HEAD });
+    expect(h.factory.gate.calls[0]?.opts).toEqual({ headSha: HEAD, trigger: "action:check_run" });
   });
 
   it("an explicit policy in the checkout is used for same-repo PRs", async () => {

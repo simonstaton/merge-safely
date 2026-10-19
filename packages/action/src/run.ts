@@ -57,6 +57,8 @@ export interface RunDeps {
   /** Store holding PR verdicts, for merge-queue lookups. Default: the check-run store. */
   verdictStore?(octokit: OctokitLike, policy: Policy, logger: Logger): VerdictStore;
   now?(): Date;
+  /** Register a handler for job cancellation (SIGINT/SIGTERM): closes out the pending check run. */
+  onCancel?(fn: () => Promise<void>): void;
 }
 
 function isRecord(x: unknown): x is Record<string, unknown> {
@@ -339,9 +341,14 @@ async function main(deps: RunDeps, secrets: SecretSet, logger: Logger): Promise<
     paths: homePaths(join(env.RUNNER_TEMP || tmpdir(), "merge-safely")),
     logger,
     concurrency: inputs.concurrency,
+    // Design 7.4: validate each key on the run and fail with the connection id and the fix before seating anyone.
+    validateConnections: true,
     ...(inputs.slackWebhook ? { slackWebhook: inputs.slackWebhook } : {}),
   });
-  const result = await gate.review(ref, { headSha });
+  deps.onCancel?.(async () => {
+    await gate.abort?.("the workflow run was cancelled");
+  });
+  const result = await gate.review(ref, { headSha, trigger: `action:${trigger.event}` });
   const checkUrl = await findCheckUrl(gh.octokit, ref.repo, headSha, policy.policy, env, logger);
   setOutputs(core, reviewOutputs(result, checkUrl));
   await core.writeSummary(secrets.scrub(reviewSummary(result, checkUrl)));

@@ -111,7 +111,28 @@ This replaces rules like "no human comments means merge". Replace `ci` with your
 
 Enable the merge queue in a ruleset and require `merge-safely/verdict` as above. A PR cannot enter the queue until the check is green on its head SHA.
 
-GitHub also evaluates required checks on the temporary merge-group commit. Merge Safely reviews pull requests, not merge groups, so a required check that never reports on the merge group will hold the queue. Before you rely on the merge queue, confirm that your version of the Action or App reports on `merge_group` events. If it does not, make the merge queue's required checks your CI checks only, and require `merge-safely/verdict` on the PR through the ruleset.
+GitHub also evaluates required checks on the temporary merge-group commit, a new SHA the gate never reviewed. **The Action reports on it.** Add the `merge_group` trigger to the same workflow:
+
+```yaml
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  merge_group:
+    types: [checks_requested]
+permissions:
+  checks: write
+  pull-requests: write
+  contents: read
+```
+
+On a `merge_group` run, the Action makes no model calls and does not need `connections`. It reads the PR number from the queue branch (`gh-readonly-queue/<base>/pr-<n>-<sha>`) and looks up that PR's stored verdict on its current head. Then it writes `merge-safely/verdict` (or your `reporting.checkName`) on the merge-group commit:
+
+- **success** when the PR has a machine or human `pass` on its current head that is not contested or expired;
+- **failure** otherwise. The check names the PR and the reason: no verdict, a block, a pending or contested verdict, or a verdict on an older commit.
+
+The PR's code was reviewed on its head, so the queue commit is not reviewed again. See [packages/action/README.md](../packages/action/README.md#merge-queue).
+
+The GitHub App does not handle `merge_group` yet. With the App, either run the Action workflow for `merge_group` only (it needs `checks: write` and no model keys), or make the merge queue's required checks your CI checks only and require `merge-safely/verdict` on the PR through the ruleset.
 
 ## Reading the verdict JSON
 

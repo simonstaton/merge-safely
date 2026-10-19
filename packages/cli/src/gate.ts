@@ -501,7 +501,10 @@ export function adaptGate(
     async review(ref, opts) {
       const gate = await pick(ref);
       return toCliResult(
-        await gate.review(ref, opts.headSha ? { headSha: opts.headSha, trigger: "cli" } : { trigger: "cli" }),
+        await gate.review(ref, {
+          ...(opts.headSha ? { headSha: opts.headSha } : {}),
+          trigger: opts.trigger ?? "cli",
+        }),
       );
     },
     async reviewChange(input) {

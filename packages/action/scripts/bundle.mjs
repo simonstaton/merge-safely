@@ -25,7 +25,6 @@ await build({
   sourcemap: false,
   legalComments: "none",
   logLevel: "warning",
-  logOverride: { "import-is-undefined": "silent" }, // createGate is looked up at runtime until the orchestrator lands
   alias: { "@merge-safely/store-sqlite": "./src/stubs/store-sqlite.ts" },
   external: ["better-sqlite3"],
   inject: ["./src/stubs/import-meta-url.ts"],
