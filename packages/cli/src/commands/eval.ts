@@ -9,7 +9,10 @@ import { discoverGithubToken } from "../token.js";
  * (it parses them strictly) and its exit code is passed through: 0 gates hold, 1 a gate failed, 2 usage/validation.
  * Full runs use the real orchestrator over this CLI's connections; `--dry` needs no connections at all.
  */
-export async function evalCliCommand(rt: Runtime, argv: string[]): Promise<number> {
+export async function evalCliCommand(rt: Runtime, rawArgv: string[]): Promise<number> {
+  // Global --json means the JSON report unless a --format was given explicitly.
+  const hasFormat = rawArgv.some((a) => a === "--format" || a.startsWith("--format="));
+  const argv = rt.json && rawArgv[0] !== "init" && !hasFormat ? [...rawArgv, "--format", "json"] : rawArgv;
   const isInit = argv[0] === "init";
   const dry = argv.some((a) => a === "--dry" || (a.startsWith("--dry=") && !/=(false|0|no|off)$/i.test(a)));
   const help = argv.includes("--help");
@@ -20,10 +23,11 @@ export async function evalCliCommand(rt: Runtime, argv: string[]): Promise<numbe
       const connections = await rt.loadConnections();
       if (connections.length > 0) gateFactory = await evalGateFactory(connections, rt.ctx.registry(), rt.logger);
     }
-    const token = rt.ctx.octokit ? await discoverGithubToken(rt.ctx.env, rt.ctx.exec) : undefined;
+    // A dry run makes no calls of its own: only an already-exported token is used, `gh auth token` is not run.
+    const token = rt.ctx.octokit ? await discoverGithubToken(rt.ctx.env, rt.ctx.exec, { allowGh: !dry }) : undefined;
     if (token && rt.ctx.octokit) {
       rt.secrets.add(token.token);
-      github = { octokit: rt.ctx.octokit(token.token) };
+      github = { octokit: rt.ctx.octokit(token.token, rt.logger) };
     }
   }
   return evalCommand(argv, {

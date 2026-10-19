@@ -17,9 +17,11 @@ export interface CliContext {
   exec: Exec;
   gateFactory: GateFactory;
   registry: () => ProviderRegistry;
-  github: (token: string) => GithubApi;
+  github: (token: string, logger?: Logger) => GithubApi;
   /** Raw GitHub client, for `eval` suites with GitHub-sourced cases. Optional: without it those cases are skipped. */
-  octokit?: (token: string) => OctokitLike;
+  octokit?: (token: string, logger?: Logger) => OctokitLike;
+  /** Subscribe to SIGINT/SIGTERM; returns an unsubscribe. Absent: no interrupt handling (tests inject a fake). */
+  onSignal?: (handler: (signal: string) => void) => () => void;
   now: () => Date;
   /** Defaults to a TTY prompter when stdin is a TTY, else one that refuses with a hint. */
   prompter?: Prompter;

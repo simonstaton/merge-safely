@@ -1,3 +1,4 @@
+import { readConnectionsFile, secretValues } from "@merge-safely/providers";
 import { listEntries, readRawConnections, removeEntry, writeRawConnections } from "../connections-file.js";
 import { CliError, EXIT } from "../errors.js";
 import { table } from "../io.js";
@@ -45,7 +46,7 @@ export async function connectionsRemove(rt: Runtime, id: string): Promise<number
       `no connection "${id}" in ${rt.paths.connections} (known: ${known.length ? known.join(", ") : "none"})`,
     );
   }
-  await writeRawConnections(rt.paths.connections, file);
+  for (const w of await writeRawConnections(rt.paths.connections, file, { home: rt.paths.home })) rt.warn(w);
   if (rt.json) rt.printJson({ removed: id, path: rt.paths.connections });
   else rt.out(`Removed ${id} from ${rt.paths.connections}.`);
   return 0;
@@ -59,20 +60,39 @@ interface TestRow {
   latencyMs?: number;
 }
 
+/** `connections.<id>: message` → id, from the providers' per-entry load errors. */
+function errorId(e: string): string | undefined {
+  return e.match(/^connections\.([^:]+):/)?.[1];
+}
+
 export async function connectionsTest(rt: Runtime, id: string | undefined): Promise<number> {
-  const all = await rt.loadConnections();
-  const targets = id ? all.filter((c) => c.id === id) : all;
-  if (id && targets.length === 0) {
+  const { file } = await readRawConnections(rt.paths.connections);
+  const rawIds = listEntries(file).map((c) => c.id);
+  if (rawIds.length === 0) {
     throw new CliError(
-      "CONNECTION_NOT_FOUND",
-      `no usable connection "${id}" (known: ${all.map((c) => c.id).join(", ") || "none"})`,
+      "NO_CONNECTIONS",
+      `no connections in ${rt.paths.connections}; add one with \`merge-safely connect <provider>\``,
     );
   }
-  if (targets.length === 0) {
-    throw new CliError("NO_CONNECTIONS", `no connections to test; add one with \`merge-safely connect <provider>\``);
+  if (id && !rawIds.includes(id)) {
+    throw new CliError("CONNECTION_NOT_FOUND", `no connection "${id}" (known: ${rawIds.join(", ")})`);
   }
+  const r = await readConnectionsFile(rt.paths.connections, rt.ctx.env, { now: rt.ctx.now });
+  for (const w of r.warnings) rt.warn(w);
+  for (const c of r.connections) rt.secrets.add(...secretValues(c.secret));
+  // Entries that do not load (unset env var, missing master key, …) are failures, never silently skipped.
+  const loadFailures: TestRow[] = [];
+  for (const e of r.errors) {
+    const eid = errorId(e) ?? "?";
+    if (id && eid !== id) continue;
+    const prev = loadFailures.find((x) => x.id === eid);
+    const msg = rt.secrets.scrub(e.replace(/^connections\.[^:]+:\s*/, ""));
+    if (prev) prev.message = `${prev.message}; ${msg}`;
+    else loadFailures.push({ id: eid, ok: false, message: `could not load: ${msg}` });
+  }
+  const targets = r.connections.filter((c) => !id || c.id === id);
   const registry = rt.ctx.registry();
-  const rows: TestRow[] = await Promise.all(
+  const tested: TestRow[] = await Promise.all(
     targets.map(async (conn): Promise<TestRow> => {
       try {
         const v = await registry.forConnection(conn).validate(conn);
@@ -88,33 +108,32 @@ export async function connectionsTest(rt: Runtime, id: string | undefined): Prom
       }
     }),
   );
-  const okIds = new Set(rows.filter((r) => r.ok).map((r) => r.id));
+  const order = (x: TestRow) => rawIds.indexOf(x.id);
+  const rows = [...tested, ...loadFailures].sort((a, b) => order(a) - order(b));
+  const okIds = new Set(rows.filter((x) => x.ok).map((x) => x.id));
   if (okIds.size) {
-    const { file, missing } = await readRawConnections(rt.paths.connections);
-    if (!missing) {
-      const at = rt.ctx.now().toISOString();
-      for (const e of file.connections) if (typeof e.id === "string" && okIds.has(e.id)) e.lastValidatedAt = at;
-      try {
-        await writeRawConnections(rt.paths.connections, file);
-      } catch (err: unknown) {
-        rt.warn(`could not record lastValidatedAt: ${err instanceof Error ? err.message : String(err)}`);
-      }
+    const at = rt.ctx.now().toISOString();
+    for (const e of file.connections) if (typeof e.id === "string" && okIds.has(e.id)) e.lastValidatedAt = at;
+    try {
+      await writeRawConnections(rt.paths.connections, file, { home: rt.paths.home });
+    } catch (err: unknown) {
+      rt.warn(`could not record lastValidatedAt: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
-  const allOk = rows.every((r) => r.ok);
+  const allOk = rows.length > 0 && rows.every((x) => x.ok);
   if (rt.json) {
     rt.printJson({ ok: allOk, results: rows });
   } else {
     const c = rt.colour;
-    for (const r of rows) {
+    for (const x of rows) {
       const detail = [
-        r.models !== undefined ? `${r.models} models` : "",
-        r.latencyMs !== undefined ? `${r.latencyMs} ms` : "",
-        r.message ?? "",
+        x.models !== undefined ? `${x.models} models` : "",
+        x.latencyMs !== undefined ? `${x.latencyMs} ms` : "",
+        x.message ?? "",
       ]
         .filter(Boolean)
         .join(", ");
-      rt.out(`${r.ok ? c.green("ok  ") : c.red("FAIL")}  ${r.id}${detail ? `  ${detail}` : ""}`);
+      rt.out(`${x.ok ? c.green("ok  ") : c.red("FAIL")}  ${x.id}${detail ? `  ${detail}` : ""}`);
     }
   }
   return allOk ? 0 : EXIT.error;

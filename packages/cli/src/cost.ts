@@ -7,16 +7,22 @@
  */
 import {
   type Change,
+  type ConnectionRecord,
   DEFAULT_POLICY,
   estimateSeatUsage,
+  findInCatalog,
   type ModelInfo,
+  type ModelRef,
   type Policy,
   type Seat,
+  SeatingError,
+  seat,
   seatBudgetFromPolicy,
   sortByTier,
+  type Tier,
   type TokenUsage,
 } from "@merge-safely/core";
-import { priceUsage, withPricing } from "@merge-safely/registry";
+import { findModel, priceUsage, withPricing } from "@merge-safely/registry";
 
 export const TYPICAL_PR_LINES = 300;
 
@@ -76,11 +82,13 @@ export interface TierCost {
   usd: number;
   /** True when a model had no registry pricing and the pessimistic fallback rate was used. */
   pessimistic: boolean;
+  /** How the models were chosen, when it is not plain policy seating (e.g. the policy names other connections). */
+  note?: string;
 }
 
 const HUNTER_PREF: ModelInfo["tier"][] = ["mid", "frontier", "small"];
 
-/** The model seating would pick automatically: hunters the first mid model, judges the strongest. */
+/** The model seating picks automatically from a catalog: hunters the first mid model, judges the strongest. */
 export function autoModels(models: ModelInfo[]): { hunter?: ModelInfo; judge?: ModelInfo } {
   const sorted = sortByTier(models);
   let hunter: ModelInfo | undefined;
@@ -91,30 +99,106 @@ export function autoModels(models: ModelInfo[]): { hunter?: ModelInfo; judge?: M
   return { hunter, judge: sorted[0] };
 }
 
-function seatUsd(model: ModelInfo | undefined, usage: TokenUsage): { usd: number; pessimistic: boolean } {
-  if (!model) return { usd: 0, pessimistic: false };
+/** The model info a seat will be priced with: the connection's catalog entry, the registry's, else unknown. */
+function modelFor(ref: ModelRef, models: ModelInfo[]): ModelInfo {
+  const known = findInCatalog(models, ref.name) ?? findModel(ref.provider, ref.name);
+  if (known) return known;
+  return {
+    provider: ref.provider,
+    name: ref.name,
+    supportsTools: true,
+    supportsStructuredOutput: true,
+    contextTokens: 0,
+    maxOutputTokens: 0,
+    tier: "mid",
+  };
+}
+
+function seatUsd(model: ModelInfo, usage: TokenUsage): { usd: number; pessimistic: boolean } {
   const priced = withPricing(model);
   const r = priceUsage(priced, usage);
   return { usd: r.usd, pessimistic: model.pricing === undefined && !priced.zeroCost };
 }
 
-/** Estimated cost per tier for a typical PR on one connection's models. */
-export function tierCosts(models: ModelInfo[], policy: Policy = DEFAULT_POLICY, lines = TYPICAL_PR_LINES): TierCost[] {
-  const { hunter, judge } = autoModels(models);
-  return ([1, 2, 3] as const).map((tier) => {
-    const p = policy.panel[`t${tier}`];
-    const hunters = p.hunters.length;
-    const judges = p.judges;
-    const h = seatUsd(hunter, seatTokens("hunter", lines, policy, false, hunter?.contextTokens));
-    const j = seatUsd(judge, seatTokens("judge", lines, policy, p.secondJudgeRound, judge?.contextTokens));
+const tierFor = (level: 1 | 2 | 3): Tier => ({
+  level,
+  score: [0, 35, 65, 90][level] ?? 0,
+  factors: { loc: TYPICAL_PR_LINES, files: TYPICAL_FILES, modules: 1, criticalPathHits: [] },
+  reasons: [],
+});
+
+/**
+ * Estimated cost per tier for a typical PR on one connection: the panel comes from the core's own seating (so
+ * `--model` / defaultModel and the policy's `models.*` are honoured exactly as a review would), priced with the
+ * registry and the core's per-seat token estimate. When the policy names connections other than this one, the
+ * automatic choice for this connection is shown instead, with a note.
+ */
+export function tierCosts(
+  models: ModelInfo[],
+  policy: Policy = DEFAULT_POLICY,
+  lines = TYPICAL_PR_LINES,
+  connection?: ConnectionRecord,
+): TierCost[] {
+  const conn: ConnectionRecord = connection ?? {
+    id: "this-connection",
+    provider: models[0]?.provider ?? "unknown",
+    kind: "api-key",
+    createdAt: "",
+  };
+  const change = typicalChange(lines);
+  const panelFor = (level: 1 | 2 | 3, p: Policy) =>
+    seat({ tier: tierFor(level), change, policy: p, connections: [conn], catalog: () => models });
+  let effective = policy;
+  let note: string | undefined;
+  try {
+    panelFor(1, policy);
+  } catch (err: unknown) {
+    if (!(err instanceof SeatingError)) throw err;
+    effective = {
+      ...policy,
+      models: { ...policy.models, hunters: undefined, judges: undefined, fallback: undefined, perLens: {} },
+    };
+    note = `the policy's models.* do not resolve on ${conn.id} (${err.message}); showing the automatic choice for this connection`;
+  }
+  return ([1, 2, 3] as const).map((level) => {
+    let seats: Seat[] = [];
+    let secondJudgeRound = false;
+    try {
+      const r = panelFor(level, effective);
+      seats = r.seats;
+      secondJudgeRound = r.secondJudgeRound;
+    } catch (_err: unknown) {
+      return {
+        tier: level,
+        hunters: 0,
+        judges: 0,
+        usd: 0,
+        pessimistic: false,
+        note: "no model to seat: this connection lists no models; pass --model <name>",
+      };
+    }
+    let usd = 0;
+    let pessimistic = false;
+    let hunterModel: ModelInfo | undefined;
+    let judgeModel: ModelInfo | undefined;
+    for (const st of seats) {
+      const m = modelFor(st.model, models);
+      if (st.role === "hunter") hunterModel ??= m;
+      else judgeModel ??= m;
+      const tokens = seatTokens(st.role, lines, effective, st.role === "judge" && secondJudgeRound, m.contextTokens);
+      const r = seatUsd(m, tokens);
+      usd += r.usd;
+      pessimistic ||= r.pessimistic;
+    }
     return {
-      tier,
-      hunters,
-      judges,
-      ...(hunter ? { hunterModel: hunter } : {}),
-      ...(judge ? { judgeModel: judge } : {}),
-      usd: h.usd * hunters + j.usd * judges,
-      pessimistic: h.pessimistic || j.pessimistic,
+      tier: level,
+      hunters: seats.filter((x) => x.role === "hunter").length,
+      judges: seats.filter((x) => x.role === "judge").length,
+      ...(hunterModel ? { hunterModel } : {}),
+      ...(judgeModel ? { judgeModel } : {}),
+      usd,
+      pessimistic,
+      ...(note ? { note } : {}),
     };
   });
 }

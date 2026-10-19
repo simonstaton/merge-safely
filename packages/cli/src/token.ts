@@ -11,11 +11,16 @@ export interface DiscoveredToken {
  * GitHub token precedence: `GITHUB_TOKEN`, then `GH_TOKEN`, then `gh auth token` when the GitHub CLI is installed
  * and logged in. Returns undefined when none is available. The token is never printed.
  */
-export async function discoverGithubToken(env: NodeJS.ProcessEnv, exec: Exec): Promise<DiscoveredToken | undefined> {
+export async function discoverGithubToken(
+  env: NodeJS.ProcessEnv,
+  exec: Exec,
+  opts: { allowGh?: boolean } = {},
+): Promise<DiscoveredToken | undefined> {
   for (const name of ["GITHUB_TOKEN", "GH_TOKEN"] as const) {
     const v = env[name]?.trim();
     if (v) return { token: v, source: name };
   }
+  if (opts.allowGh === false) return undefined;
   const r = await exec("gh", ["auth", "token"], { timeoutMs: 10_000 });
   const t = r.code === 0 ? r.stdout.trim() : "";
   if (t && !/\s/.test(t)) return { token: t, source: "gh" };
@@ -31,6 +36,8 @@ export type TokenIdentity = "app" | "user";
  */
 export function tokenIdentity(t: DiscoveredToken, env: NodeJS.ProcessEnv): TokenIdentity {
   if (t.token.startsWith("ghs_")) return "app";
+  // A PAT or OAuth token passed through GITHUB_TOKEN inside Actions is still a user token.
+  if (/^(ghp_|github_pat_|gho_|ghu_)/.test(t.token)) return "user";
   if (t.source === "GITHUB_TOKEN" && env.GITHUB_ACTIONS === "true") return "app";
   return "user";
 }

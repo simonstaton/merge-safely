@@ -82,6 +82,7 @@ describe("run --local through the real gate", () => {
     expect(r.code).toBe(1);
     expect(r.stdout).toMatch(/BLOCK/);
     expect(r.stdout).toContain("correctness: change breaks an invariant");
+    expect(r.stdout).not.toContain("WORKTRE");
     expect(provider.calls.length).toBeGreaterThan(0);
   });
 

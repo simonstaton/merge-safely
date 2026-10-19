@@ -6,7 +6,7 @@
  * a decrypt. Writes are validated against the providers' schema and land atomically with mode 0600.
  */
 import { randomBytes } from "node:crypto";
-import { chmod, lstat, mkdir, open, readFile, realpath, rename, unlink } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readFile, realpath, rename, stat, unlink } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import type { Connection } from "@merge-safely/core";
 import {
@@ -52,8 +52,16 @@ export async function readRawConnections(path: string): Promise<{ file: RawConne
   return { file: { version: 1, connections: entries }, missing: false };
 }
 
-/** Write atomically, mode 0600, directory created 0700. Refuses to write a file the schema rejects. */
-export async function writeRawConnections(path: string, file: RawConnectionsFile): Promise<void> {
+/**
+ * Write atomically, mode 0600, directory created 0700. When `home` is given and the file lives in it, an existing
+ * home directory that other users can read is tightened to 0700 (only when we own it). Returns warnings.
+ */
+export async function writeRawConnections(
+  path: string,
+  file: RawConnectionsFile,
+  opts: { home?: string } = {},
+): Promise<string[]> {
+  const warnings: string[] = [];
   const checked = connectionsFileSchema.safeParse(file);
   if (!checked.success) {
     const issues = checked.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
@@ -67,6 +75,18 @@ export async function writeRawConnections(path: string, file: RawConnectionsFile
   }
   const dir = dirname(target);
   await mkdir(dir, { recursive: true, mode: 0o700 });
+  if (process.platform !== "win32") {
+    try {
+      const st = await stat(dir);
+      if ((st.mode & 0o077) !== 0) {
+        const ours = typeof process.getuid !== "function" || st.uid === process.getuid();
+        if (opts.home && resolve(opts.home) === dir && ours) await chmod(dir, 0o700);
+        else warnings.push(`directory ${dir} is accessible by other users; consider: chmod 700 ${dir}`);
+      }
+    } catch (_err: unknown) {
+      // best effort
+    }
+  }
   const tmp = join(dir, `.connections.${process.pid}.${randomBytes(4).toString("hex")}.tmp`);
   try {
     const fh = await open(tmp, "wx", 0o600);
@@ -84,6 +104,7 @@ export async function writeRawConnections(path: string, file: RawConnectionsFile
     throw new CliError("CONNECTIONS_WRITE_FAILED", `could not write connections file ${path}${code}`);
   }
   await chmod(target, 0o600);
+  return warnings;
 }
 
 export interface EntryOptions {
@@ -100,10 +121,12 @@ export interface EntryOptions {
 export function toFileEntry(conn: Connection, opts: EntryOptions): { entry: ConnectionFileEntry; warnings: string[] } {
   const { secret, ...record } = conn;
   const warnings: string[] = [];
-  if (opts.masterKey) {
-    return { entry: { ...record, secretRef: { encrypted: encryptSecret(secret, opts.masterKey, conn.id) } }, warnings };
-  }
+  // Records with nothing secret are stored as plain records, never encrypted (they must load without a master key).
   if (secret.kind === "cloud" || secret.kind === "subscription") return { entry: { ...record, secret }, warnings };
+  if (secret.kind === "openai-compatible" && !secret.apiKey && !secret.headers) {
+    // Keyless local endpoint: only a base URL, nothing secret.
+    return { entry: { ...record, baseUrl: secret.baseUrl }, warnings };
+  }
   if (opts.envRef) {
     if (secret.kind === "openai-compatible" || secret.kind === "anthropic-compatible") {
       return {
@@ -118,9 +141,8 @@ export function toFileEntry(conn: Connection, opts: EntryOptions): { entry: Conn
     }
     return { entry: { ...record, secretRef: { env: opts.envRef } }, warnings };
   }
-  if (secret.kind === "openai-compatible" && !secret.apiKey && !secret.headers) {
-    // Keyless local endpoint: only a base URL, nothing secret.
-    return { entry: { ...record, baseUrl: secret.baseUrl }, warnings };
+  if (opts.masterKey) {
+    return { entry: { ...record, secretRef: { encrypted: encryptSecret(secret, opts.masterKey, conn.id) } }, warnings };
   }
   warnings.push(
     `connection ${conn.id}: secret stored in plaintext (file mode 0600); set ${MASTER_KEY_ENV} to encrypt it, or use --api-key-env`,

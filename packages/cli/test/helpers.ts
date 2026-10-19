@@ -196,9 +196,19 @@ export class FakeGate implements CliGate {
 export class FakeGithub implements GithubApi {
   fileRefs: string[] = [];
   files: Record<string, string> = {};
-  pull = { headSha: "b".repeat(40), baseRef: "main", baseSha: "c".repeat(40) };
+  pull: { headSha: string; baseRef: string; baseSha: string; author?: string } = {
+    headSha: "b".repeat(40),
+    baseRef: "main",
+    baseSha: "c".repeat(40),
+    author: "pr-author",
+  };
+  /** Login GET /user returns; undefined = the token has no user (App/Actions). */
+  user: string | undefined = "reviewer";
   async getPull() {
     return this.pull;
+  }
+  async currentUser() {
+    return this.user;
   }
   async getFile(_repo: unknown, path: string, ref: string) {
     this.fileRefs.push(ref);

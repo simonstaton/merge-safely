@@ -8,6 +8,7 @@
  */
 import { join } from "node:path";
 import {
+  type Change,
   type Connection,
   type CostLedger,
   createGate,
@@ -30,6 +31,7 @@ import {
   type TrustProvider,
   type VerdictStore,
   type Workspace,
+  type WorkspaceHandle,
 } from "@merge-safely/core";
 import { slackEscalation } from "@merge-safely/escalation-slack";
 import { coreGateFactory, type GateFactory as EvalGateFactory } from "@merge-safely/evals";
@@ -39,7 +41,6 @@ import {
   commitStatusReporter,
   githubSource,
   type OctokitLike,
-  octokitFromToken,
   prReviewReporter,
   trustFromPolicy,
 } from "@merge-safely/github";
@@ -52,8 +53,10 @@ import { memoryVerdictStore } from "@merge-safely/store-memory";
 import { sqliteStores } from "@merge-safely/store-sqlite";
 import { createReadOnlyTools } from "@merge-safely/tools";
 import { currentTreeWorkspace, localWorkspace } from "@merge-safely/workspace-local";
+import { CliError } from "./errors.js";
 import type { CliEstimate, CliGate, CliReviewResult, GateFactory, GateSetup, Outcome } from "./gate-types.js";
 import { isChangeRef } from "./gate-types.js";
+import { quietOctokit } from "./github-api.js";
 import { CLI_VERSION } from "./version.js";
 
 /** Default seats run in parallel by the CLI (`--concurrency`). Lower than the core's 4 to be gentle on rate limits. */
@@ -114,7 +117,68 @@ export interface GateOverrides {
 export interface Wiring {
   deps: GateDeps;
   reporters: Reporter[];
+  /** Cancel support: reports an error for an unfinished change and disposes acquired workspaces. */
+  abort: (reason: string) => Promise<void>;
 }
+
+const DEFAULT_VALIDATE_TIMEOUT_MS = 15_000;
+
+function withTimeoutMs<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const t = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${what} timed out after ${Math.round(ms / 1000)} s`)), ms);
+    timer.unref?.();
+  });
+  return Promise.race([p, t]).finally(() => clearTimeout(timer));
+}
+
+/** Connection ids the policy names explicitly (hunters, judges, per-lens). The fallback is optional by design. */
+export function namedConnections(policy: Policy): string[] {
+  const ids = [policy.models.hunters?.connection, policy.models.judges?.connection];
+  for (const sel of Object.values(policy.models.perLens)) ids.push(sel.connection);
+  return [...new Set(ids.filter((x): x is string => typeof x === "string"))];
+}
+
+/**
+ * Validate connections before seating (`run`), with a timeout each. A connection the policy names that fails is
+ * fatal (CONNECTION_UNREACHABLE naming it and the fix); with automatic model choice failed connections are dropped
+ * with a warning, and it is fatal only when none is left. Models returned by validate prefill the catalog cache.
+ */
+export async function preflightConnections(
+  registry: ProviderRegistry,
+  connections: Connection[],
+  policy: Policy,
+  logger: Logger,
+  timeoutMs = DEFAULT_VALIDATE_TIMEOUT_MS,
+): Promise<{ connections: Connection[]; cache: Map<string, ModelInfo[]> }> {
+  const cache = new Map<string, ModelInfo[]>();
+  const results = await Promise.all(
+    connections.map(async (conn) => {
+      try {
+        const v = await withTimeoutMs(registry.forConnection(conn).validate(conn), timeoutMs, `validating ${conn.id}`);
+        if (v.ok && v.models && v.models.length > 0) cache.set(conn.id, v.models);
+        return { conn, ok: v.ok, message: v.message ?? "validation failed" };
+      } catch (err: unknown) {
+        return { conn, ok: false, message: err instanceof Error ? err.message : String(err) };
+      }
+    }),
+  );
+  const failed = results.filter((r) => !r.ok);
+  const fail = (r: (typeof results)[number]) =>
+    new CliError(
+      "CONNECTION_UNREACHABLE",
+      `connection ${r.conn.id} is unreachable or rejected (${r.message}). Fix: check its key, base URL and network, then run \`merge-safely connections test ${r.conn.id}\``,
+    );
+  const named = new Set(namedConnections(policy));
+  const namedFailure = failed.find((r) => named.has(r.conn.id));
+  if (namedFailure) throw fail(namedFailure);
+  const ok = results.filter((r) => r.ok).map((r) => r.conn);
+  if (ok.length === 0 && failed[0]) throw fail(failed[0]);
+  for (const r of failed) logger.warn(`connection ${r.conn.id} skipped: ${r.message}`);
+  return { connections: ok, cache };
+}
+
+const FINAL_EVENTS: ReadonlySet<ReportEvent["type"]> = new Set(["verdict", "escalated", "budget-blocked", "error"]);
 
 /** Build the GateDeps for a setup. Exported for tests of the wiring itself. */
 export async function buildGateDeps(
@@ -122,10 +186,20 @@ export async function buildGateDeps(
   registry: ProviderRegistry,
   overrides: GateOverrides = {},
 ): Promise<Wiring> {
-  const { policy, connections, paths, logger } = setup;
-  const catalogData = await buildCatalog(registry, connections);
-  for (const p of catalogData.problems) logger.warn(`connection ${p.connectionId}: ${p.message}`);
-  const catalog = catalogLookup(catalogData);
+  const { policy, paths, logger } = setup;
+  let connections = setup.connections;
+  let catalog: (connectionId: string) => ModelInfo[] = () => [];
+  if (setup.catalog !== false) {
+    let cache: Map<string, ModelInfo[]> | undefined;
+    if (setup.validateConnections) {
+      const pre = await preflightConnections(registry, connections, policy.policy, logger, setup.validateTimeoutMs);
+      connections = pre.connections;
+      cache = pre.cache;
+    }
+    const catalogData = await buildCatalog(registry, connections, cache ? { cache } : {});
+    for (const p of catalogData.problems) logger.warn(`connection ${p.connectionId}: ${p.message}`);
+    catalog = catalogLookup(catalogData);
+  }
 
   let source: SourceProvider | undefined;
   let workspace: Workspace;
@@ -144,7 +218,7 @@ export async function buildGateDeps(
     reporters.push(memoryReporter());
     installationId = "local";
   } else {
-    const octokit: OctokitLike = overrides.octokit ? overrides.octokit(t.token) : octokitFromToken(t.token);
+    const octokit: OctokitLike = overrides.octokit ? overrides.octokit(t.token) : quietOctokit(t.token, logger);
     source = githubSource({ octokit });
     workspace =
       overrides.workspace?.(setup) ??
@@ -174,14 +248,74 @@ export async function buildGateDeps(
     }
   }
 
+  // Track what is in flight so an interrupt can close it out (see `abort`).
+  const handles = new Set<WorkspaceHandle>();
+  let aborted = false;
+  const tracked: Workspace = {
+    async acquire(change, opts) {
+      const h = await workspace.acquire(change, opts);
+      if (aborted) {
+        await h.dispose().catch(() => undefined);
+        throw new Error("review interrupted");
+      }
+      const wrapped: WorkspaceHandle = {
+        ...h,
+        dispose: async () => {
+          handles.delete(wrapped);
+          await h.dispose();
+        },
+      };
+      handles.add(wrapped);
+      return wrapped;
+    },
+  };
+  let open: { change: Change; round: number } | undefined;
+  const trackedReporters: Reporter[] = reporters.map((r) => ({
+    async report(e) {
+      if (e.type === "pending") open = { change: e.change, round: e.round };
+      else if (FINAL_EVENTS.has(e.type)) open = undefined;
+      await r.report(e);
+    },
+  }));
+  if (trackedReporters.length === 0) {
+    trackedReporters.push({
+      async report(e) {
+        if (e.type === "pending") open = { change: e.change, round: e.round };
+        else if (FINAL_EVENTS.has(e.type)) open = undefined;
+      },
+    });
+  }
+  const abort = async (reason: string): Promise<void> => {
+    aborted = true;
+    const pending = open;
+    open = undefined;
+    if (pending) {
+      const event: ReportEvent = { type: "error", change: pending.change, error: reason, round: pending.round };
+      await Promise.all(
+        reporters.map((r) =>
+          r.report(event).catch((err: unknown) => {
+            logger.warn(`could not report the interruption: ${err instanceof Error ? err.message : String(err)}`);
+          }),
+        ),
+      );
+    }
+    await Promise.all(
+      [...handles].map((h) =>
+        h.dispose().catch((err: unknown) => {
+          logger.warn(`could not dispose workspace ${h.cwd}: ${err instanceof Error ? err.message : String(err)}`);
+        }),
+      ),
+    );
+  };
+
   const deps: GateDeps = {
     ...(source ? { source } : {}),
-    workspace,
+    workspace: tracked,
     providers: (conn) => registry.forConnection(conn),
     connections,
     catalog,
     store,
-    reporters,
+    reporters: trackedReporters,
     ledger,
     ...(trust ? { trust } : {}),
     ...(escalation ? { escalation } : {}),
@@ -197,7 +331,7 @@ export async function buildGateDeps(
     logger,
     producedBy: `merge-safely-cli@${CLI_VERSION}`,
   };
-  return { deps, reporters };
+  return { deps, reporters, abort };
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -261,8 +395,9 @@ export function toCliEstimate(e: Estimate): CliEstimate {
   };
 }
 
-export function adaptGate(g: Gate, policy: Policy): CliGate {
+export function adaptGate(g: Gate, policy: Policy, abort?: (reason: string) => Promise<void>): CliGate {
   return {
+    ...(abort ? { abort } : {}),
     async review(ref, opts) {
       return toCliResult(
         await g.review(ref, opts.headSha ? { headSha: opts.headSha, trigger: "cli" } : { trigger: "cli" }),
@@ -298,8 +433,8 @@ export function realGateFactory(
   overrides: GateOverrides = {},
 ): GateFactory {
   return async (setup) => {
-    const { deps } = await buildGateDeps(setup, registry(), overrides);
-    return adaptGate(createGate(deps), setup.policy.policy);
+    const { deps, abort } = await buildGateDeps(setup, registry(), overrides);
+    return adaptGate(createGate(deps), setup.policy.policy, abort);
   };
 }
 

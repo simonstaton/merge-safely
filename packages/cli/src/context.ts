@@ -1,7 +1,6 @@
-import { octokitFromToken } from "@merge-safely/github";
 import { execCommand } from "./exec.js";
 import { defaultProviderRegistry, realGateFactory } from "./gate.js";
-import { githubApi } from "./github-api.js";
+import { githubApi, quietOctokit } from "./github-api.js";
 import { processIO } from "./io.js";
 import type { CliContext } from "./runtime.js";
 
@@ -14,8 +13,17 @@ export function defaultContext(): CliContext {
     exec: execCommand,
     gateFactory: realGateFactory(defaultProviderRegistry),
     registry: defaultProviderRegistry,
-    github: (token) => githubApi(octokitFromToken(token)),
-    octokit: (token) => octokitFromToken(token),
+    github: (token, logger) => githubApi(quietOctokit(token, logger)),
+    octokit: (token, logger) => quietOctokit(token, logger),
+    onSignal: (handler) => {
+      const on = (sig: NodeJS.Signals) => handler(sig);
+      process.once("SIGINT", on);
+      process.once("SIGTERM", on);
+      return () => {
+        process.removeListener("SIGINT", on);
+        process.removeListener("SIGTERM", on);
+      };
+    },
     now: () => new Date(),
   };
 }

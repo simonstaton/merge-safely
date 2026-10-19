@@ -1,4 +1,4 @@
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { ChangeRef, Principal, RepoRef } from "@merge-safely/core";
 import { parseRepo } from "@merge-safely/github";
 import { CliError, EXIT } from "../errors.js";
@@ -72,7 +72,10 @@ interface PrContext {
   identity: TokenIdentity;
   gh: GithubApi;
   headSha: string;
+  /** The PR's current head (before any --head / --sha). */
+  currentHead: string;
   baseRef: string;
+  author?: string;
   policy: LoadedPolicy;
 }
 
@@ -83,6 +86,7 @@ interface PrContext {
 async function prContext(rt: Runtime, opts: PrOptions): Promise<PrContext> {
   const repo = parseRepoFlag(opts.repo);
   const number = parsePrNumber(opts.pr);
+  const policyPath = opts.policy ? resolve(rt.ctx.cwd, opts.policy) : undefined;
   const found = await discoverGithubToken(rt.ctx.env, rt.ctx.exec);
   if (!found) {
     throw new CliError(
@@ -92,11 +96,11 @@ async function prContext(rt: Runtime, opts: PrOptions): Promise<PrContext> {
   }
   rt.secrets.add(found.token);
   rt.logger.debug(`GitHub token from ${found.source}`);
-  const gh = rt.ctx.github(found.token);
+  const gh = rt.ctx.github(found.token, rt.logger);
   const pull = await gh.getPull(repo, number);
   let policy: LoadedPolicy;
-  if (opts.policy) {
-    policy = await readPolicyFile(opts.policy);
+  if (policyPath) {
+    policy = await readPolicyFile(policyPath);
   } else {
     const text = await gh.getFile(repo, POLICY_FILE, pull.baseRef);
     const source = `${repo.owner}/${repo.name}@${pull.baseRef}:${POLICY_FILE}`;
@@ -109,7 +113,9 @@ async function prContext(rt: Runtime, opts: PrOptions): Promise<PrContext> {
     identity: tokenIdentity(found, rt.ctx.env),
     gh,
     headSha: opts.head ?? pull.headSha,
+    currentHead: pull.headSha,
     baseRef: pull.baseRef,
+    ...(pull.author ? { author: pull.author } : {}),
     policy,
   };
 }
@@ -124,13 +130,30 @@ export interface RunOptions extends PrOptions {
   concurrency?: string;
 }
 
+/** Flags that only make sense for a PR review; `--local` rejects them rather than silently ignoring them. */
+const PR_ONLY_FLAGS: Array<[keyof RunOptions, string]> = [
+  ["repo", "--repo"],
+  ["pr", "--pr"],
+  ["report", "--report"],
+  ["store", "--store"],
+  ["head", "--head"],
+  ["slackWebhook", "--slack-webhook"],
+  ["dryRun", "--dry-run"],
+];
+
 function prTarget(rt: Runtime, c: PrContext, opts: RunOptions): PrTarget {
   const report = (opts.report ?? (c.identity === "app" ? "github" : "status")) as ReportKind;
   if (!REPORTS.includes(report)) throw new CliError("USAGE", `--report must be one of ${REPORTS.join(", ")}`);
-  const store = (opts.store ?? "fs") as StoreKind;
+  // Same store as the Action (check runs) when the token can write them; a local fs store otherwise.
+  const store = (opts.store ?? (c.identity === "app" ? "checkrun" : "fs")) as StoreKind;
   if (!STORES.includes(store)) throw new CliError("USAGE", `--store must be one of ${STORES.join(", ")}`);
   if (c.identity === "user" && (report === "github" || store === "checkrun")) {
     rt.warn("check runs need a GitHub App or Actions token; with a personal token use --report status and --store fs");
+  }
+  if (!rt.json) {
+    rt.err(
+      `store: ${store}${store === "checkrun" ? " (the PR's check runs, like the Action)" : ` (${rt.paths.store})`}, report: ${report}`,
+    );
   }
   return {
     mode: "pr",
@@ -156,10 +179,12 @@ async function makeGate(
   rt: Runtime,
   target: GateSetup["target"],
   policy: LoadedPolicy,
-  extra: { slackWebhook?: string; concurrency?: string } = {},
+  extra: { slackWebhook?: string; concurrency?: string; models?: boolean; validate?: boolean } = {},
 ): Promise<CliGate> {
   const concurrency = parseConcurrency(extra.concurrency);
-  const connections = await rt.loadConnections({ required: true });
+  // explain/verdict call no model: they need no usable connection and no provider catalog.
+  const needsModels = extra.models !== false;
+  const connections = await rt.loadConnections({ required: needsModels });
   const webhook = extra.slackWebhook ?? rt.ctx.env.MERGE_SAFELY_SLACK_WEBHOOK;
   if (webhook) rt.secrets.add(webhook);
   return rt.ctx.gateFactory({
@@ -170,7 +195,35 @@ async function makeGate(
     logger: rt.logger,
     ...(webhook ? { slackWebhook: webhook } : {}),
     ...(concurrency !== undefined ? { concurrency } : {}),
+    ...(needsModels ? {} : { catalog: false }),
+    ...(extra.validate ? { validateConnections: true } : {}),
   });
+}
+
+export const EXIT_INTERRUPTED = 130;
+
+/**
+ * Run a gate call, cancelling cleanly on SIGINT/SIGTERM: the gate reports an error for the in-flight change (so a
+ * check run is not left in progress) and disposes its workspaces; the command then exits 130.
+ */
+async function interruptible<T>(rt: Runtime, gate: CliGate, work: Promise<T>): Promise<T | "interrupted"> {
+  if (!rt.ctx.onSignal) return work;
+  let off: (() => void) | undefined;
+  const interrupted = new Promise<"interrupted">((resolveInterrupt) => {
+    off = rt.ctx.onSignal?.((signal) => {
+      rt.err(`merge-safely: ${signal} received; cancelling the review …`);
+      const done = gate.abort ? gate.abort(`review interrupted (${signal}); re-run the check`) : Promise.resolve();
+      done.then(
+        () => resolveInterrupt("interrupted"),
+        () => resolveInterrupt("interrupted"),
+      );
+    });
+  });
+  try {
+    return await Promise.race([work, interrupted]);
+  } finally {
+    off?.();
+  }
 }
 
 function printResult(rt: Runtime, result: CliReviewResult, asJson: boolean): number {
@@ -183,43 +236,54 @@ function printResult(rt: Runtime, result: CliReviewResult, asJson: boolean): num
       ...(result.verdict ? { verdict: result.verdict } : {}),
     });
   } else {
-    rt.out(rt.secrets.scrub(result.digest.text));
+    rt.out(rt.secrets.scrub(result.digest.text).replace(/\bcommit WORKTRE(E)?\b/g, "working tree"));
   }
   return exitFor(result.outcome);
 }
 
 async function localInput(rt: Runtime, base: string | undefined): Promise<LocalChange> {
-  return buildLocalChange({ exec: rt.ctx.exec, cwd: rt.ctx.cwd, ...(base ? { base } : {}) });
+  const lc = await buildLocalChange({ exec: rt.ctx.exec, cwd: rt.ctx.cwd, env: rt.ctx.env, ...(base ? { base } : {}) });
+  if (lc.omitted.length) {
+    const shown = lc.omitted.slice(0, 10).join(", ");
+    rt.warn(
+      `${lc.omitted.length} changed file${lc.omitted.length === 1 ? "" : "s"} left out of the review because the diff exceeds the size cap: ${shown}${lc.omitted.length > 10 ? ", …" : ""}. The change is treated as tier 3 with no auto-pass.`,
+    );
+  }
+  return lc;
 }
 
-async function localPolicy(lc: LocalChange, path: string | undefined): Promise<LoadedPolicy> {
-  return path ? readPolicyFile(path) : readPolicyOrDefault(join(lc.root, POLICY_FILE));
+async function localPolicy(rt: Runtime, lc: LocalChange, path: string | undefined): Promise<LoadedPolicy> {
+  return path ? readPolicyFile(resolve(rt.ctx.cwd, path)) : readPolicyOrDefault(join(lc.root, POLICY_FILE));
 }
 
 export async function runCommand(rt: Runtime, opts: RunOptions): Promise<number> {
   if (opts.local) {
-    if (opts.repo || opts.pr) throw new CliError("USAGE", "--local cannot be combined with --repo/--pr");
+    const bad = PR_ONLY_FLAGS.filter(([k]) => opts[k] !== undefined && opts[k] !== false).map(([, f]) => f);
+    if (bad.length) throw new CliError("USAGE", `--local cannot be combined with ${bad.join(", ")} (PR-only flags)`);
     const lc = await localInput(rt, opts.base);
-    if (lc.change.files.length === 0) {
+    if (lc.change.stats.files === 0) {
       if (rt.json) rt.printJson({ outcome: "pass", exitCode: 0, headline: "No changes against the base" });
       else rt.out(`No changes against ${lc.change.baseRef}; nothing to review.`);
       return EXIT.pass;
     }
-    const policy = await localPolicy(lc, opts.policy);
+    const policy = await localPolicy(rt, lc, opts.policy);
     rt.logger.info(`policy: ${policy.source} (${policy.hash})`);
     if (!rt.json) {
       rt.err(
         `Reviewing ${lc.change.stats.files} files (+${lc.change.stats.additions}/-${lc.change.stats.deletions}) against ${lc.change.baseRef}${lc.dirty ? " including uncommitted changes" : ""} …`,
       );
     }
-    const gate = await makeGate(rt, { mode: "local", root: lc.root }, policy, opts);
+    const gate = await makeGate(rt, { mode: "local", root: lc.root }, policy, { ...opts, validate: true });
     const input: LocalReviewInput = { change: lc.change, diff: lc.diff, untrusted: lc.untrusted };
-    return printResult(rt, await gate.reviewChange(input), rt.json);
+    const r = await interruptible(rt, gate, gate.reviewChange(input));
+    if (r === "interrupted") return EXIT_INTERRUPTED;
+    return printResult(rt, r, rt.json);
   }
   const c = await prContext(rt, opts);
   const target = prTarget(rt, c, opts);
-  const gate = await makeGate(rt, target, c.policy, opts);
-  const result = await gate.review(c.ref, { headSha: c.headSha });
+  const gate = await makeGate(rt, target, c.policy, { ...opts, validate: true });
+  const result = await interruptible(rt, gate, gate.review(c.ref, { headSha: c.headSha }));
+  if (result === "interrupted") return EXIT_INTERRUPTED;
   if (target.report === "json") return printResult(rt, result, true);
   return printResult(rt, result, rt.json);
 }
@@ -280,13 +344,13 @@ export async function estimateCommand(rt: Runtime, opts: RunOptions): Promise<nu
   let policy: LoadedPolicy;
   if (opts.local) {
     const lc = await localInput(rt, opts.base);
-    policy = await localPolicy(lc, opts.policy);
+    policy = await localPolicy(rt, lc, opts.policy);
     gate = await makeGate(rt, { mode: "local", root: lc.root }, policy);
     est = await gate.estimate({ change: lc.change, diff: lc.diff, untrusted: lc.untrusted });
   } else {
     const c = await prContext(rt, opts);
     policy = c.policy;
-    gate = await makeGate(rt, { ...prTarget(rt, c, { ...opts, store: opts.store ?? "fs" }), dryRun: true }, policy);
+    gate = await makeGate(rt, { ...prTarget(rt, c, opts), dryRun: true }, policy);
     est = await gate.estimate(c.ref);
   }
   if (rt.json) rt.printJson({ ...est, policy: { source: policy.source, hash: policy.hash } });
@@ -296,10 +360,13 @@ export async function estimateCommand(rt: Runtime, opts: RunOptions): Promise<nu
 
 export async function explainCommand(rt: Runtime, opts: RunOptions): Promise<number> {
   const c = await prContext(rt, opts);
-  const gate = await makeGate(rt, prTarget(rt, c, opts), c.policy);
+  const target = prTarget(rt, c, opts);
+  const gate = await makeGate(rt, target, c.policy, { models: false });
   const found = await gate.explain(c.ref);
   if (!found) {
-    const msg = `No verdict recorded for ${c.ref.repo.owner}/${c.ref.repo.name}#${c.ref.number} in the ${opts.store ?? "fs"} store.`;
+    const hint =
+      target.store === "checkrun" ? "" : " (verdicts from the Action live in check runs: try --store checkrun)";
+    const msg = `No verdict recorded for ${c.ref.repo.owner}/${c.ref.repo.name}#${c.ref.number} in the ${target.store} store${hint}.`;
     if (rt.json) rt.printJson({ found: false, message: msg });
     else rt.out(msg);
     return EXIT.pending;
@@ -314,32 +381,77 @@ export interface VerdictOptions extends RunOptions {
   decision?: string;
   reason?: string;
   as?: string;
+  allowStaleSha?: boolean;
 }
 
-/** `--as`, else the login of the `gh` CLI user, else GITHUB_ACTOR. */
-export async function resolveSigner(rt: Runtime, as: string | undefined): Promise<Principal> {
-  if (as?.trim()) return { kind: "human", login: as.trim() };
-  const r = await rt.ctx.exec("gh", ["api", "user", "--jq", ".login"], { timeoutMs: 15_000 });
-  const login = r.code === 0 ? r.stdout.trim() : "";
-  if (login && /^[A-Za-z0-9-]+(\[bot\])?$/.test(login)) return { kind: "human", login };
-  const actor = rt.ctx.env.GITHUB_ACTOR?.trim();
-  if (actor) return { kind: "human", login: actor };
-  throw new CliError(
-    "SIGNER_UNKNOWN",
-    "cannot tell who is signing: pass --as <login>, log in with `gh`, or set GITHUB_ACTOR",
-  );
+const sameLogin = (a: string | undefined, b: string | undefined) =>
+  a !== undefined && b !== undefined && a.toLowerCase() === b.toLowerCase();
+
+/**
+ * Who signs a human verdict. With a token that has a user (`GET /user`), that login is the signer and `--as` must
+ * match it. Without one (App/Actions tokens), `--as` or GITHUB_ACTOR is accepted with a warning that the signer is
+ * self-declared. The PR author can never sign their own PR.
+ */
+export async function resolveSigner(
+  rt: Runtime,
+  gh: GithubApi,
+  as: string | undefined,
+  author: string | undefined,
+): Promise<Principal> {
+  const claimed = as?.trim() || undefined;
+  const tokenUser = gh.currentUser ? await gh.currentUser() : undefined;
+  let login: string;
+  if (tokenUser) {
+    if (claimed && !sameLogin(claimed, tokenUser)) {
+      throw new CliError(
+        "SIGNER_MISMATCH",
+        `--as ${claimed} does not match the GitHub token's user (${tokenUser}); sign with your own token`,
+      );
+    }
+    login = tokenUser;
+  } else {
+    const declared = claimed ?? rt.ctx.env.GITHUB_ACTOR?.trim();
+    if (!declared) {
+      throw new CliError(
+        "SIGNER_UNKNOWN",
+        "cannot tell who is signing: the token has no user; pass --as <login> or set GITHUB_ACTOR",
+      );
+    }
+    rt.warn(`the token has no user, so the signer "${declared}" is self-declared and not verified by GitHub`);
+    login = declared;
+  }
+  if (sameLogin(login, author)) {
+    throw new CliError("SIGNER_IS_AUTHOR", `${login} is the author of this pull request and cannot sign its verdict`);
+  }
+  return { kind: "human", login };
 }
 
 export async function verdictCommand(rt: Runtime, opts: VerdictOptions): Promise<number> {
+  // All flag checks first, before any network call.
+  parseRepoFlag(opts.repo);
+  parsePrNumber(opts.pr);
+  const sha = opts.sha?.trim().toLowerCase();
+  if (!sha || !/^([0-9a-f]{40}|[0-9a-f]{64})$/.test(sha)) {
+    throw new CliError("USAGE", "--sha must be the full 40- (or 64-) character commit SHA the decision applies to");
+  }
   const decision = opts.decision;
   if (decision !== "pass" && decision !== "block") throw new CliError("USAGE", "--decision must be pass or block");
-  const sha = opts.sha?.trim();
-  if (!sha || !/^[0-9a-f]{7,40}$/i.test(sha)) throw new CliError("USAGE", "--sha <commit sha> is required");
   const reason = opts.reason?.trim();
   if (!reason) throw new CliError("USAGE", "--reason <text> is required: say what you checked");
-  const signedBy = await resolveSigner(rt, opts.as);
+
   const c = await prContext(rt, { ...opts, head: sha });
-  const gate = await makeGate(rt, prTarget(rt, c, opts), c.policy);
+  if (c.currentHead.toLowerCase() !== sha) {
+    const msg = `--sha ${sha.slice(0, 12)} is not the PR's current head (${c.currentHead.slice(0, 12)})`;
+    if (!opts.allowStaleSha) {
+      throw new CliError(
+        "SHA_NOT_HEAD",
+        `${msg}; review the current head, or pass --allow-stale-sha to sign it anyway`,
+      );
+    }
+    rt.warn(`${msg}; recording it anyway (--allow-stale-sha). It will not satisfy the check for the current head.`);
+  }
+  const signedBy = await resolveSigner(rt, c.gh, opts.as, c.author);
+  const gate = await makeGate(rt, prTarget(rt, c, opts), c.policy, { models: false });
   const v = await gate.recordHumanVerdict({ ref: c.ref, headSha: sha, decision, signedBy, reason });
   if (rt.json) rt.printJson({ verdict: v });
   else {

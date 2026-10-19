@@ -101,6 +101,14 @@ async function chooseKey(rt: Runtime, provider: ConnectProvider, opts: ConnectOp
   );
 }
 
+const NETWORK_ERROR =
+  /ENOTFOUND|ECONNREFUSED|ECONNRESET|EAI_AGAIN|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|timed? ?out|timeout|network|fetch failed|unreachable|socket hang up|getaddrinfo/i;
+
+/** True when a validation message describes a connectivity problem rather than a rejected credential. */
+export function looksLikeNetworkError(message: string): boolean {
+  return NETWORK_ERROR.test(message);
+}
+
 function groupModels(models: ModelInfo[]): string[] {
   const lines: string[] = [];
   for (const tier of ["frontier", "mid", "small"] as const) {
@@ -128,9 +136,11 @@ export function renderTierCosts(costs: TierCost[], policy: LoadedPolicy, lines =
     b.spendLimitUsd !== null ? `, ${formatUsd(b.spendLimitUsd)} all-time` : "",
     ` (${policy.source === "defaults" ? "policy defaults" : policy.source}).`,
   ].join("");
+  const notes = [...new Set(costs.map((c) => c.note).filter((n): n is string => Boolean(n)))];
   return [
-    `Estimated cost per review of a typical ${lines}-line PR (same heuristic the budget ceilings use):`,
+    `Estimated cost per review of a typical ${lines}-line PR, for the models seating would pick (${policy.source === "defaults" ? "default policy" : policy.source}), priced from the registry:`,
     table(["tier", "seats", "hunters", "judges", "est. per PR"], rows),
+    ...notes.map((n) => `Note: ${n}.`),
     ceiling,
   ].join("\n");
 }
@@ -181,10 +191,11 @@ export async function connectCommand(rt: Runtime, providerArg: string, opts: Con
     if (!rt.json) rt.err(`Validating ${id} …`);
     const v = await providerImpl.validate(conn);
     if (!v.ok) {
-      throw new CliError(
-        "VALIDATION_FAILED",
-        `${id}: ${v.message ?? "validation failed"}. Nothing was saved; fix the key or pass --no-validate`,
-      );
+      const msg = v.message ?? "validation failed";
+      const fix = looksLikeNetworkError(msg)
+        ? "the endpoint is unreachable: check the base URL and your network"
+        : "fix the key";
+      throw new CliError("VALIDATION_FAILED", `${id}: ${msg}. Nothing was saved; ${fix}, or pass --no-validate`);
     }
     conn.lastValidatedAt = rt.ctx.now().toISOString();
     models = v.models ?? [];
@@ -195,7 +206,8 @@ export async function connectCommand(rt: Runtime, providerArg: string, opts: Con
         rt.warn(`could not list models for ${id}: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
-  } else {
+  } else if (!conn.defaultModel) {
+    // Not validated: the registry's view of this provider stands in for the catalog (an illustration).
     models = modelsFor(conn.provider);
   }
   if (opts.model && models.length > 0 && !models.some((m) => m.name.toLowerCase() === opts.model?.toLowerCase())) {
@@ -208,7 +220,13 @@ export async function connectCommand(rt: Runtime, providerArg: string, opts: Con
   } catch (_err: unknown) {
     policy = defaultLoadedPolicy();
   }
-  const costs = tierCosts(models, policy.policy);
+  const costs = tierCosts(models, policy.policy, TYPICAL_PR_LINES, conn);
+  const priced = costs[0]?.hunterModel?.name;
+  if (opts.model && priced && priced.toLowerCase() !== opts.model.toLowerCase()) {
+    for (const c of costs) {
+      c.note = `seating picks automatically from the models ${id} lists, so --model ${opts.model} is only used when that list is empty; to force it, set models.hunters / models.judges in .merge-safely.yml`;
+    }
+  }
 
   const masterKey = rt.ctx.env[MASTER_KEY_ENV]?.trim() || undefined;
   if (masterKey) rt.secrets.add(masterKey);
@@ -217,8 +235,8 @@ export async function connectCommand(rt: Runtime, providerArg: string, opts: Con
   });
   const { file } = await readRawConnections(rt.paths.connections);
   const replaced = upsertEntry(file, entry);
-  await writeRawConnections(rt.paths.connections, file);
-  for (const w of warnings) rt.warn(w);
+  const dirWarnings = await writeRawConnections(rt.paths.connections, file, { home: rt.paths.home });
+  for (const w of [...warnings, ...dirWarnings]) rt.warn(w);
 
   const storage = key.apiKeyEnv
     ? `reference to $${key.apiKeyEnv}`

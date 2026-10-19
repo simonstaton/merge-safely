@@ -14,8 +14,8 @@ import type { Exec } from "./exec.js";
 /** Pinned on every call so repository config cannot run code (fsmonitor, external diff, pager). */
 const GIT_SAFE = ["-c", "core.fsmonitor=false", "-c", "core.quotePath=false", "-c", "diff.external=", "--no-pager"];
 const DIFF_FLAGS = ["--no-ext-diff", "--no-textconv", "--no-color", "-M"];
-const MAX_UNTRACKED = 200;
-const MAX_UNTRACKED_BYTES = 1024 * 1024;
+/** Cap on the diff sent to reviewers. Files beyond it are listed in `omitted` and force tier 3. */
+export const MAX_DIFF_BYTES = 2 * 1024 * 1024;
 
 export interface LocalChange {
   change: Change;
@@ -23,6 +23,8 @@ export interface LocalChange {
   untrusted: UntrustedText;
   root: string;
   dirty: boolean;
+  /** Changed files left out of the diff and file list because the diff hit the size cap. */
+  omitted: string[];
 }
 
 export interface LocalChangeOptions {
@@ -30,6 +32,10 @@ export interface LocalChangeOptions {
   cwd: string;
   /** Base ref; default from `defaultBaseRef`. */
   base?: string;
+  /** Environment for the author fallback (USER). */
+  env?: NodeJS.ProcessEnv;
+  /** Diff size cap in bytes; default MAX_DIFF_BYTES. */
+  maxDiffBytes?: number;
 }
 
 async function git(exec: Exec, cwd: string, args: string[], okCodes: number[] = [0]): Promise<string> {
@@ -152,36 +158,50 @@ export async function buildLocalChange(opts: LocalChangeOptions): Promise<LocalC
 
   const untrackedList = (await git(exec, root, ["ls-files", "--others", "--exclude-standard", "-z"]))
     .split("\0")
-    .filter((p) => p !== "")
-    .slice(0, MAX_UNTRACKED);
-  let untrackedDiff = "";
-  for (const p of untrackedList) {
-    // Exit code 1 means "differences found", which is the point.
-    const d = await git(exec, root, ["diff", ...DIFF_FLAGS, "--no-index", "--", "/dev/null", p], [0, 1]);
-    if (untrackedDiff.length + d.length > MAX_UNTRACKED_BYTES) break;
-    untrackedDiff += d;
-  }
-  const diff = tracked + untrackedDiff;
-  const patches = splitPatches(diff);
+    .filter((p) => p !== "");
+  const patches = splitPatches(tracked);
 
-  const files: ChangedFile[] = nameStatus.map((ns) => {
+  interface Candidate {
+    file: ChangedFile;
+    patch: string;
+  }
+  const candidates: Candidate[] = nameStatus.map((ns) => {
     const counts = numstat.get(ns.path) ?? { additions: 0, deletions: 0 };
-    const patch = patches.get(ns.path);
     return {
-      path: ns.path,
-      status: ns.status,
-      additions: counts.additions,
-      deletions: counts.deletions,
-      ...(ns.previousPath ? { previousPath: ns.previousPath } : {}),
-      ...(patch ? { patch } : {}),
+      file: {
+        path: ns.path,
+        status: ns.status,
+        additions: counts.additions,
+        deletions: counts.deletions,
+        ...(ns.previousPath ? { previousPath: ns.previousPath } : {}),
+      },
+      patch: patches.get(ns.path) ?? "",
     };
   });
   for (const p of untrackedList) {
-    const patch = patches.get(p);
-    if (!patch || files.some((f) => f.path === p)) continue;
+    if (candidates.some((c) => c.file.path === p)) continue;
+    // Exit code 1 means "differences found", which is the point.
+    const patch = await git(exec, root, ["diff", ...DIFF_FLAGS, "--no-index", "--", "/dev/null", p], [0, 1]);
     const additions = patch.split("\n").filter((l) => l.startsWith("+") && !l.startsWith("+++")).length;
-    files.push({ path: p, status: "added", additions, deletions: 0, patch });
+    candidates.push({ file: { path: p, status: "added", additions, deletions: 0 }, patch });
   }
+
+  // Every changed file is counted; files whose patch would push the diff past the cap are left out of the file list
+  // and the diff (never silently: `omitted` lists them, and stats.files > files.length makes the core fail closed to
+  // tier 3 with no triage auto-pass).
+  const maxBytes = opts.maxDiffBytes ?? MAX_DIFF_BYTES;
+  const files: ChangedFile[] = [];
+  const omitted: string[] = [];
+  let diff = "";
+  for (const c of candidates) {
+    if (diff.length + c.patch.length > maxBytes) {
+      omitted.push(c.file.path);
+      continue;
+    }
+    diff += c.patch;
+    files.push(c.patch ? { ...c.file, patch: c.patch } : c.file);
+  }
+  const allFiles = candidates.map((c) => c.file);
 
   const status = await git(exec, root, ["status", "--porcelain", "--untracked-files=normal"]);
   const dirty = status.trim() !== "";
@@ -193,8 +213,8 @@ export async function buildLocalChange(opts: LocalChangeOptions): Promise<LocalC
   const repo = (remote && repoFromRemote(remote)) || { host: "local", owner: "local", name: basename(root) };
 
   const [subject = "", ...rest] = lastMessage.split("\n");
-  const additions = files.reduce((s, f) => s + f.additions, 0);
-  const deletions = files.reduce((s, f) => s + f.deletions, 0);
+  const additions = allFiles.reduce((s, f) => s + f.additions, 0);
+  const deletions = allFiles.reduce((s, f) => s + f.deletions, 0);
   const change: Change = {
     repo,
     number: 0,
@@ -206,11 +226,11 @@ export async function buildLocalChange(opts: LocalChangeOptions): Promise<LocalC
     body: rest.join("\n").trim(),
     author: {
       kind: "human",
-      login: userName || process.env.USER || "local",
+      login: userName || opts.env?.USER || opts.env?.USERNAME || "local",
       ...(userEmail ? { id: userEmail } : {}),
     },
     files,
-    stats: { additions, deletions, files: files.length },
+    stats: { additions, deletions, files: allFiles.length },
     labels: [],
     draft: false,
     ciStatus: "unknown",
@@ -220,5 +240,5 @@ export async function buildLocalChange(opts: LocalChangeOptions): Promise<LocalC
     body: change.body,
     commitMessages: lastMessage ? [lastMessage] : [],
   };
-  return { change, diff, untrusted, root, dirty };
+  return { change, diff, untrusted, root, dirty, omitted };
 }

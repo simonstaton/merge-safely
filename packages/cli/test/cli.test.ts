@@ -130,7 +130,11 @@ describe("run --repo --pr", () => {
     h.gate.error = err;
     const r = await h.run("run", "--repo", "acme/app", "--pr", "7");
     expect(r.code).toBe(2);
-    expect(r.stderr.trim().split("\n")).toHaveLength(1);
+    const errors = r.stderr
+      .trim()
+      .split("\n")
+      .filter((l) => l.startsWith("error"));
+    expect(errors).toHaveLength(1);
     expect(r.stderr).toContain("error [SEATING_FAILED]");
     expect(r.stderr).not.toContain("sk-ant-test-key-123456789");
     expect(r.stderr).not.toContain(TOKEN);
@@ -179,49 +183,93 @@ describe("explain", () => {
 });
 
 describe("verdict", () => {
-  const ghUser: Exec = async (cmd, args) =>
-    cmd === "gh" && args[0] === "api"
-      ? { code: 0, stdout: "octocat\n", stderr: "" }
-      : { code: 1, stdout: "", stderr: "" };
+  const HEAD = "b".repeat(40);
+  const base = (sha = HEAD) => [
+    "verdict",
+    "--repo",
+    "acme/app",
+    "--pr",
+    "7",
+    "--sha",
+    sha,
+    "--decision",
+    "pass",
+    "--reason",
+    "checked the backfill by hand",
+  ];
 
-  it("records a human verdict signed by the gh user", async () => {
-    const h = harness({ env: { GITHUB_TOKEN: TOKEN, ANTHROPIC_API_KEY: "sk-ant-test-key-123456789" }, exec: ghUser });
-    await h.run("connect", "anthropic", "--api-key-env", "ANTHROPIC_API_KEY");
-    const sha = "d".repeat(40);
-    const r = await h.run(
-      "verdict",
-      "--repo",
-      "acme/app",
-      "--pr",
-      "7",
-      "--sha",
-      sha,
-      "--decision",
-      "pass",
-      "--reason",
-      "checked the backfill by hand",
-    );
+  it("records a human verdict signed by the token's own user, with the full head SHA", async () => {
+    const h = await connected();
+    const r = await h.run(...base());
     expect(r.code).toBe(0);
     expect(r.stdout).toContain("Recorded human PASS");
     expect(h.gate.calls[0]).toMatchObject({
       method: "recordHumanVerdict",
-      arg: { headSha: sha, decision: "pass", signedBy: { login: "octocat" }, reason: "checked the backfill by hand" },
+      arg: { headSha: HEAD, decision: "pass", signedBy: { login: "reviewer" }, reason: "checked the backfill by hand" },
     });
+    // explain/verdict need no model catalog.
+    expect(h.gate.setups[0]?.catalog).toBe(false);
   });
 
-  it("prefers --as, falls back to GITHUB_ACTOR, and validates its flags", async () => {
-    const h = await connected({ GITHUB_ACTOR: "ci-bot" });
-    const base = ["verdict", "--repo", "acme/app", "--pr", "7", "--sha", "abcdef1", "--reason", "ok"];
-    let r = await h.run(...base, "--decision", "block");
-    expect(r.code).toBe(0);
-    expect(h.gate.calls.at(-1)?.arg).toMatchObject({ signedBy: { login: "ci-bot" }, decision: "block" });
-    r = await h.run(...base, "--decision", "block", "--as", "alice");
-    expect(h.gate.calls.at(-1)?.arg).toMatchObject({ signedBy: { login: "alice" } });
-    r = await h.run(...base, "--decision", "maybe");
+  it("rejects a short SHA and a SHA that is not the PR head (unless --allow-stale-sha)", async () => {
+    const h = await connected();
+    let r = await h.run(...base("bbbbbbb"));
     expect(r.code).toBe(2);
-    expect(r.stderr).toContain("error [USAGE]");
-    r = await h.run("verdict", "--repo", "acme/app", "--pr", "7", "--sha", "abcdef1", "--decision", "pass");
+    expect(r.stderr).toContain("error [USAGE]: --sha must be the full");
+    r = await h.run(...base("e".repeat(40)));
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain("error [SHA_NOT_HEAD]");
+    expect(h.gate.calls).toHaveLength(0);
+    r = await h.run(...base("e".repeat(40)), "--allow-stale-sha");
+    expect(r.code).toBe(0);
+    expect(r.stderr).toContain("--allow-stale-sha");
+    expect(h.gate.calls[0]?.arg).toMatchObject({ headSha: "e".repeat(40) });
+  });
+
+  it("only accepts --as when it matches the token user, and refuses the PR author", async () => {
+    const h = await connected();
+    let r = await h.run(...base(), "--as", "someone-else");
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain("error [SIGNER_MISMATCH]");
+    r = await h.run(...base(), "--as", "Reviewer");
+    expect(r.code).toBe(0);
+    h.github.user = "pr-author";
+    r = await h.run(...base());
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain("error [SIGNER_IS_AUTHOR]");
+  });
+
+  it("falls back to a self-declared --as or GITHUB_ACTOR when the token has no user, with a warning", async () => {
+    const h = await connected({ GITHUB_ACTOR: "ci-bot" });
+    h.github.user = undefined;
+    let r = await h.run(...base());
+    expect(r.code).toBe(0);
+    expect(r.stderr).toContain("self-declared");
+    expect(h.gate.calls.at(-1)?.arg).toMatchObject({ signedBy: { login: "ci-bot" } });
+    r = await h.run(...base(), "--as", "alice");
+    expect(h.gate.calls.at(-1)?.arg).toMatchObject({ signedBy: { login: "alice" } });
+    r = await h.run(...base(), "--as", "pr-author");
+    expect(r.stderr).toContain("SIGNER_IS_AUTHOR");
+  });
+
+  it("checks its flags before any network call", async () => {
+    const h = await connected();
+    let r = await h.run("verdict", "--decision", "pass", "--sha", HEAD, "--reason", "x");
+    expect(r.stderr).toContain("--repo <owner/name> is required");
+    r = await h.run("verdict", "--repo", "acme/app", "--pr", "7", "--sha", HEAD, "--decision", "maybe");
+    expect(r.stderr).toContain("--decision must be pass or block");
+    r = await h.run("verdict", "--repo", "acme/app", "--pr", "7", "--sha", HEAD, "--decision", "pass");
     expect(r.stderr).toContain("--reason");
+  });
+
+  it("works with no usable model connection (explain too)", async () => {
+    const h = harness({ env: { GITHUB_TOKEN: TOKEN } });
+    let r = await h.run(...base());
+    expect(r.code).toBe(0);
+    r = await h.run("explain", "--repo", "acme/app", "--pr", "7");
+    expect(r.code).toBe(2);
+    expect(r.stdout).toContain("No verdict recorded");
+    expect(r.stdout).toContain("--store checkrun");
   });
 });
 

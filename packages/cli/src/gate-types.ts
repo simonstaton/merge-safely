@@ -87,6 +87,11 @@ export interface CliGate {
   /** Latest verdict for a change with its digest, or null when there is none. */
   explain(ref: ChangeRef): Promise<{ verdict: Verdict; digest: HumanDigest } | null>;
   recordHumanVerdict(input: HumanVerdictInput): Promise<Verdict>;
+  /**
+   * Cancel an in-flight review (SIGINT/SIGTERM): report an `error` event for a change that was reported pending but
+   * not finished, so a check run is not left in progress, and dispose every acquired workspace. Optional for fakes.
+   */
+  abort?(reason: string): Promise<void>;
 }
 
 export type StoreKind = "fs" | "sqlite" | "checkrun" | "memory";
@@ -117,6 +122,12 @@ export interface GateSetup {
   slackWebhook?: string;
   /** Seats run in parallel (GateDeps.concurrency). Unset: the CLI default (2). */
   concurrency?: number;
+  /** Build the provider catalog (calls each provider's models endpoint). Default true; explain/verdict pass false. */
+  catalog?: boolean;
+  /** Validate connections before seating and fail fast on a dead one (`run`). Default false. */
+  validateConnections?: boolean;
+  /** Per-connection validation timeout. Default 15 s. */
+  validateTimeoutMs?: number;
   logger: Logger;
 }
 

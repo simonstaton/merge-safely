@@ -96,8 +96,8 @@ export function buildProgram(ctx: CliContext, done: (code: number) => void): Com
     .option("--local", "review the working tree against --base (no store, nothing posted)")
     .option("--base <ref>", "base ref for --local (default: origin/HEAD, else main)")
     .option("--report <kind>", "github | status | stdout | json (default github with an App token, else status)")
-    .option("--store <kind>", "fs | sqlite | checkrun (default fs)")
-    .option("--head <sha>", "pin the head SHA to review")
+    .option("--store <kind>", "fs | sqlite | checkrun (default checkrun with an App/Actions token, else fs)")
+    .option("--head <sha>", "review this head SHA; refuses (head-moved) if the PR head has moved since")
     .option("--slack-webhook <url>", "escalate to this Slack webhook (or $MERGE_SAFELY_SLACK_WEBHOOK)")
     .option("--dry-run", "run the review but write nothing to GitHub or the store")
     .option("--concurrency <n>", "seats run in parallel (default 2)")
@@ -109,16 +109,17 @@ export function buildProgram(ctx: CliContext, done: (code: number) => void): Com
     .action(wrap<RunOptions>((rt, opts) => estimateCommand(rt, opts)));
 
   prOptions(program.command("explain").description("print the digest of the latest verdict for a PR"))
-    .option("--store <kind>", "fs | sqlite | checkrun (default fs)")
+    .option("--store <kind>", "fs | sqlite | checkrun (default checkrun with an App/Actions token, else fs)")
     .action(wrap<RunOptions>((rt, opts) => explainCommand(rt, opts)));
 
   prOptions(program.command("verdict").description("record a SHA-bound human verdict"))
     .option("--sha <sha>", "head SHA the decision applies to")
     .option("--decision <decision>", "pass | block")
     .option("--reason <text>", "what you checked")
-    .option("--as <login>", "who is signing (default: the gh user, else $GITHUB_ACTOR)")
+    .option("--as <login>", "who is signing; must match the token's user when it has one")
+    .option("--allow-stale-sha", "sign a SHA that is not the PR's current head (warns)")
     .option("--report <kind>", "github | status | stdout | json")
-    .option("--store <kind>", "fs | sqlite | checkrun (default fs)")
+    .option("--store <kind>", "fs | sqlite | checkrun (default checkrun with an App/Actions token, else fs)")
     .action(wrap<VerdictOptions>((rt, opts) => verdictCommand(rt, opts)));
 
   const policy = program.command("policy").description("policy tools");
