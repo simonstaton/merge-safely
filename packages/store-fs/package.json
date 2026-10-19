@@ -23,5 +23,8 @@
   },
   "dependencies": {
     "@merge-safely/core": "0.1.0"
+  },
+  "devDependencies": {
+    "@merge-safely/store-memory": "0.1.0"
   }
 }
