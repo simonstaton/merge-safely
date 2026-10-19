@@ -24,7 +24,6 @@
   "dependencies": {
     "@merge-safely/core": "0.1.0",
     "@octokit/rest": "^21.0.0",
-    "@octokit/auth-app": "^7.1.0",
-    "@octokit/webhooks": "^13.3.0"
+    "@octokit/auth-app": "^7.1.0"
   }
 }
