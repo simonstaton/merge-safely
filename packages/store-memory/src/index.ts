@@ -1,6 +1,7 @@
 // @merge-safely/store-memory — In-memory VerdictStore and CostLedger
 
 export {
+  type ContractApi,
   type CostLedgerFactory,
   costLedgerContract,
   type VerdictStoreFactory,

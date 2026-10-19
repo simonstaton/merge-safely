@@ -1,7 +1,7 @@
 import type Database from "better-sqlite3";
 
 /** Bump when adding a migration below. Stored in PRAGMA user_version. */
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 const V1 = `
 CREATE TABLE IF NOT EXISTS verdicts (
@@ -67,7 +67,13 @@ CREATE TABLE IF NOT EXISTS ledger_resets (
 );
 `;
 
-const MIGRATIONS: ReadonlyArray<{ to: number; sql: string }> = [{ to: 1, sql: V1 }];
+/** v2: index for rolling-window scans and compaction, which filter on `at` alone. */
+const V2 = "CREATE INDEX IF NOT EXISTS cost_entries_at ON cost_entries (at);";
+
+const MIGRATIONS: ReadonlyArray<{ to: number; sql: string }> = [
+  { to: 1, sql: V1 },
+  { to: 2, sql: V2 },
+];
 
 /** Apply pending migrations in one immediate transaction. Idempotent on reopen; refuses a newer schema. */
 export function migrate(db: Database.Database): void {

@@ -12,21 +12,23 @@ import {
   KeyedMutex,
   readFileOrNull,
 } from "./io.js";
+import { sameRepo } from "./key.js";
 import {
   addEntry,
+  combine,
+  entryAtMs,
   inWindow,
-  sameRepo,
-  subtractTotals,
   type Totals,
   toSummary,
   usdToMicros,
+  validateEntry,
   zeroTotals,
 } from "./money.js";
 
-/** One JSONL line: the entry as appended plus its exact integer micro-dollar amount. */
+/** One JSONL line: the entry as appended plus its integer micro-dollar amount (rounded up). */
 interface LedgerLine extends CostEntry {
   usdMicros: number;
-  /** Parsed `at`; an unparseable timestamp is recorded at append time so spend never vanishes. */
+  /** Recorded time: `at` clamped to append time when in the future or unparseable, so spend never vanishes. */
   atMs: number;
 }
 
@@ -113,8 +115,8 @@ export function fsCostLedger(dir: string, opts: FsCostLedgerOptions = {}): CostL
 
   return {
     async append(entry: CostEntry) {
-      const parsed = Date.parse(entry.at);
-      const atMs = Number.isNaN(parsed) ? now().getTime() : parsed;
+      validateEntry(entry);
+      const atMs = entryAtMs(entry.at, now().getTime());
       const line: LedgerLine = { ...entry, usdMicros: usdToMicros(entry.usd), atMs };
       const file = join(ledgerDir, ledgerFileName(entry.installationId));
       await mutex.run(file, async () => {
@@ -151,20 +153,21 @@ export function fsCostLedger(dir: string, opts: FsCostLedgerOptions = {}): CostL
     async allTime(installationId: string): Promise<SpendSummary> {
       const [raw, rollups] = await Promise.all([rawAllTime(installationId), readRollups()]);
       const base = rollups.baselines[installationId] ?? zeroTotals();
-      return toSummary(subtractTotals(raw, base));
+      return toSummary(combine(raw, base, -1));
     },
 
     async reset(installationId: string) {
       await mutex.run(rollupsFile, async () => {
         await mkdir(ledgerDir, { recursive: true });
-        const release = await acquireFileLock(`${rollupsFile}.lock`, opts.lock);
+        const lock = await acquireFileLock(`${rollupsFile}.lock`, opts.lock);
         try {
           const rollups = await readRollups();
           const raw = await rawAllTime(installationId);
           rollups.baselines[installationId] = { ...raw, at: now().toISOString() };
+          if (!(await lock.verify())) throw new Error("lost lock on ledger rollups before commit; retry");
           await atomicWrite(rollupsFile, `${JSON.stringify(rollups, null, 2)}\n`);
         } finally {
-          await release();
+          await lock.release();
         }
       });
     },

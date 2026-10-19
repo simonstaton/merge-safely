@@ -8,8 +8,8 @@ import type {
   VerdictStore,
 } from "@merge-safely/core";
 import Database from "better-sqlite3";
-import { verdictKeyString } from "./key.js";
-import { combine, type Totals, toSummary, usdToMicros, zeroTotals } from "./money.js";
+import { compareVerdicts, normaliseRepo, repoKeyString, verdictKeyString } from "./key.js";
+import { combine, entryAtMs, type Totals, toSummary, usdToMicros, validateEntry, zeroTotals } from "./money.js";
 import { migrate } from "./schema.js";
 
 export interface SqliteStoresOptions {
@@ -26,10 +26,12 @@ export interface SqliteStores {
    * Fold cost entries older than `olderThanMs` (default 30 days) into per-change rollups, delete them,
    * then truncate the WAL. Totals are unchanged by construction.
    */
-  compact(opts?: { olderThanMs?: number }): { compacted: number };
+  compact(opts?: { olderThanMs?: number; force?: boolean }): { compacted: number };
 }
 
 export const DEFAULT_COMPACT_OLDER_THAN_MS = 30 * 24 * 60 * 60 * 1000;
+/** The longest rolling window the design allows. Compacting younger rows would make window sums over-count. */
+export const MIN_COMPACT_OLDER_THAN_MS = 7 * 24 * 60 * 60 * 1000;
 
 interface TotalsRow {
   usd: number;
@@ -49,17 +51,13 @@ function rowTotals(r: TotalsRow | undefined): Totals {
   return { usdMicros: r.usd, in: r.tin, out: r.tout, cachedIn: r.tcin, cacheWrite: r.tcw, entries: r.n };
 }
 
-function repoKey(repo: RepoRef): string {
-  return `${repo.host.toLowerCase()}/${repo.owner}/${repo.name}`;
-}
-
-function isConstraintViolation(err: unknown): boolean {
+/** Only a primary-key clash means "lost the create race"; any other constraint error is a real failure. */
+function isPrimaryKeyViolation(err: unknown): boolean {
   return (
     typeof err === "object" &&
     err !== null &&
     "code" in err &&
-    typeof (err as { code: unknown }).code === "string" &&
-    (err as { code: string }).code.startsWith("SQLITE_CONSTRAINT")
+    (err as { code: unknown }).code === "SQLITE_CONSTRAINT_PRIMARYKEY"
   );
 }
 
@@ -89,8 +87,7 @@ export function sqliteStores(opts: SqliteStoresOptions): SqliteStores {
      WHERE key = ? AND version = ? RETURNING version`,
   );
   const listVerdicts = db.prepare<[string, string, string, number], { json: string }>(
-    `SELECT json FROM verdicts WHERE repo_host = ? AND repo_owner = ? AND repo_name = ? AND number = ?
-     ORDER BY created_at, rowid`,
+    "SELECT json FROM verdicts WHERE repo_host = ? AND repo_owner = ? AND repo_name = ? AND number = ?",
   );
 
   const putTx = db.transaction((v: Verdict, expect: string | null): { ok: boolean; version: string } => {
@@ -103,19 +100,11 @@ export function sqliteStores(opts: SqliteStoresOptions): SqliteStores {
     };
     if (expect === null) {
       try {
-        insVerdict.run(
-          key,
-          v.repo.host.toLowerCase(),
-          v.repo.owner,
-          v.repo.name,
-          v.number,
-          v.headSha.toLowerCase(),
-          createdAt,
-          json,
-        );
+        const r = normaliseRepo(v.repo);
+        insVerdict.run(key, r.host, r.owner, r.name, v.number, v.headSha.toLowerCase(), createdAt, json);
         return { ok: true, version: "1" };
       } catch (err: unknown) {
-        if (isConstraintViolation(err)) return { ok: false, version: current() };
+        if (isPrimaryKeyViolation(err)) return { ok: false, version: current() };
         throw err;
       }
     }
@@ -133,9 +122,12 @@ export function sqliteStores(opts: SqliteStoresOptions): SqliteStores {
       return putTx.immediate(v, expect.version);
     },
     async listForChange(repo, number) {
+      const r = normaliseRepo(repo);
+      // Sorted with the shared comparator so ordering (and unparseable createdAt) matches every other store.
       return listVerdicts
-        .all(repo.host.toLowerCase(), repo.owner, repo.name, number)
-        .map((r) => JSON.parse(r.json) as Verdict);
+        .all(r.host, r.owner, r.name, number)
+        .map((row) => JSON.parse(row.json) as Verdict)
+        .sort(compareVerdicts);
     },
   };
 
@@ -159,8 +151,9 @@ export function sqliteStores(opts: SqliteStoresOptions): SqliteStores {
   const rollForInst = db.prepare<[string], TotalsRow>(
     `SELECT ${SUM_COLS}, COALESCE(SUM(entries), 0) AS n FROM cost_rollups WHERE installation_id = ?`,
   );
-  const liveForWindow = db.prepare<[string, number, number], TotalsRow>(
-    `SELECT ${SUM_COLS}, COUNT(*) AS n FROM cost_entries WHERE installation_id = ? AND at > ? AND at <= ?`,
+  // No upper bound: entries are clamped to append time, and anything ahead of the reading clock counts as now.
+  const liveForWindow = db.prepare<[string, number], TotalsRow>(
+    `SELECT ${SUM_COLS}, COUNT(*) AS n FROM cost_entries WHERE installation_id = ? AND at > ?`,
   );
   // Rollups lose per-row timestamps. A rollup whose newest row falls inside the window is counted whole:
   // over-counting is the safe direction for a budget ceiling.
@@ -205,10 +198,11 @@ export function sqliteStores(opts: SqliteStoresOptions): SqliteStores {
 
   const ledger: CostLedger = {
     async append(entry: CostEntry) {
+      validateEntry(entry);
       insEntry.run({
-        at: entryAtMs(entry.at, now),
+        at: entryAtMs(entry.at, now().getTime()),
         installation_id: entry.installationId ?? null,
-        repo_key: repoKey(entry.repo),
+        repo_key: repoKeyString(entry.repo),
         number: entry.number,
         head_sha: entry.headSha.toLowerCase(),
         round: entry.round,
@@ -226,7 +220,7 @@ export function sqliteStores(opts: SqliteStoresOptions): SqliteStores {
       });
     },
     async forChange(repo: RepoRef, number: number): Promise<SpendSummary> {
-      const k = repoKey(repo);
+      const k = repoKeyString(repo);
       return toSummary(combine(rowTotals(liveForChange.get(k, number)), rowTotals(rollForChange.get(k, number))));
     },
     async forWindow(installationId: string, windowMs: number): Promise<SpendSummary> {
@@ -234,7 +228,7 @@ export function sqliteStores(opts: SqliteStoresOptions): SqliteStores {
       const start = nowMs - windowMs;
       return toSummary(
         combine(
-          rowTotals(liveForWindow.get(installationId, start, nowMs)),
+          rowTotals(liveForWindow.get(installationId, start)),
           rowTotals(rollForWindow.get(installationId, start)),
         ),
       );
@@ -255,6 +249,11 @@ export function sqliteStores(opts: SqliteStoresOptions): SqliteStores {
     },
     compact(copts) {
       const olderThanMs = copts?.olderThanMs ?? DEFAULT_COMPACT_OLDER_THAN_MS;
+      if (olderThanMs < MIN_COMPACT_OLDER_THAN_MS && !copts?.force) {
+        throw new Error(
+          `compact olderThanMs must be at least ${MIN_COMPACT_OLDER_THAN_MS} (7 days) so window sums stay exact; pass force: true to override`,
+        );
+      }
       const compacted = compactTx.immediate(now().getTime() - olderThanMs);
       db.pragma("wal_checkpoint(TRUNCATE)");
       return { compacted };
@@ -266,10 +265,4 @@ export function sqliteStores(opts: SqliteStoresOptions): SqliteStores {
 function normaliseIso(iso: string): string {
   const t = Date.parse(iso);
   return Number.isNaN(t) ? iso : new Date(t).toISOString();
-}
-
-/** An unparseable timestamp is recorded at append time rather than dropped: spend must never vanish from the ledger. */
-function entryAtMs(at: string, now: () => Date): number {
-  const t = Date.parse(at);
-  return Number.isNaN(t) ? now().getTime() : t;
 }

@@ -1,4 +1,6 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -10,7 +12,9 @@ import {
   verdictStoreContract,
 } from "@merge-safely/store-memory";
 import Database from "better-sqlite3";
+import * as t from "vitest";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { verdictKeyString } from "./key.js";
 import { SCHEMA_VERSION } from "./schema.js";
 import { type SqliteStores, sqliteStores } from "./sqlite.js";
 
@@ -19,7 +23,7 @@ async function tempDb(): Promise<{ path: string; cleanup: () => Promise<void> }>
   return { path: join(dir, "store.db"), cleanup: () => rm(dir, { recursive: true, force: true }) };
 }
 
-verdictStoreContract("sqlite", async () => {
+verdictStoreContract(t, "sqlite", async () => {
   const { path, cleanup } = await tempDb();
   const s = sqliteStores({ path });
   return {
@@ -31,7 +35,7 @@ verdictStoreContract("sqlite", async () => {
   };
 });
 
-verdictStoreContract("sqlite (two connections on one file)", async () => {
+verdictStoreContract(t, "sqlite (two connections on one file)", async () => {
   const { path, cleanup } = await tempDb();
   const a = sqliteStores({ path });
   const b = sqliteStores({ path });
@@ -51,7 +55,7 @@ verdictStoreContract("sqlite (two connections on one file)", async () => {
   };
 });
 
-costLedgerContract("sqlite", async (clock) => {
+costLedgerContract(t, "sqlite", async (clock) => {
   const { path, cleanup } = await tempDb();
   const s = sqliteStores({ path, now: clock.now });
   return {
@@ -63,7 +67,7 @@ costLedgerContract("sqlite", async (clock) => {
   };
 });
 
-costLedgerContract("sqlite (compacted before every read)", async (clock) => {
+costLedgerContract(t, "sqlite (compacted before every read)", async (clock) => {
   // Compacting rows older than the longest window (7 days per the design) must never change what the ledger reports.
   const { path, cleanup } = await tempDb();
   const s = sqliteStores({ path, now: clock.now });
@@ -208,7 +212,7 @@ describe("sqliteStores", () => {
     // Reset after compaction, then compact the rest: still consistent.
     await s.ledger.reset?.("inst-1");
     expect((await s.ledger.allTime("inst-1")).usd).toBe(0);
-    expect(s.compact({ olderThanMs: 0 }).compacted).toBe(1);
+    expect(s.compact({ olderThanMs: 0, force: true }).compacted).toBe(1);
     expect((await s.ledger.allTime("inst-1")).usd).toBe(0);
     expect((await s.ledger.forChange(FIXTURE_REPO, 1)).usd).toBe(1.2);
     expect((await s.ledger.forChange(FIXTURE_REPO, 1)).entries).toBe(4);
@@ -225,7 +229,7 @@ describe("sqliteStores", () => {
     const { statSync } = await import("node:fs");
     const s = make();
     for (let i = 0; i < 200; i++) await s.ledger.append(makeCostEntry({ usd: 0.01 }));
-    s.compact({ olderThanMs: 0 });
+    s.compact({ olderThanMs: 0, force: true });
     expect(statSync(`${path}-wal`).size).toBe(0);
   });
 
@@ -236,10 +240,78 @@ describe("sqliteStores", () => {
     await s.ledger.append(makeCostEntry({ usd: 1, at: "2026-01-09T00:00:00.000Z" })); // 24 h ago
     await s.ledger.append(makeCostEntry({ usd: 2, at: "2026-01-09T23:00:00.000Z" })); // 1 h ago
     expect((await s.ledger.forWindow("inst-1", 2 * hour)).usd).toBe(2);
-    s.compact({ olderThanMs: 0 });
+    s.compact({ olderThanMs: 0, force: true });
     expect((await s.ledger.forWindow("inst-1", 2 * hour)).usd).toBe(3);
     clock.advance(2 * hour);
     expect((await s.ledger.forWindow("inst-1", 2 * hour)).usd).toBe(0);
+  });
+
+  it("compact refuses thresholds under 7 days unless forced", () => {
+    const s = make();
+    expect(() => s.compact({ olderThanMs: 24 * 3_600_000 })).toThrow(/7 days/);
+    expect(s.compact({ olderThanMs: 24 * 3_600_000, force: true }).compacted).toBe(0);
+    expect(s.compact({ olderThanMs: 7 * 24 * 3_600_000 }).compacted).toBe(0);
+    expect(s.compact().compacted).toBe(0);
+  });
+
+  it("a non-primary-key constraint error is rethrown, not reported as a lost race", async () => {
+    const s = make();
+    const bad = makeVerdict({ createdAt: null as unknown as string });
+    await expect(s.verdicts.put(bad, { version: null })).rejects.toThrow(/NOT NULL/);
+  });
+
+  it("migrates a v1 database to the current schema", async () => {
+    make().close();
+    open.length = 0;
+    const raw = new Database(path);
+    raw.exec("DROP INDEX cost_entries_at");
+    raw.pragma("user_version = 1");
+    raw.close();
+    make();
+    const check = new Database(path, { readonly: true });
+    try {
+      expect(check.pragma("user_version", { simple: true })).toBe(SCHEMA_VERSION);
+      const idx = check
+        .prepare<[], { name: string }>(
+          "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'cost_entries_at'",
+        )
+        .all();
+      expect(idx).toHaveLength(1);
+    } finally {
+      check.close();
+    }
+  });
+
+  it("another process holding the write lock: put waits on busy_timeout, then sees the newer version", async () => {
+    const s = make();
+    const v = makeVerdict();
+    const base = await s.verdicts.put(v, { version: null });
+    const sqlitePath = createRequire(import.meta.url).resolve("better-sqlite3");
+    const script = `
+      const D = require(process.argv[1]);
+      const db = new D(process.argv[2]);
+      db.pragma("busy_timeout = 5000");
+      db.exec("BEGIN IMMEDIATE");
+      db.prepare("UPDATE verdicts SET version = version + 1 WHERE key = ?").run(process.argv[3]);
+      process.stdout.write("locked\\n");
+      setTimeout(() => { db.exec("COMMIT"); db.close(); process.exit(0); }, 300);
+    `;
+    const child = spawn(process.execPath, ["-e", script, sqlitePath, path, verdictKeyString(v)], {
+      stdio: ["ignore", "pipe", "inherit"],
+    });
+    const exited = new Promise<number | null>((r) => child.on("exit", r));
+    await new Promise<void>((resolve, reject) => {
+      child.stdout.on("data", (d: Buffer) => {
+        if (d.toString().includes("locked")) resolve();
+      });
+      child.on("error", reject);
+    });
+    const t0 = Date.now();
+    const res = await s.verdicts.put(makeVerdict({ round: 2 }), { version: base.version });
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(150);
+    expect(res).toEqual({ ok: false, version: "2" });
+    expect(await exited).toBe(0);
+    expect((await s.verdicts.put(makeVerdict({ round: 3 }), { version: "2" })).ok).toBe(true);
   });
 
   it("concurrent CAS across two connections: exactly one of ten wins", async () => {
@@ -260,5 +332,15 @@ describe("sqliteStores", () => {
     const v1 = await s.verdicts.put(makeVerdict(), { version: null });
     const res = await s.verdicts.put(makeVerdict({ round: 2 }), { version: "m1" });
     expect(res).toEqual({ ok: false, version: v1.version });
+  });
+});
+
+describe("shared helpers", () => {
+  it("key.ts and money.ts are byte-identical to the canonical copies in store-memory", async () => {
+    for (const f of ["key.ts", "money.ts"]) {
+      const mine = await readFile(new URL(f, import.meta.url), "utf8");
+      const canonical = await readFile(new URL(`../../store-memory/src/${f}`, import.meta.url), "utf8");
+      expect(mine, `${f} drifted from packages/store-memory/src/${f}`).toBe(canonical);
+    }
   });
 });

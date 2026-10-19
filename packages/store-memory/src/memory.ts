@@ -7,22 +7,22 @@ import type {
   VerdictKey,
   VerdictStore,
 } from "@merge-safely/core";
-import { changeKeyString, verdictKeyString } from "./key.js";
+import { changeKeyString, compareVerdicts, sameRepo, verdictKeyString } from "./key.js";
 import {
   addEntry,
+  combine,
+  entryAtMs,
   inWindow,
-  sameRepo,
-  subtractTotals,
   type Totals,
   toSummary,
   usdToMicros,
+  validateEntry,
   zeroTotals,
 } from "./money.js";
 
 interface Slot {
   verdict: Verdict;
   version: string;
-  seq: number;
 }
 
 /** In-memory VerdictStore. CAS against a process-wide monotonic version counter. Verdicts are deep-copied in and out. */
@@ -38,45 +38,32 @@ export function memoryVerdictStore(): VerdictStore {
 
     async put(v: Verdict, expect: { version: string | null }) {
       const k = verdictKeyString(v);
-      const current = slots.get(k);
-      const currentVersion = current?.version ?? null;
+      const currentVersion = slots.get(k)?.version ?? null;
       if (currentVersion !== expect.version) return { ok: false, version: currentVersion ?? "" };
       counter += 1;
       const version = `m${counter}`;
-      slots.set(k, { verdict: structuredClone(v), version, seq: counter });
+      slots.set(k, { verdict: structuredClone(v), version });
       return { ok: true, version };
     },
 
     async listForChange(repo: RepoRef, number: number) {
       const prefix = `${changeKeyString(repo, number)}@`;
-      const found: Slot[] = [];
-      for (const [k, slot] of slots) if (k.startsWith(prefix)) found.push(slot);
-      return sortByCreatedAt(found).map((s) => structuredClone(s.verdict));
+      const found: Verdict[] = [];
+      for (const [k, slot] of slots) if (k.startsWith(prefix)) found.push(structuredClone(slot.verdict));
+      return found.sort(compareVerdicts);
     },
   };
-}
-
-function sortByCreatedAt(slots: Slot[]): Slot[] {
-  return slots.sort((a, b) => {
-    const d = createdAtMs(a.verdict) - createdAtMs(b.verdict);
-    return d !== 0 ? d : a.seq - b.seq;
-  });
-}
-
-function createdAtMs(v: Verdict): number {
-  const t = Date.parse(v.createdAt);
-  return Number.isNaN(t) ? 0 : t;
 }
 
 interface Row {
   entry: CostEntry;
   usdMicros: number;
-  /** Parsed `at`; an unparseable timestamp is recorded at append time so spend never vanishes. */
+  /** Recorded time: `at` clamped to append time when in the future or unparseable. */
   atMs: number;
 }
 
 /**
- * In-memory CostLedger. usd is held as integer micro-dollars so sums are exact.
+ * In-memory CostLedger. usd is held as integer micro-dollars (rounded up) so sums are exact.
  * `reset` records the current all-time totals as a baseline; allTime reports spend above it.
  * forChange and forWindow are unaffected by reset.
  */
@@ -94,11 +81,11 @@ export function memoryCostLedger(opts?: { now?: () => Date }): CostLedger {
 
   return {
     async append(entry: CostEntry) {
-      const parsed = Date.parse(entry.at);
+      validateEntry(entry);
       rows.push({
         entry: structuredClone(entry),
         usdMicros: usdToMicros(entry.usd),
-        atMs: Number.isNaN(parsed) ? now().getTime() : parsed,
+        atMs: entryAtMs(entry.at, now().getTime()),
       });
     },
 
@@ -112,8 +99,7 @@ export function memoryCostLedger(opts?: { now?: () => Date }): CostLedger {
     },
 
     async allTime(installationId: string): Promise<SpendSummary> {
-      const base = baselines.get(installationId) ?? zeroTotals();
-      return toSummary(subtractTotals(rawAllTime(installationId), base));
+      return toSummary(combine(rawAllTime(installationId), baselines.get(installationId) ?? zeroTotals(), -1));
     },
 
     async reset(installationId: string) {

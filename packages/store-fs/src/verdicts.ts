@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { RepoRef, Verdict, VerdictKey, VerdictStore } from "@merge-safely/core";
 import {
   acquireFileLock,
+  atomicCreate,
   atomicWrite,
   encodeSegment,
   type FileLockOptions,
@@ -11,7 +12,7 @@ import {
   KeyedMutex,
   readFileOrNull,
 } from "./io.js";
-import { verdictKeyString } from "./key.js";
+import { compareVerdicts, normaliseRepo, verdictKeyString } from "./key.js";
 
 /** On-disk envelope. The nonce makes every write's bytes, and therefore its version, unique. */
 interface Envelope {
@@ -29,16 +30,11 @@ function sha256(data: string): string {
   return createHash("sha256").update(data, "utf8").digest("hex");
 }
 
+/** Path segments are lower-cased (GitHub names are case-insensitive) and percent-encoded. */
 function changeDir(root: string, repo: RepoRef, number: number): string {
   if (!Number.isSafeInteger(number) || number < 0) throw new Error("change number must be a non-negative integer");
-  return join(
-    root,
-    "verdicts",
-    encodeSegment(repo.host.toLowerCase()),
-    encodeSegment(repo.owner),
-    encodeSegment(repo.name),
-    String(number),
-  );
+  const r = normaliseRepo(repo);
+  return join(root, "verdicts", encodeSegment(r.host), encodeSegment(r.owner), encodeSegment(r.name), String(number));
 }
 
 function verdictFile(root: string, key: VerdictKey): string {
@@ -66,12 +62,13 @@ function parseEnvelope(raw: string, file: string): Envelope {
 
 /**
  * Filesystem VerdictStore: one JSON file per verdict at
- * `<dir>/verdicts/<host>/<owner>/<name>/<number>/<sha>.json`.
+ * `<dir>/verdicts/<host>/<owner>/<name>/<number>/<sha>.json` (segments lower-cased; original casing kept inside).
  *
  * - version = sha256 of the file's bytes (each write carries a fresh nonce, so versions never repeat)
- * - writes are atomic (temp file + fsync + rename)
- * - compare-and-set is serialised by an in-process mutex per key and a `<file>.lock` O_EXCL lock file
- *   (broken when older than 30 s) so separate processes sharing the directory do not interleave
+ * - creates commit with link(), which fails atomically if the file exists; replaces use temp + fsync + rename;
+ *   the directory is fsynced after either
+ * - compare-and-set is serialised by an in-process mutex per key and a `<file>.lock` lock file
+ *   (see acquireFileLock); the holder re-verifies its lock token immediately before committing
  * - a corrupt file makes `get` throw rather than return null, so it can never be silently replaced
  */
 export function fsVerdictStore(dir: string, opts: FsVerdictStoreOptions = {}): VerdictStore {
@@ -83,6 +80,11 @@ export function fsVerdictStore(dir: string, opts: FsVerdictStoreOptions = {}): V
     return { verdict: parseEnvelope(raw, file).verdict, version: sha256(raw) };
   }
 
+  const versionOf = async (file: string) => {
+    const raw = await readFileOrNull(file);
+    return raw === null ? null : sha256(raw);
+  };
+
   return {
     async get(key) {
       return readCurrent(verdictFile(dir, key));
@@ -92,10 +94,9 @@ export function fsVerdictStore(dir: string, opts: FsVerdictStoreOptions = {}): V
       const file = verdictFile(dir, v);
       return mutex.run(verdictKeyString(v), async () => {
         await mkdir(changeDir(dir, v.repo, v.number), { recursive: true });
-        const release = await acquireFileLock(`${file}.lock`, opts.lock);
+        const lock = await acquireFileLock(`${file}.lock`, opts.lock);
         try {
-          const raw = await readFileOrNull(file);
-          const currentVersion = raw === null ? null : sha256(raw);
+          const currentVersion = await versionOf(file);
           if (currentVersion !== expect.version) return { ok: false, version: currentVersion ?? "" };
           const envelope: Envelope = {
             schema: 1,
@@ -104,10 +105,15 @@ export function fsVerdictStore(dir: string, opts: FsVerdictStoreOptions = {}): V
             verdict: v,
           };
           const body = `${JSON.stringify(envelope, null, 2)}\n`;
-          await atomicWrite(file, body);
+          if (!(await lock.verify())) throw new Error(`lost lock on ${file} before commit; retry`);
+          if (expect.version === null) {
+            if (!(await atomicCreate(file, body))) return { ok: false, version: (await versionOf(file)) ?? "" };
+          } else {
+            await atomicWrite(file, body);
+          }
           return { ok: true, version: sha256(body) };
         } finally {
-          await release();
+          await lock.release();
         }
       });
     },
@@ -122,16 +128,11 @@ export function fsVerdictStore(dir: string, opts: FsVerdictStoreOptions = {}): V
         throw err;
       }
       const verdicts: Verdict[] = [];
-      for (const name of names.filter((n) => n.endsWith(".json")).sort()) {
+      for (const name of names.filter((n) => n.endsWith(".json"))) {
         const found = await readCurrent(join(cdir, name));
         if (found) verdicts.push(found.verdict);
       }
-      return verdicts.sort((a, b) => ms(a.createdAt) - ms(b.createdAt));
+      return verdicts.sort(compareVerdicts);
     },
   };
-}
-
-function ms(iso: string): number {
-  const t = Date.parse(iso);
-  return Number.isNaN(t) ? 0 : t;
 }

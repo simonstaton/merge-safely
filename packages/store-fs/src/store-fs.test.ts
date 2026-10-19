@@ -1,6 +1,6 @@
-import { mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   costLedgerContract,
   FIXTURE_REPO,
@@ -8,8 +8,9 @@ import {
   makeVerdict,
   verdictStoreContract,
 } from "@merge-safely/store-memory";
+import * as t from "vitest";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { acquireFileLock, encodeSegment } from "./io.js";
+import { acquireFileLock, atomicCreate, DEFAULT_LOCK_STALE_MS, DEFAULT_LOCK_TIMEOUT_MS, encodeSegment } from "./io.js";
 import { fsCostLedger } from "./ledger.js";
 import { fsVerdictStore } from "./verdicts.js";
 
@@ -18,12 +19,12 @@ async function tempDir(): Promise<{ dir: string; close: () => Promise<void> }> {
   return { dir, close: () => rm(dir, { recursive: true, force: true }) };
 }
 
-verdictStoreContract("fs", async () => {
+verdictStoreContract(t, "fs", async () => {
   const { dir, close } = await tempDir();
   return { store: fsVerdictStore(dir), close };
 });
 
-verdictStoreContract("fs (two instances on one dir)", async () => {
+verdictStoreContract(t, "fs (two instances on one dir)", async () => {
   // Alternating calls between two instances simulates two processes: they share no in-memory state.
   const { dir, close } = await tempDir();
   const a = fsVerdictStore(dir);
@@ -40,7 +41,7 @@ verdictStoreContract("fs (two instances on one dir)", async () => {
   };
 });
 
-costLedgerContract("fs", async (clock) => {
+costLedgerContract(t, "fs", async (clock) => {
   const { dir, close } = await tempDir();
   return { ledger: fsCostLedger(dir, { now: clock.now }), close };
 });
@@ -105,10 +106,10 @@ describe("fsVerdictStore", () => {
     const store = fsVerdictStore(dir, { lock: { timeoutMs: 100 } });
     await store.put(makeVerdict(), { version: null });
     const file = join(dir, "verdicts", "github%2Ecom", "acme", "widgets", "1", `${"a".repeat(40)}.json`);
-    const release = await acquireFileLock(`${file}.lock`);
+    const lock = await acquireFileLock(`${file}.lock`);
     const cur = await store.get(makeVerdict());
     await expect(store.put(makeVerdict({ round: 2 }), { version: cur?.version ?? null })).rejects.toThrow(/timed out/);
-    await release();
+    await lock.release();
     expect((await store.put(makeVerdict({ round: 2 }), { version: cur?.version ?? null })).ok).toBe(true);
   });
 
@@ -119,6 +120,59 @@ describe("fsVerdictStore", () => {
     await writeFile(file, "{not json");
     await expect(store.get(makeVerdict())).rejects.toThrow(/corrupt/);
     expect((await store.put(makeVerdict(), { version: null })).ok).toBe(false);
+  });
+
+  it("stale-lock stress: many instances breaking one stale lock never yield two winners", async () => {
+    const file = join(dir, "verdicts", "github%2Ecom", "acme", "widgets", "1", `${"a".repeat(40)}.json`);
+    const stores = Array.from({ length: 8 }, () => fsVerdictStore(dir, { lock: { timeoutMs: 5_000 } }));
+    const old = new Date(Date.now() - 60_000);
+    const trials = Number(process.env.STORE_FS_STRESS_TRIALS ?? 20);
+    for (let trial = 0; trial < trials; trial++) {
+      await rm(join(dir, "verdicts"), { recursive: true, force: true });
+      await mkdir(dirname(file), { recursive: true });
+      // Updates go through the lock alone, so plant a base verdict first on odd trials.
+      const base = trial % 2 ? await stores[0]?.put(makeVerdict(), { version: null }) : undefined;
+      await writeFile(`${file}.lock`, JSON.stringify({ token: "crashed" }));
+      await utimes(`${file}.lock`, old, old);
+      const results = await Promise.all(
+        stores.map((s, i) => s.put(makeVerdict({ round: i + 2 }), { version: base?.version ?? null })),
+      );
+      expect(
+        results.filter((r) => r.ok),
+        `trial ${trial}`,
+      ).toHaveLength(1);
+      const left = (await readdir(dirname(file))).filter((n) => n !== `${"a".repeat(40)}.json`);
+      expect(left, `trial ${trial}`).toEqual([]);
+    }
+  });
+
+  it("a holder whose lock was taken over refuses to commit", async () => {
+    const lockPath = join(dir, "x.lock");
+    const lock = await acquireFileLock(lockPath);
+    expect(await lock.verify()).toBe(true);
+    await writeFile(lockPath, JSON.stringify({ token: "someone-else" }));
+    expect(await lock.verify()).toBe(false);
+    await lock.release(); // not ours: must not delete it
+    expect(JSON.parse(await readFile(lockPath, "utf8")).token).toBe("someone-else");
+  });
+
+  it("creates commit atomically and fail when the file already exists", async () => {
+    const f = join(dir, "c.txt");
+    expect(await atomicCreate(f, "one")).toBe(true);
+    expect(await atomicCreate(f, "two")).toBe(false);
+    expect(await readFile(f, "utf8")).toBe("one");
+    expect(await readdir(dir)).toEqual(["c.txt"]);
+  });
+
+  it("default lock timeout outlives the stale threshold", () => {
+    expect(DEFAULT_LOCK_TIMEOUT_MS).toBeGreaterThan(DEFAULT_LOCK_STALE_MS);
+  });
+
+  it("stores under lower-cased path segments and keeps original casing inside", async () => {
+    const store = fsVerdictStore(dir);
+    await store.put(makeVerdict({ repo: { host: "GitHub.com", owner: "Acme", name: "Widgets" } }), { version: null });
+    expect(await readdir(join(dir, "verdicts", "github%2Ecom"))).toEqual(["acme"]);
+    expect((await store.get(makeVerdict()))?.verdict.repo.owner).toBe("Acme");
   });
 
   it("untrusted repo names cannot escape the store directory", async () => {
@@ -181,5 +235,15 @@ describe("fsCostLedger", () => {
     const s = await a.allTime("inst-1");
     expect(s.entries).toBe(50);
     expect(s.usd).toBe(0.5);
+  });
+});
+
+describe("shared helpers", () => {
+  it("key.ts and money.ts are byte-identical to the canonical copies in store-memory", async () => {
+    for (const f of ["key.ts", "money.ts"]) {
+      const mine = await readFile(new URL(f, import.meta.url), "utf8");
+      const canonical = await readFile(new URL(`../../store-memory/src/${f}`, import.meta.url), "utf8");
+      expect(mine, `${f} drifted from packages/store-memory/src/${f}`).toBe(canonical);
+    }
   });
 });

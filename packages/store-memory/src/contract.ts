@@ -1,29 +1,18 @@
 /**
- * Shared contract suites for VerdictStore and CostLedger. Any implementation can run them:
+ * Shared contract suites for VerdictStore and CostLedger. Any implementation can run them from a vitest file:
  *
- *   verdictStoreContract("sqlite", async () => ({ store, close }));
- *   costLedgerContract("sqlite", async (clock) => ({ ledger, close }));
+ *   import * as t from "vitest";
+ *   verdictStoreContract(t, "sqlite", async () => ({ store, close }));
+ *   costLedgerContract(t, "sqlite", async (clock) => ({ ledger, close }));
  *
- * vitest is loaded lazily so importing this package outside a test run never requires vitest to be installed.
+ * The test API is injected, so this module never imports vitest at runtime (the import below is type-only).
  */
 import type { CostLedger, VerdictStore } from "@merge-safely/core";
+import type * as Vitest from "vitest";
 import { FIXTURE_REPO, fakeClock, makeCostEntry, makeVerdict } from "./fixtures.js";
 
-type Vitest = typeof import("vitest");
-
-let vitest: Vitest | undefined;
-try {
-  vitest = await import("vitest");
-} catch (err: unknown) {
-  void err;
-  vitest = undefined;
-}
-
-function requireVitest(): Vitest {
-  if (!vitest)
-    throw new Error("@merge-safely/store-memory contract suites need vitest; run them from a vitest test file");
-  return vitest;
-}
+/** The slice of the vitest API the suites use. Pass `import * as t from "vitest"`. */
+export type ContractApi = Pick<typeof Vitest, "describe" | "it" | "expect" | "beforeEach" | "afterEach">;
 
 export type VerdictStoreFactory = () => Promise<{ store: VerdictStore; close?: () => Promise<void> }>;
 export type CostLedgerFactory = (clock: { now: () => Date }) => Promise<{
@@ -35,8 +24,8 @@ const SHA_A = "a".repeat(40);
 const SHA_B = "b".repeat(40);
 const SHA_C = "c".repeat(40);
 
-export function verdictStoreContract(name: string, factory: VerdictStoreFactory): void {
-  const { describe, it, expect, beforeEach, afterEach } = requireVitest();
+export function verdictStoreContract(api: ContractApi, name: string, factory: VerdictStoreFactory): void {
+  const { describe, it, expect, beforeEach, afterEach } = api;
 
   describe(`VerdictStore contract: ${name}`, () => {
     let store: VerdictStore;
@@ -158,14 +147,30 @@ export function verdictStoreContract(name: string, factory: VerdictStoreFactory)
       expect(await store.listForChange(FIXTURE_REPO, 99)).toEqual([]);
     });
 
-    it("keys are (host, owner, name, number, headSha) and SHAs compare case-insensitively", async () => {
+    it("keys are (host, owner, name, number, headSha), all compared case-insensitively", async () => {
       const upper = "ABCDEF0123456789".repeat(2);
-      const res = await store.put(makeVerdict({ headSha: upper }), { version: null });
+      const cased = { host: "GitHub.com", owner: "Acme", name: "Widgets" };
+      const res = await store.put(makeVerdict({ repo: cased, headSha: upper, decision: "block" }), { version: null });
       expect(res.ok).toBe(true);
+
+      // Every casing of the same identity finds the same verdict, with its original casing preserved.
       const got = await store.get({ repo: FIXTURE_REPO, number: 1, headSha: upper.toLowerCase() });
       expect(got?.version).toBe(res.version);
+      expect(got?.verdict.repo).toEqual(cased);
+      expect(got?.verdict.headSha).toBe(upper);
+      expect(
+        (await store.get({ repo: { host: "GITHUB.COM", owner: "ACME", name: "wIdGeTs" }, number: 1, headSha: upper }))
+          ?.version,
+      ).toBe(res.version);
+
+      // A pass under a different casing cannot be created next to the stored block.
       const dup = await store.put(makeVerdict({ headSha: upper.toLowerCase() }), { version: null });
       expect(dup.ok).toBe(false);
+      expect(dup.version).toBe(res.version);
+
+      const list = await store.listForChange({ host: "github.com", owner: "ACME", name: "widgets" }, 1);
+      expect(list).toHaveLength(1);
+      expect(list[0]?.decision).toBe("block");
 
       for (const key of [
         { repo: { ...FIXTURE_REPO, host: "ghe.example.com" }, number: 1, headSha: upper },
@@ -177,11 +182,28 @@ export function verdictStoreContract(name: string, factory: VerdictStoreFactory)
         expect(await store.get(key)).toBeNull();
       }
     });
+
+    it("key separators are unambiguous", async () => {
+      await store.put(makeVerdict({ repo: { host: "github.com", owner: "a/b", name: "c" } }), { version: null });
+      expect(
+        await store.get({ repo: { host: "github.com", owner: "a", name: "b/c" }, number: 1, headSha: SHA_A }),
+      ).toBeNull();
+      expect(await store.listForChange({ host: "github.com", owner: "a", name: "b/c" }, 1)).toEqual([]);
+    });
+
+    it("listForChange breaks createdAt ties by headSha and sorts unparseable createdAt first", async () => {
+      const t = "2026-01-02T00:00:00.000Z";
+      await store.put(makeVerdict({ headSha: SHA_C, createdAt: t }), { version: null });
+      await store.put(makeVerdict({ headSha: SHA_A, createdAt: t }), { version: null });
+      await store.put(makeVerdict({ headSha: SHA_B, createdAt: "not-a-date" }), { version: null });
+      const list = await store.listForChange(FIXTURE_REPO, 1);
+      expect(list.map((v) => v.headSha)).toEqual([SHA_B, SHA_A, SHA_C]);
+    });
   });
 }
 
-export function costLedgerContract(name: string, factory: CostLedgerFactory): void {
-  const { describe, it, expect, beforeEach, afterEach } = requireVitest();
+export function costLedgerContract(api: ContractApi, name: string, factory: CostLedgerFactory): void {
+  const { describe, it, expect, beforeEach, afterEach } = api;
 
   describe(`CostLedger contract: ${name}`, () => {
     let ledger: CostLedger;
@@ -247,6 +269,39 @@ export function costLedgerContract(name: string, factory: CostLedgerFactory): vo
       // The window is (now - windowMs, now]: an entry exactly at the lower edge is out.
       expect((await ledger.forWindow("inst-1", 3 * hour)).usd).toBe(1);
       expect((await ledger.forWindow("inst-1", 4 * hour)).usd).toBe(3);
+    });
+
+    it("an entry dated in the future (clock skew) counts as now in the window", async () => {
+      await ledger.append(makeCostEntry({ usd: 3, at: "2026-01-10T00:05:00.000Z" })); // 5 min ahead
+      expect((await ledger.forWindow("inst-1", 60_000)).usd).toBe(3);
+      clock.advance(10 * 60_000);
+      // Recorded at append time, so it ages out of a 1 min window like any other entry.
+      expect((await ledger.forWindow("inst-1", 60_000)).usd).toBe(0);
+      expect((await ledger.forWindow("inst-1", 3_600_000)).usd).toBe(3);
+    });
+
+    it("rejects entries that would corrupt totals", async () => {
+      const bad = [
+        makeCostEntry({ usd: -5 }),
+        makeCostEntry({ usd: Number.NaN }),
+        makeCostEntry({ usd: Number.POSITIVE_INFINITY }),
+        makeCostEntry({ tokens: { in: Number.NaN, out: 0 } }),
+        makeCostEntry({ tokens: { in: -1, out: 0 } }),
+        makeCostEntry({ tokens: { in: 1.5, out: 0 } }),
+        makeCostEntry({ tokens: { in: 1, out: 1, cachedIn: -2 } }),
+        makeCostEntry({ tokens: { in: 1, out: 1, cacheWrite: Number.NaN } }),
+      ];
+      for (const e of bad) await expect(ledger.append(e)).rejects.toThrow(/cost entry/);
+      const s = await ledger.allTime("inst-1");
+      expect(s.entries).toBe(0);
+      expect(s.usd).toBe(0);
+    });
+
+    it("rounds sub-micro-dollar amounts up, never down", async () => {
+      for (let i = 0; i < 100; i++) await ledger.append(makeCostEntry({ usd: 0.0000004 }));
+      const s = await ledger.allTime("inst-1");
+      expect(s.usd).toBe(0.0001);
+      expect(s.usd).toBeGreaterThanOrEqual(100 * 0.0000004);
     });
 
     it("an entry with an unparseable timestamp is recorded at append time, never dropped", async () => {

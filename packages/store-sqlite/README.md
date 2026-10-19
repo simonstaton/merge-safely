@@ -13,17 +13,19 @@ setInterval(() => compact({ olderThanMs: 30 * 24 * 3_600_000 }), 3_600_000).unre
 - `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`. Several processes may open the same file. Use local
   disk only: WAL does not work over network filesystems.
 - Schema is created on open and versioned with `PRAGMA user_version`. Reopening is idempotent; a database written by a
-  newer build is refused rather than misread.
-- **Verdicts**: compare-and-set is one `INSERT` (create, unique-violation means lost race) or one
+  newer build is refused rather than misread. v2 adds an index on `cost_entries(at)`.
+- **Verdicts**: keys and the `repo_*`/`head_sha` columns are lower-cased (GitHub names are case-insensitive); the JSON
+  keeps original casing. Compare-and-set is one `INSERT` (create; only a primary-key violation means lost race, any
+  other constraint error is rethrown) or one
   `UPDATE … WHERE key = ? AND version = ?` (replace), inside a `BEGIN IMMEDIATE` transaction. Versions are opaque
   strings that increase per key.
-- **Ledger**: usd is stored as integer micro-dollars (`usd_micros`) and summed in SQL, so totals are exact. `at` is
-  stored as epoch ms. Every row carries installation, change, head SHA, round, seat, lens, connection, provider and model.
-- **Compaction**: `compact({ olderThanMs })` (default 30 days) folds older rows into per-change rows in `cost_rollups`,
+- **Ledger**: usd is stored as integer micro-dollars (`usd_micros`, rounded up) and summed in SQL, so totals are exact.
+  Invalid entries are rejected on append. `at` is stored as epoch ms, clamped to append time when in the future. Every row carries installation, change, head SHA, round, seat, lens, connection, provider and model.
+- **Compaction**: `compact({ olderThanMs, force })` (default 30 days; under 7 days throws unless `force: true`) folds older rows into per-change rows in `cost_rollups`,
   deletes them, then runs `PRAGMA wal_checkpoint(TRUNCATE)`. `forChange` and `allTime` read rollups plus live rows, so
   compaction never changes them. `forWindow` counts a rollup whole when its newest folded row is inside the window. That
-  over-counts and never under-counts, which is the safe direction for a ceiling. Keep `olderThanMs` above your longest
-  window (the design caps windows at 7 days) and window sums stay exact.
+  over-counts and never under-counts, which is the safe direction for a ceiling. With the 7-day minimum (the design's
+  longest window), window sums stay exact.
 - **Reset**: `reset(id)` writes the installation's current all-time totals to `ledger_resets` as a baseline; `allTime`
   reports spend above it. History is kept, so `forChange` and `forWindow` are unaffected.
 
