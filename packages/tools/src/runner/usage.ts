@@ -1,7 +1,7 @@
 import type { TokenUsage } from "@merge-safely/core";
 
 /**
- * Token usage convention shared by every runner in this package (and by @merge-safely/registry pricing):
+ * Token usage convention shared by the API runners built on this loop (and by @merge-safely/registry pricing):
  * `in` = input tokens billed at the full input rate (i.e. EXCLUDING cached reads),
  * `cachedIn` = input tokens served from the provider's prompt cache,
  * `out` = output tokens including any reasoning/thinking tokens.

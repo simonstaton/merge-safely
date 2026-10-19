@@ -18,8 +18,10 @@ import {
   type ToolResult,
   type WorkspaceHandle,
 } from "@merge-safely/core";
+import { redactDiagnostics } from "../redact.js";
+import { SUBMIT_REVIEW_TOOL_NAME } from "../submit-review.js";
+import { errorMessage } from "./errors.js";
 import { RunGuard } from "./guard.js";
-import { errorMessage, redact } from "./redact.js";
 import {
   AbortedError,
   abortable,
@@ -37,14 +39,15 @@ import { isStrictCompatible, sanitizeSchema } from "./schema.js";
  * one run; the loop owns tools, budgets, retries, schema validation and the audit.
  */
 
-export const SUBMIT_TOOL = "submit_review";
+export const SUBMIT_TOOL = SUBMIT_REVIEW_TOOL_NAME;
 /** Invalid submissions tolerated before the run is schema-invalid (so at most MAX + 1 attempts). */
 export const MAX_INVALID_SUBMISSIONS = 2;
 
 export interface NeutralTool {
   name: string;
   description: string;
-  parameters: Record<string, unknown>;
+  /** JSON schema of the arguments, already sanitized. Convert with the `to*Tools` helpers. */
+  inputSchema: Record<string, unknown>;
   /** Request provider-side strict schema adherence (only set when the schema permits it). */
   strict: boolean;
 }
@@ -126,7 +129,7 @@ export class AgenticLoop {
   }
 
   private safe(text: string): string {
-    return redact(text, this.cfg.secrets);
+    return redactDiagnostics(text, this.cfg.secrets);
   }
 
   async run(seat: Seat, input: ReviewerInput, ws: WorkspaceHandle, signal?: AbortSignal): Promise<ReviewerRun> {
@@ -189,7 +192,7 @@ export class AgenticLoop {
       tools.push({
         name: d.name,
         description: d.description,
-        parameters: sanitizeSchema(d.inputSchema),
+        inputSchema: sanitizeSchema(d.inputSchema),
         strict: false,
       });
     }
@@ -197,7 +200,7 @@ export class AgenticLoop {
     tools.push({
       name: SUBMIT_TOOL,
       description: toolDescription(),
-      parameters: schema,
+      inputSchema: schema,
       strict: this.cfg.supportsStrict && isStrictCompatible(schema),
     });
     return tools;

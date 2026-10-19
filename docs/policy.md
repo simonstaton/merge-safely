@@ -28,7 +28,9 @@ Path patterns are used by `tiers.criticalPaths`, `tiers.ignorePaths`, the `triag
 
 - Matching works on **whole path segments**. `**/auth/**` matches `src/auth/session.ts` but not `src/author/profile.ts`.
 - Matching is **case-insensitive**.
-- Patterns are anchored at the repository root. `*.tsx` matches only files at the root. Use `**/*.tsx` for "anywhere".
+- A pattern with a `/` is anchored at the repository root (`src/**/*.tsx`). A pattern without one matches the file name at any depth, so `*.tsx` behaves like `**/*.tsx`.
+- A trailing `/` means a directory: `docs/` matches everything inside any `docs` directory.
+- Every list above uses the same matcher, so a pattern means the same thing in `conditionalLenses` as in `criticalPaths`.
 - For a rename, the previous path is checked too.
 
 ## Tiers and the score
@@ -172,6 +174,13 @@ Default `conditionalLenses`:
 ```yaml
 design-fidelity: ["**/*.tsx", "**/*.jsx", "**/*.vue", "**/*.svelte", "**/*.css", "**/*.scss", "**/components/**", "**/ui/**"]
 ```
+
+`conditionalLenses` globs use the same matcher as every other path pattern in the policy (see [Glob patterns](#glob-patterns)). For conditional lenses this means:
+
+- Matching is case-insensitive: `**/components/**` matches `src/Components/Button.tsx`.
+- A pattern without a `/` matches the file name at any depth: `*.css` matches `src/app.css`.
+- A trailing `/**` needs at least one further segment. `**/ui/**` matches `src/ui/button.tsx` but not a file named `ui`, and `src/design-system/**` matches files inside that directory but not the path `src/design-system` itself.
+- `{a,b}` alternatives are expanded: `**/*.{tsx,jsx}` matches either extension.
 
 ## `models`
 

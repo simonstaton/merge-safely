@@ -17,6 +17,7 @@ import {
   type ToolUseAudit,
   type WorkspaceHandle,
 } from "@merge-safely/core";
+import { toAnthropicTools } from "@merge-safely/tools";
 import { classifyExit } from "./classify.js";
 import { type AnthropicLike, describeApiError } from "./client.js";
 import { addUsage, priceFor, ZERO_USAGE } from "./models.js";
@@ -49,13 +50,9 @@ const TOOL_PREAMBLE = [
   `Its input must match the tool's schema exactly. Do not put the final result in plain text.`,
 ].join("\n");
 
-/** Convert the shared tool definitions to Anthropic tool shapes. */
+/** Convert the shared tool definitions to Anthropic tool shapes (the shared converter, typed for the SDK). */
 export function toAnthropicToolDefs(defs: readonly ToolDefinition[]): Anthropic.Tool[] {
-  return defs.map((d) => ({
-    name: d.name,
-    description: d.description,
-    input_schema: { ...d.inputSchema, type: "object" } as Anthropic.Tool.InputSchema,
-  }));
+  return toAnthropicTools(defs) as Anthropic.Tool[];
 }
 
 export function submitReviewTool(seat: Seat, input: ReviewerInput): Anthropic.Tool {

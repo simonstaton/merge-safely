@@ -1,8 +1,15 @@
 import type { Logger } from "@merge-safely/core";
+import {
+  type NormalizedCall,
+  type ToolResultMessage,
+  type Transport,
+  type TransportInit,
+  type TurnResult,
+  toOpenAIResponsesTools,
+} from "@merge-safely/tools";
 import type { FunctionTool, ResponseInputItem } from "openai/resources/responses/responses";
 import type { ReasoningEffort } from "openai/resources/shared";
 import type { OpenAILike } from "./client.js";
-import type { NormalizedCall, ToolResultMessage, Transport, TransportInit, TurnResult } from "./common/loop.js";
 import { isSchemaRejection } from "./errors.js";
 
 export const REASONING_EFFORTS: ReadonlyArray<Exclude<ReasoningEffort, null>> = ["minimal", "low", "medium", "high"];
@@ -38,14 +45,7 @@ export class ResponsesTransport implements Transport {
     logger?: Logger,
   ) {
     this.input = [{ role: "user", content: init.user }];
-    this.tools = init.tools.map((t) => ({
-      type: "function",
-      name: t.name,
-      description: t.description,
-      parameters: t.parameters,
-      // The Responses API defaults strict to true, so it is always set explicitly.
-      strict: t.strict,
-    }));
+    this.tools = toOpenAIResponsesTools(init.tools);
     this.effort = toEffort(init.effort, logger);
     this.reasoning = this.effort !== undefined || isReasoningModel(model);
   }

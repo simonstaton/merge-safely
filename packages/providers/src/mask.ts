@@ -1,4 +1,4 @@
-import type { ConnectionSecret } from "@merge-safely/core";
+import { type ConnectionSecret, redactText } from "@merge-safely/core";
 
 /**
  * Mask a secret for display: `…k3Fd` (last four characters) when the secret is long enough that the tail
@@ -9,7 +9,13 @@ export function maskSecret(s: string): string {
   return `…${s.slice(-4)}`;
 }
 
-/** Userinfo and query-string values embedded in a URL (e.g. `https://u:pw@gw/v1?api-key=…`), raw and decoded. */
+/** Query parameter names whose values are credentials (`api-key`, `token`, `sig`, ...); `api-version` is not. */
+const CREDENTIAL_QUERY_KEY = /key|token|secret|auth|sig|password|passwd|credential/i;
+
+/**
+ * Userinfo and credential-looking query-string values embedded in a URL (e.g. `https://u:pw@gw/v1?api-key=…`),
+ * raw and decoded. Other query values (`api-version=2024-10-21`) are configuration, not secrets.
+ */
 export function urlCredentials(url: string): string[] {
   let u: URL;
   try {
@@ -29,7 +35,8 @@ export function urlCredentials(url: string): string[] {
   };
   add(u.username);
   add(u.password);
-  for (const [, v] of u.searchParams) {
+  for (const [k, v] of u.searchParams) {
+    if (!CREDENTIAL_QUERY_KEY.test(k)) continue;
     out.add(v);
     add(encodeURIComponent(v));
   }
@@ -62,11 +69,14 @@ export function secretValues(secret: ConnectionSecret | undefined): string[] {
   return out.filter((v) => v.length >= 6);
 }
 
-/** Replace every occurrence of the given secret values in `text` with their masked form. */
+/**
+ * Replace every occurrence of the given secret values in `text` with their masked form (longest first),
+ * then redact anything else shaped like a credential with core's redactor.
+ */
 export function scrubText(text: string, secrets: string[]): string {
   let out = text;
   for (const s of [...secrets].sort((a, b) => b.length - a.length)) {
     if (s) out = out.split(s).join(maskSecret(s));
   }
-  return out;
+  return redactText(out, { aggressive: true, replacement: "[REDACTED]" });
 }

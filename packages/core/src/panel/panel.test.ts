@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { loadPolicy } from "../policy/index.js";
 import type { PolicyInput } from "../policy/schema.js";
+import { matchPath as matchGlob } from "../stages/glob.js";
 import type { Change, ConnectionRecord, ModelInfo, ModelTierClass, Tier } from "../types.js";
 import { SeatingError } from "./errors.js";
-import { matchGlob } from "./glob.js";
 import { describeSeating, findInCatalog, normaliseModelId, planFallback, seat, sortByTier } from "./index.js";
 
 const info = (provider: string, name: string, tier: ModelTierClass, priced = true): ModelInfo => ({
@@ -66,7 +66,7 @@ function run(policyIn: PolicyInput, level: Tier["level"], c: Change, connections
   return seat({ tier: tier(level), change: c, policy: loadPolicy(policyIn), connections, catalog });
 }
 
-describe("glob", () => {
+describe("glob (conditional lenses use the policy matcher)", () => {
   it("matches whole segments", () => {
     expect(matchGlob("**/*.tsx", "a/b/C.tsx")).toBe(true);
     expect(matchGlob("**/*.tsx", "C.tsx")).toBe(true);
@@ -74,10 +74,16 @@ describe("glob", () => {
     expect(matchGlob("**/auth/**", "src/author/x.ts")).toBe(false);
     expect(matchGlob("**/components/**", "components/a/b.ts")).toBe(true);
     expect(matchGlob("docs/**", "docs/a.md")).toBe(true);
-    expect(matchGlob("*.md", "docs/a.md")).toBe(false);
+    // A pattern without `/` matches the basename anywhere, as everywhere else in the policy.
+    expect(matchGlob("*.md", "docs/a.md")).toBe(true);
     expect(matchGlob("src/?.ts", "src/a.ts")).toBe(true);
     expect(matchGlob("**/*.css", "a/b.scss")).toBe(false);
     expect(matchGlob("a/**/b/**/c.ts", "a/x/y/b/c.ts")).toBe(true);
+  });
+
+  it("is case-insensitive like every other policy path pattern", () => {
+    expect(matchGlob("**/components/**", "src/Components/Button.tsx")).toBe(true);
+    expect(matchGlob("**/*.tsx", "src/App.TSX")).toBe(true);
   });
 });
 

@@ -80,9 +80,9 @@ const RULES: Rule[] = [
     replace: whole("private-key"),
   },
   { kind: "aws-access-key", re: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, replace: whole("aws-access-key") },
-  { kind: "github-token", re: /\bgithub_pat_[A-Za-z0-9_]{22,255}\b/g, replace: whole("github-token") },
-  { kind: "github-token", re: /\bgh[pousr]_[A-Za-z0-9]{36,255}\b/g, replace: whole("github-token") },
-  { kind: "anthropic-key", re: /\bsk-ant-[A-Za-z0-9_-]{20,}/g, replace: whole("anthropic-key") },
+  { kind: "github-token", re: /\bgithub_pat_[A-Za-z0-9_]{20,255}\b/g, replace: whole("github-token") },
+  { kind: "github-token", re: /\bgh[pousr]_[A-Za-z0-9]{20,255}\b/g, replace: whole("github-token") },
+  { kind: "anthropic-key", re: /\bsk-ant-[A-Za-z0-9_-]{8,}/g, replace: whole("anthropic-key") },
   {
     kind: "openai-key",
     re: /\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}/g,
@@ -103,6 +103,16 @@ const RULES: Rule[] = [
       const pass = g[1] ?? "";
       if (pass.length === 0 || isPlaceholder(pass)) return null;
       return `${g[0] ?? ""}:${tag("url-credentials")}@`;
+    },
+  },
+  {
+    // Scheme-less userinfo (//user:pass@host, as in .npmrc or protocol-relative URLs).
+    kind: "url-credentials",
+    re: /(^|[\s"'`(=])(\/\/[^\s:/@]+):([^\s@/]+)@/g,
+    replace: (_m, g) => {
+      const pass = g[2] ?? "";
+      if (pass.length === 0 || isPlaceholder(pass)) return null;
+      return `${g[0] ?? ""}${g[1] ?? ""}:${tag("url-credentials")}@`;
     },
   },
   {
@@ -132,6 +142,8 @@ const RULES: Rule[] = [
     replace: (m, g) => {
       const value = g[4] ?? "";
       if (value.length < 6 || /\s/.test(value) || isPlaceholder(value)) return null;
+      // `"secret" in conn`, `token: "token"`: the value is just the name again.
+      if (value.toLowerCase() === (g[1] ?? "").toLowerCase()) return null;
       return m.slice(0, m.length - value.length - 1) + tag("credential") + (g[3] ?? "");
     },
   },
@@ -158,11 +170,96 @@ const RULES: Rule[] = [
   },
 ];
 
-/** Redact secret-shaped substrings. Returns the redacted text and how many substrings were replaced. */
-export function redactSecrets(text: string): { text: string; redactions: number } {
+/**
+ * Recall-oriented rules that only run with `aggressive: true`: for diagnostics leaving the process (error
+ * messages, logs, check-run error text) where a false positive costs little and a leak costs a lot.
+ * Never use it on code a reviewer reads (diffs, tool output) or on findings: it redacts ordinary code there.
+ * These are the union of the shapes the adapters (tools, providers, github) used to keep locally.
+ * `AGGRESSIVE_PRE` runs before the default rules (it must see raw text), `AGGRESSIVE_POST` after them.
+ */
+const notCode = (v: string): boolean =>
+  !v.includes("(") && !v.includes("[REDACTED:") && !/^(?:\$\{|\{\{|<|process\.env)/.test(v);
+
+const AGGRESSIVE_PRE: Rule[] = [
+  {
+    // git remote errors: https://x-access-token:<token>@github.com, with or without a scheme.
+    kind: "url-credentials",
+    re: /(x-access-token:)[^@\s]+@/g,
+    replace: (_m, g) => `${g[0] ?? ""}${tag("url-credentials")}@`,
+  },
+  {
+    // Any PEM block, including one whose END line was cut off: redact to the end of the text.
+    kind: "pem-block",
+    re: /-----BEGIN [A-Z0-9 ]+-----[\s\S]*?(?:-----END [A-Z0-9 ]+-----|$)/g,
+    replace: whole("pem-block"),
+  },
+  {
+    // ?key=...&token=... query parameters (keeps the other parameters).
+    kind: "query-credential",
+    re: /([?&](?:key|api[_-]?key|token|access[_-]?token|auth|password|secret|client[_-]?secret|sig|signature)=)([^&\s"'#]+)/gi,
+    replace: (_m, g) => (notCode(g[1] ?? "") ? `${g[0] ?? ""}${tag("query-credential")}` : null),
+  },
+  {
+    // Authorization header values: `<scheme> <credential>` (or a bare credential), never the rest of the line.
+    kind: "authorization",
+    re: /(\bauthorization["']?\s*[:=]\s*["']?)((?:(?:bearer|basic|token|digest|negotiate|ntlm|apikey|sso-key)\s+)?)([^\s"'`,;)]+)/gi,
+    replace: (_m, g) => {
+      const scheme = g[1] ?? "";
+      const value = g[2] ?? "";
+      if (isPlaceholder(value)) return null;
+      // Without a scheme, an identifier or call (`authorization: getHeader(req)`, `authorization: string`) is code.
+      if (!scheme && (/[()]/.test(value) || (/^[A-Za-z_$][\w$]*(?:\.[\w$]+)*$/.test(value) && !/[0-9]/.test(value))))
+        return null;
+      return `${g[0] ?? ""}${tag("authorization")}`;
+    },
+  },
+];
+
+const AGGRESSIVE_POST: Rule[] = [
+  {
+    // HTTP header style names (`x-api-key: …`, `api-key=…`, `x-auth-token: …`): any value. Hyphenated names cannot
+    // be code identifiers, so this never fires on `apiKey: string` or `api_key = opts.apiKey`.
+    kind: "api-key",
+    re: /(\b(?:x-)?(?:api-key|auth-token)["']?\s*[:=]\s*["']?)([^\s"'`,;}]+)/gi,
+    replace: (_m, g) => (notCode(g[1] ?? "") ? `${g[0] ?? ""}${tag("api-key")}` : null),
+  },
+  {
+    // password = "any value, even with spaces" (4+ chars).
+    kind: "credential",
+    re: /(\b[A-Za-z0-9_]*(?:password|passwd|token|secret|api_?key)\s*[:=]\s*)(["'])([^"'\r\n]{4,})\2/gi,
+    replace: (_m, g) =>
+      isPlaceholder(g[2] ?? "") ? null : `${g[0] ?? ""}${g[1] ?? ""}${tag("credential")}${g[1] ?? ""}`,
+  },
+  {
+    // KEY=value with no spaces (env, ini, URL query), 4+ chars.
+    kind: "credential",
+    re: /(\b[A-Za-z0-9_]*(?:password|passwd|token|secret|api_?key)=)(?!["'])([^\s&"'`]{4,})/gi,
+    replace: (_m, g) => (isPlaceholder(g[1] ?? "") ? null : `${g[0] ?? ""}${tag("credential")}`),
+  },
+  {
+    kind: "bearer-token",
+    re: /\b(Bearer\s+)([A-Za-z0-9._~+/=-]{8,})/gi,
+    replace: (_m, g) => `${g[0] ?? ""}${tag("bearer-token")}`,
+  },
+  // Also after `_` (e.g. `KEY_sk-…`), which `\b` would miss; still not inside a word like `ask-…`.
+  { kind: "openai-key", re: /(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{12,}/g, replace: whole("openai-key") },
+  { kind: "google-api-key", re: /(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{20,}/g, replace: whole("google-api-key") },
+];
+
+export interface RedactOptions {
+  /**
+   * Also apply the recall-oriented rules (any PEM block, Authorization header values, short bearer tokens and
+   * key shapes, api-key headers, query-string credentials). Only for error messages, logs and check-run error
+   * text; leave off for diffs, tool output, prompts and findings, where reviewers need code as written.
+   */
+  aggressive?: boolean;
+  /** Replace every `[REDACTED:<kind>]` marker with this fixed string (e.g. `[REDACTED]`). */
+  replacement?: string;
+}
+
+function applyRules(rules: readonly Rule[], text: string, count: () => void): string {
   let out = text;
-  let redactions = 0;
-  for (const rule of RULES) {
+  for (const rule of rules) {
     rule.re.lastIndex = 0;
     out = out.replace(rule.re, (match: string, ...rest: unknown[]) => {
       // rest = [...groups, offset, input, namedGroups?]; keep only the capture groups.
@@ -173,16 +270,33 @@ export function redactSecrets(text: string): { text: string; redactions: number 
       }
       const replaced = rule.replace(match, groups);
       if (replaced === null) return match;
-      redactions++;
+      count();
       return replaced;
     });
+  }
+  return out;
+}
+
+/** Redact secret-shaped substrings. Returns the redacted text and how many substrings were replaced. */
+export function redactSecrets(text: string, opts: RedactOptions = {}): { text: string; redactions: number } {
+  let redactions = 0;
+  const count = () => {
+    redactions++;
+  };
+  let out = text;
+  if (opts.aggressive) out = applyRules(AGGRESSIVE_PRE, out, count);
+  out = applyRules(RULES, out, count);
+  if (opts.aggressive) out = applyRules(AGGRESSIVE_POST, out, count);
+  if (opts.replacement !== undefined) {
+    const replacement = opts.replacement;
+    out = out.replace(/\[REDACTED:[a-z-]+\]/g, () => replacement);
   }
   return { text: out, redactions };
 }
 
 /** Redact a string and return only the text. */
-export function redactText(text: string): string {
-  return redactSecrets(text).text;
+export function redactText(text: string, opts?: RedactOptions): string {
+  return redactSecrets(text, opts).text;
 }
 
 /**
@@ -191,7 +305,7 @@ export function redactText(text: string): string {
  */
 export function redactFinding<F extends Pick<Finding, "title" | "detail"> & Partial<Finding>>(f: F): F {
   const out: F = { ...f, title: redactText(f.title), detail: redactText(f.detail) };
-  if (f.evidence) out.evidence = f.evidence.map(redactText);
+  if (f.evidence) out.evidence = f.evidence.map((e) => redactText(e));
   if (f.suggestedFix !== undefined) out.suggestedFix = redactText(f.suggestedFix);
   if (f.votes) out.votes = f.votes.map((v) => (v.reason === undefined ? v : { ...v, reason: redactText(v.reason) }));
   return out;

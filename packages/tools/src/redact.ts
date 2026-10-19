@@ -1,40 +1,42 @@
+import { redactText } from "@merge-safely/core";
+
 export const REDACTED = "[REDACTED]";
 
-const PATTERNS: Array<[RegExp, string | ((m: string, ...g: string[]) => string)]> = [
-  // PEM blocks (also a BEGIN with its END cut off by truncation).
-  [/-----BEGIN [A-Z0-9 ]+-----[\s\S]*?(?:-----END [A-Z0-9 ]+-----|$)/g, REDACTED],
-  [/\bsk-ant-[A-Za-z0-9_-]{8,}/g, REDACTED],
-  [/\bsk-[A-Za-z0-9_-]{16,}/g, REDACTED],
-  [/\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}/g, REDACTED],
-  [/\bgithub_pat_[A-Za-z0-9_]{20,}/g, REDACTED],
-  [/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, REDACTED],
-  [/\bxox[abposr]-[A-Za-z0-9-]{10,}/g, REDACTED],
-  // Authorization header values, to end of line.
-  [/(\bauthorization\s*[:=]\s*)[^\r\n]+/gi, (_m, k: string) => `${k}${REDACTED}`],
-  // password=/token= style assignments with a quoted literal, or an unspaced KEY=value (env/ini/URL query).
-  [
-    /(\b[A-Za-z0-9_]*(?:password|passwd|token|secret|api_?key)\s*[:=]\s*)(["'])[^"'\r\n]{4,}\2/gi,
-    (_m, k: string, q: string) => `${k}${q}${REDACTED}${q}`,
-  ],
-  [
-    /(\b[A-Za-z0-9_]*(?:password|passwd|token|secret|api_?key)=)(?!["'])[^\s&"'`]{4,}/gi,
-    (_m, k: string) => `${k}${REDACTED}`,
-  ],
-];
+/**
+ * Redaction for content a reviewer reads: tool output (read_file, search, git_*, run_command) and findings.
+ * Known secret values are replaced verbatim first (longest first), then core's DEFAULT, precise redactor
+ * removes real credential shapes (provider/GitHub/AWS/Slack keys, PEM private keys, JWTs, Bearer tokens,
+ * literal password/token assignments). Code that merely handles credentials (`apiKey: string`,
+ * `const token = getToken()`) is left exactly as written so reviewers can review it.
+ */
+export function redactToolOutput(text: string, secrets: ReadonlyArray<string | undefined> = []): string {
+  return redactText(replaceLiterals(text, secrets, REDACTED, 4), { replacement: REDACTED });
+}
 
 /**
- * Replace secret-shaped strings in tool output with [REDACTED] so they never reach a prompt
- * (and from there a finding posted on the PR). Shapes: OpenAI/Anthropic keys, GitHub tokens,
- * AWS access key ids, Slack tokens, PEM blocks, Authorization header values and
- * password/token/secret/api_key assignments.
- *
- * TODO: switch to `redactSecrets` from @merge-safely/core once it is exported.
+ * Redaction for diagnostics leaving the process: error messages, logs, check-run error text. Known secret
+ * values first, then core's redactor in aggressive mode (also Authorization/api-key header values, short
+ * key shapes, query-string credentials, any PEM block). Never use it on code or findings.
  */
-export function redactSecrets(text: string): string {
+export function redactDiagnostics(
+  text: string,
+  secrets: ReadonlyArray<string | undefined> = [],
+  minLength = 4,
+): string {
+  return redactText(replaceLiterals(text, secrets, REDACTED, minLength), { aggressive: true, replacement: REDACTED });
+}
+
+/** Replace every occurrence of each literal value (longest first) with `replacement`, or with its result. */
+export function replaceLiterals(
+  text: string,
+  secrets: ReadonlyArray<string | undefined>,
+  replacement: string | ((secret: string) => string),
+  minLength = 1,
+): string {
   let out = text;
-  for (const [re, rep] of PATTERNS) {
-    out =
-      typeof rep === "string" ? out.replace(re, rep) : out.replace(re, rep as (m: string, ...g: string[]) => string);
+  const values = secrets.filter((s): s is string => typeof s === "string" && s.length >= minLength);
+  for (const s of [...new Set(values)].sort((a, b) => b.length - a.length)) {
+    out = out.split(s).join(typeof replacement === "string" ? replacement : replacement(s));
   }
   return out;
 }

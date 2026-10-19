@@ -1,6 +1,12 @@
 import { ApiError } from "@google/genai";
-import { errorMessage, NETWORK_CODES, redact, systemErrorCode } from "./common/redact.js";
-import type { ErrorClassifier, ErrorInfo } from "./common/retry.js";
+import {
+  type ErrorClassifier,
+  type ErrorInfo,
+  errorMessage,
+  NETWORK_CODES,
+  redactDiagnostics,
+  systemErrorCode,
+} from "@merge-safely/tools";
 
 function short(text: string): string {
   return text.length > 300 ? `${text.slice(0, 300)}...` : text;
@@ -18,7 +24,7 @@ export function classifyGeminiError(secrets: string[]): ErrorClassifier {
     if (err instanceof Error && err.name === "AbortError")
       return { kind: "abort", retryable: false, message: "aborted" };
     const status = err instanceof ApiError && typeof err.status === "number" ? err.status : undefined;
-    const raw = redact(errorMessage(err), secrets);
+    const raw = redactDiagnostics(errorMessage(err), secrets);
     const msg = short(raw);
     if (status !== undefined) {
       if (status === 401 || (status === 400 && /API[_ ]KEY[_ ]INVALID|API key not valid/i.test(raw)))

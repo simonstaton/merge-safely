@@ -2,6 +2,7 @@
 
 export {
   type AnthropicToolShape,
+  type ConvertibleTool,
   type GeminiFunctionDeclarationShape,
   type OpenAIFunctionToolShape,
   type OpenAIResponsesToolShape,
@@ -28,7 +29,8 @@ export {
 export { globToRegExp, matchGlob } from "./glob.js";
 export { PathError, resolveSafe, type SafePath } from "./paths.js";
 export { toolsSystemPromptFragment } from "./prompt.js";
-export { REDACTED, redactSecrets } from "./redact.js";
+export { REDACTED, redactDiagnostics, redactToolOutput, replaceLiterals } from "./redact.js";
+export * from "./runner/index.js";
 export { isHiddenPath, isSensitivePath } from "./sensitive.js";
 export { SUBMIT_REVIEW_TOOL_NAME, submitReviewDefinition } from "./submit-review.js";
 export { type AllowEntry, matchAllowlist, parseAllowEntry, type TokenizeResult, tokenizeCommand } from "./tokenize.js";

@@ -1,7 +1,14 @@
 import { type Content, type FunctionDeclaration, type Part, type ThinkingConfig, ThinkingLevel } from "@google/genai";
 import type { Logger, ModelInfo } from "@merge-safely/core";
+import {
+  type NormalizedCall,
+  type ToolResultMessage,
+  type Transport,
+  type TransportInit,
+  type TurnResult,
+  toGeminiFunctionDeclarations,
+} from "@merge-safely/tools";
 import type { GenAILike } from "./client.js";
-import type { NormalizedCall, ToolResultMessage, Transport, TransportInit, TurnResult } from "./common/loop.js";
 import { baseModelId, geminiEffortLevels } from "./models.js";
 
 const BUDGETS: Record<string, number> = { minimal: 0, low: 1_024, medium: 8_192, high: 24_576 };
@@ -67,11 +74,7 @@ export class GeminiTransport implements Transport {
     logger?: Logger,
   ) {
     this.contents = [{ role: "user", parts: [{ text: init.user }] }];
-    this.declarations = init.tools.map((t) => ({
-      name: t.name,
-      description: t.description,
-      parametersJsonSchema: t.parameters,
-    }));
+    this.declarations = toGeminiFunctionDeclarations(init.tools);
     this.model = model.name;
     this.thinking = thinkingConfigFor(model, init.effort, logger);
   }

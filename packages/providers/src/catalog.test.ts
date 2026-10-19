@@ -110,9 +110,9 @@ describe("secretValues / URL credentials", () => {
       baseUrl: "https://gwuser:hunter2password@gw.test/v1?api-key=query-secret-1&x=y%2Fz-encoded",
     };
     const values = secretValues(secret);
-    expect(values).toEqual(
-      expect.arrayContaining(["gwuser", "hunter2password", "query-secret-1", "y/z-encoded", "y%2Fz-encoded"]),
-    );
+    expect(values).toEqual(expect.arrayContaining(["gwuser", "hunter2password", "query-secret-1"]));
+    // `x` is not a credential-looking query key, so its value is configuration, not a secret.
+    expect(values).not.toContain("y/z-encoded");
     const reg = createProviderRegistry([
       provider("openai-compatible", ["openai-compatible"], {
         models: async () => {

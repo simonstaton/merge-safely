@@ -11,10 +11,8 @@ import type {
   ValidationResult,
   WorkspaceHandle,
 } from "@merge-safely/core";
+import { AgenticLoop, errorMessage, type RetryOptions, redactDiagnostics, secretStrings } from "@merge-safely/tools";
 import { defaultClientFactory, type OpenAILike } from "./client.js";
-import { AgenticLoop } from "./common/loop.js";
-import { errorMessage, redact, secretStrings } from "./common/redact.js";
-import type { RetryOptions } from "./common/retry.js";
 import { classifyOpenAIError } from "./errors.js";
 import { isChatModelId, toModelInfo } from "./models.js";
 import { ChatTransport } from "./transport-chat.js";
@@ -105,7 +103,7 @@ function buildProvider(id: string, connectionKinds: ConnectionKind[], opts: Open
           return { ok: true, message: "base URL does not expose /models, assuming reachable", latencyMs };
         if (info.kind === "network")
           return { ok: false, message: `provider unreachable at ${hostOf(conn)} (${info.message})`, latencyMs };
-        return { ok: false, message: `validation failed: ${redact(info.message, secrets)}`, latencyMs };
+        return { ok: false, message: `validation failed: ${redactDiagnostics(info.message, secrets)}`, latencyMs };
       }
     },
 
@@ -130,7 +128,7 @@ function buildProvider(id: string, connectionKinds: ConnectionKind[], opts: Open
           try {
             client = factory(conn);
           } catch (err: unknown) {
-            setupError = `could not create OpenAI client: ${redact(errorMessage(err), secrets)}`;
+            setupError = `could not create OpenAI client: ${redactDiagnostics(errorMessage(err), secrets)}`;
           }
           const loop = new AgenticLoop({
             model,

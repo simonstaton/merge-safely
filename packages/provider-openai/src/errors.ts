@@ -1,6 +1,14 @@
+import {
+  type ErrorClassifier,
+  type ErrorInfo,
+  errorMessage,
+  NETWORK_CODES,
+  NonRetryableError,
+  parseRetryAfter,
+  redactDiagnostics,
+  systemErrorCode,
+} from "@merge-safely/tools";
 import { APIConnectionError, APIConnectionTimeoutError, APIError, APIUserAbortError } from "openai";
-import { errorMessage, NETWORK_CODES, redact, systemErrorCode } from "./common/redact.js";
-import { type ErrorClassifier, type ErrorInfo, NonRetryableError, parseRetryAfter } from "./common/retry.js";
 
 function short(text: string): string {
   return text.length > 300 ? `${text.slice(0, 300)}...` : text;
@@ -18,7 +26,7 @@ export function isRetryableStatus(status: number): boolean {
  */
 export function classifyOpenAIError(secrets: string[]): ErrorClassifier {
   return (err: unknown): ErrorInfo => {
-    const msg = short(redact(errorMessage(err), secrets));
+    const msg = short(redactDiagnostics(errorMessage(err), secrets));
     if (err instanceof APIUserAbortError || (err instanceof Error && err.name === "AbortError")) {
       return { kind: "abort", retryable: false, message: "aborted" };
     }
