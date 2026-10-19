@@ -1,6 +1,7 @@
 import { Command, CommanderError } from "commander";
 import { CONNECT_PROVIDERS, type ConnectOptions, connectCommand } from "./commands/connect.js";
 import { connectionsList, connectionsPath, connectionsRemove, connectionsTest } from "./commands/connections.js";
+import { evalCliCommand } from "./commands/eval.js";
 import { policyInit, policyLint } from "./commands/policy.js";
 import {
   estimateCommand,
@@ -99,6 +100,7 @@ export function buildProgram(ctx: CliContext, done: (code: number) => void): Com
     .option("--head <sha>", "pin the head SHA to review")
     .option("--slack-webhook <url>", "escalate to this Slack webhook (or $MERGE_SAFELY_SLACK_WEBHOOK)")
     .option("--dry-run", "run the review but write nothing to GitHub or the store")
+    .option("--concurrency <n>", "seats run in parallel (default 2)")
     .action(wrap<RunOptions>((rt, opts) => runCommand(rt, opts)));
 
   prOptions(program.command("estimate").description("tier, seats, models and estimated cost; no model calls"))
@@ -131,6 +133,13 @@ export function buildProgram(ctx: CliContext, done: (code: number) => void): Com
     .argument("[path]")
     .action(wrap((rt, _o, path) => policyInit(rt, path)));
 
+  // Listed for --help only; runCli routes `eval` to @merge-safely/evals before commander parses anything.
+  program
+    .command("eval")
+    .description("run an eval suite: eval --suite <dir> [--dry] …, or eval init <dir> (see eval --help)")
+    .allowUnknownOption()
+    .argument("[args...]");
+
   program
     .command("version")
     .description("print the version")
@@ -145,8 +154,53 @@ export function buildProgram(ctx: CliContext, done: (code: number) => void): Com
   return program;
 }
 
+const GLOBAL_VALUE_FLAGS = new Set(["--home", "--connections"]);
+const GLOBAL_BOOL_FLAGS: Record<string, keyof GlobalOptions> = { "--verbose": "verbose", "--json": "json" };
+
+/**
+ * `eval` hands everything after it to @merge-safely/evals, which parses its own flags strictly. Returns the global
+ * options before it and the rest, or undefined when the command is not `eval`.
+ */
+export function splitEvalArgs(argv: string[]): { globals: GlobalOptions; rest: string[] } | undefined {
+  const globals: GlobalOptions = {};
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i] ?? "";
+    const [flag = "", inline] =
+      a.startsWith("--") && a.includes("=")
+        ? [a.slice(0, a.indexOf("=")), a.slice(a.indexOf("=") + 1)]
+        : [a, undefined];
+    if (GLOBAL_VALUE_FLAGS.has(flag)) {
+      const v = inline ?? argv[++i];
+      if (flag === "--home") globals.home = v;
+      else globals.connections = v;
+      continue;
+    }
+    const bool = GLOBAL_BOOL_FLAGS[a];
+    if (bool) {
+      globals[bool] = true as never;
+      continue;
+    }
+    if (a === "--no-color") {
+      globals.color = false;
+      continue;
+    }
+    return a === "eval" ? { globals, rest: argv.slice(i + 1) } : undefined;
+  }
+  return undefined;
+}
+
 /** Run the CLI with user arguments (no node/script prefix). Resolves to the process exit code; never throws. */
 export async function runCli(argv: string[], ctx: CliContext): Promise<number> {
+  const evalArgs = splitEvalArgs(argv);
+  if (evalArgs) {
+    const rt = new Runtime(ctx, evalArgs.globals);
+    try {
+      return await evalCliCommand(rt, evalArgs.rest);
+    } catch (err: unknown) {
+      rt.err(formatError(err, rt.secrets));
+      return exitCodeFor(err);
+    }
+  }
   let code: number = EXIT.pass;
   const program = buildProgram(ctx, (c) => {
     code = c;

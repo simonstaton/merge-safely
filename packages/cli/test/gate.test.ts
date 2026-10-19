@@ -1,9 +1,10 @@
-import * as core from "@merge-safely/core";
+import type * as core from "@merge-safely/core";
 import { DEFAULT_POLICY, policyHash } from "@merge-safely/core";
 import { createProviderRegistry } from "@merge-safely/providers";
+import { makeChange } from "@merge-safely/testkit";
 import { describe, expect, it } from "vitest";
 import { autoModels, seatTokens, tierCosts } from "../src/cost.js";
-import { adaptGate, buildGateDeps, realGateFactory, registryPricing, toCliEstimate, toCliResult } from "../src/gate.js";
+import { buildGateDeps, lensPrompts, registryPricing, toCliEstimate, toCliResult } from "../src/gate.js";
 import type { GateSetup } from "../src/gate-types.js";
 import { homePaths } from "../src/home.js";
 import { fakeProvider, model, tempDir, verdict } from "./helpers.js";
@@ -52,51 +53,89 @@ describe("gate wiring", () => {
     expect(deps.source).toBeDefined();
   });
 
-  it("the production factory reports a clear error until the core exports createGate", async () => {
-    const hasGate = typeof (core as Record<string, unknown>).createGate === "function";
-    const f = realGateFactory(() => createProviderRegistry([fakeProvider()]));
-    if (hasGate) await expect(f(setup({ mode: "local", root: "/tmp" }))).resolves.toBeDefined();
-    else await expect(f(setup({ mode: "local", root: "/tmp" }))).rejects.toMatchObject({ code: "GATE_UNAVAILABLE" });
-  });
-
   it("registry pricing steps down within the connection's catalog", () => {
     const models = [model("claude-opus-5-5", "frontier"), model("claude-sonnet-5-5", "mid")];
-    const p = registryPricing(() => models);
-    const next = p.cheaper({ connectionId: "c", provider: "anthropic", name: "claude-opus-5-5" });
+    const p = registryPricing();
+    const next = p.cheaper({ connectionId: "c", provider: "anthropic", name: "claude-opus-5-5" }, models);
     expect(next).toEqual({ connectionId: "c", provider: "anthropic", name: "claude-sonnet-5-5" });
-    expect(p.cheaper({ connectionId: "c", provider: "anthropic", name: "unknown" })).toBeUndefined();
+    expect(p.cheaper({ connectionId: "c", provider: "anthropic", name: "unknown" }, models)).toBeUndefined();
     expect(p.price(model("x", "mid"), { in: 1_000_000, out: 0 }).usd).toBe(3);
+  });
+
+  it("builds lens prompts by lens id", () => {
+    expect(typeof lensPrompts.hunter).toBe("function");
+    expect(() => lensPrompts.hunter("no-such-lens", {} as never)).toThrow();
   });
 });
 
+const digest = { headline: "h", markdown: "m", text: "t" };
+
 describe("result normalisation", () => {
-  it("maps verdicts, contested and budget-blocked results", () => {
-    const pass = toCliResult(
-      { verdict: verdict(), digest: { headline: "h", markdown: "m", text: "t" } },
-      DEFAULT_POLICY,
-    );
-    expect(pass).toMatchObject({ outcome: "pass", digest: { text: "t" } });
-    expect(toCliResult({ verdict: verdict({ contested: true }) }, DEFAULT_POLICY).outcome).toBe("contested");
-    const blocked = toCliResult({ verdict: verdict({ decision: "block" }) }, DEFAULT_POLICY);
-    expect(blocked.outcome).toBe("block");
-    expect(blocked.digest.text).toContain("BLOCK");
-    expect(toCliResult({ status: "budget-blocked", reason: "per-change" }, DEFAULT_POLICY)).toMatchObject({
-      outcome: "budget-blocked",
-      reason: "per-change",
+  it("maps verdicts, contested, outages and budget refusals", () => {
+    expect(toCliResult({ verdict: verdict(), digest, events: [] })).toMatchObject({ outcome: "pass", digest });
+    expect(toCliResult({ verdict: verdict(), digest, events: [], contested: true }).outcome).toBe("contested");
+    expect(toCliResult({ verdict: verdict({ decision: "block" }), digest, events: [] }).outcome).toBe("block");
+    const pending = verdict({ decision: "pending", reason: "seat outage" });
+    expect(toCliResult({ verdict: pending, digest, events: [] })).toMatchObject({
+      outcome: "pending",
+      reason: "seat outage",
     });
-    expect(toCliResult(undefined, DEFAULT_POLICY).outcome).toBe("error");
+    const change = makeChange();
+    const budget = toCliResult({
+      verdict: pending,
+      digest,
+      events: [
+        {
+          type: "budget-blocked",
+          change,
+          tier: pending.tier,
+          reason: "per-change over",
+          ceiling: "per-change",
+          digest,
+        },
+      ],
+    });
+    expect(budget).toMatchObject({ outcome: "budget-blocked", reason: "per-change over" });
+    // A decided stored verdict kept despite a budget refusal stays the signal.
+    const kept = toCliResult({
+      verdict: verdict({ decision: "block" }),
+      digest,
+      events: [{ type: "budget-blocked", change, tier: pending.tier, reason: "x", ceiling: "per-change", digest }],
+      pendingReason: "x",
+    });
+    expect(kept.outcome).toBe("block");
   });
 
-  it("maps estimates defensively", () => {
+  it("maps estimates, taking per-seat dollars from the per-seat ceiling rows", () => {
+    const seat = {
+      id: "h1",
+      role: "hunter" as const,
+      lens: "correctness",
+      model: { connectionId: "c", provider: "p", name: "m" },
+      budget: { maxTurns: 50, deadlineMs: 1000 },
+    };
+    const row = (ceiling: "per-seat" | "per-change", extra = {}) => ({
+      ceiling,
+      limitUsd: 25,
+      currentUsd: 0,
+      projectedUsd: 0.5,
+      breached: false,
+      fraction: 0.02,
+      ...extra,
+    });
     const e = toCliEstimate({
-      tier: { level: 2, score: 50, factors: { loc: 1, files: 1, modules: 1, criticalPathHits: [] }, reasons: [] },
-      seats: [
-        { id: "h1", role: "hunter", lens: "correctness", model: { connectionId: "c", provider: "p", name: "m" } },
-      ],
-      perSeatUsd: { h1: 0.5 },
-      usd: 0.5,
-      ceilings: [{ ceiling: "per-change", limitUsd: 25, currentUsd: 0, projectedUsd: 0.5, breached: false }],
-      admission: { ok: false, message: "nope" },
+      change: makeChange(),
+      tier: verdict().tier,
+      triage: { decision: "review", reason: "big" },
+      seats: [seat],
+      secondJudgeRound: false,
+      estimateUsd: 0.5,
+      unknownSeats: [],
+      ceilings: [row("per-seat", { seatId: "h1" }), row("per-change")],
+      round: 1,
+      diffOnly: false,
+      budgetBlocked: { ceiling: "per-change", message: "nope" },
+      summary: "",
     });
     expect(e).toMatchObject({
       seats: [{ id: "h1", model: "m", connectionId: "c", usd: 0.5 }],
@@ -104,34 +143,7 @@ describe("result normalisation", () => {
       admitted: false,
       blockedReason: "nope",
     });
-    expect(toCliEstimate(null).seats).toEqual([]);
-  });
-
-  it("adapts a core gate", async () => {
-    const v = verdict();
-    const g = adaptGate(
-      {
-        review: async () => ({ verdict: v }),
-        reviewChange: async () => ({ verdict: v }),
-        estimate: async () => ({}),
-        explain: async () => null,
-        recordHumanVerdict: async () => v,
-      },
-      DEFAULT_POLICY,
-    );
-    expect((await g.review({ repo: v.repo, number: 1 }, {})).outcome).toBe("pass");
-    expect(await g.explain({ repo: v.repo, number: 1 })).toBeNull();
-    expect(
-      (
-        await g.recordHumanVerdict({
-          ref: { repo: v.repo, number: 1 },
-          headSha: "a",
-          decision: "pass",
-          signedBy: { kind: "human", login: "x" },
-          reason: "r",
-        })
-      ).decision,
-    ).toBe("pass");
+    expect(e.ceilings.map((c) => c.ceiling)).toEqual(["per-change"]);
   });
 });
 
@@ -141,9 +153,10 @@ describe("cost heuristics", () => {
     expect(autoModels(models)).toMatchObject({ hunter: { name: "mid-1" }, judge: { name: "big" } });
     const [t1, t2, t3] = tierCosts(models);
     expect(t1?.hunters).toBe(2);
-    expect(t3?.judges).toBe(4);
+    expect(t3?.judges).toBe(2);
     expect((t1?.usd ?? 0) < (t2?.usd ?? 0) && (t2?.usd ?? 0) < (t3?.usd ?? 0)).toBe(true);
-    expect(seatTokens("hunter", 300).in).toBeGreaterThan(seatTokens("judge", 300).in);
+    expect(seatTokens("judge", 300, DEFAULT_POLICY, true).in).toBeGreaterThan(seatTokens("judge", 300).in);
+    expect(seatTokens("hunter", 3000).in).toBeGreaterThan(seatTokens("hunter", 300).in);
     const unpriced = tierCosts([{ ...model("mystery", "mid", "openai-compatible"), pricing: undefined }]);
     expect(unpriced[0]?.pessimistic).toBe(true);
     expect(tierCosts([]).every((c) => c.usd === 0)).toBe(true);

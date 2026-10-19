@@ -1,4 +1,5 @@
 import type { Connection, Logger } from "@merge-safely/core";
+import type { OctokitLike } from "@merge-safely/github";
 import { type ProviderRegistry, readConnectionsFile, secretValues } from "@merge-safely/providers";
 import { CliError, SecretSet } from "./errors.js";
 import type { Exec } from "./exec.js";
@@ -17,6 +18,8 @@ export interface CliContext {
   gateFactory: GateFactory;
   registry: () => ProviderRegistry;
   github: (token: string) => GithubApi;
+  /** Raw GitHub client, for `eval` suites with GitHub-sourced cases. Optional: without it those cases are skipped. */
+  octokit?: (token: string) => OctokitLike;
   now: () => Date;
   /** Defaults to a TTY prompter when stdin is a TTY, else one that refuses with a hint. */
   prompter?: Prompter;

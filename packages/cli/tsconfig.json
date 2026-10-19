@@ -18,6 +18,7 @@
     { "path": "../store-memory" },
     { "path": "../store-fs" },
     { "path": "../store-sqlite" },
-    { "path": "../escalation-slack" }
+    { "path": "../escalation-slack" },
+    { "path": "../evals" }
   ]
 }

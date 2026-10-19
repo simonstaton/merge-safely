@@ -29,7 +29,8 @@ function isRecord(x: unknown): x is Record<string, unknown> {
 
 /** The error's code: `CliError`/`GateError` codes, Node errno codes, else a generic one. */
 export function errorCode(err: unknown): string {
-  if (isRecord(err) && typeof err.code === "string" && err.code !== "") return err.code;
+  if (isRecord(err) && typeof err.code === "string" && err.code !== "")
+    return err.code.toUpperCase().replace(/-/g, "_");
   if (err instanceof Error && err.name && err.name !== "Error") return toCode(err.name);
   return "ERROR";
 }
@@ -46,6 +47,10 @@ function toCode(name: string): string {
 export function exitCodeFor(err: unknown): number {
   if (err instanceof CliError) return err.exitCode;
   if (isRecord(err) && typeof err.exitCode === "number") return err.exitCode;
+  // GateError("budget"): the review was refused by a budget ceiling.
+  if (err instanceof Error && err.name === "GateError" && isRecord(err) && err.code === "budget") {
+    return EXIT.budgetBlocked;
+  }
   return EXIT.error;
 }
 
@@ -68,7 +73,8 @@ export class SecretSet {
  * annotations keep the whole story on the line that carries the code.
  */
 export function formatError(err: unknown, secrets?: SecretSet): string {
-  const raw = err instanceof Error ? err.message : String(err);
+  const fix = isRecord(err) && typeof err.fix === "string" && err.fix !== "" ? ` Fix: ${err.fix}` : "";
+  const raw = (err instanceof Error ? err.message : String(err)) + fix;
   const oneLine = raw
     .split(/\r?\n/)
     .map((l) => l.trim().replace(/^- /, ""))

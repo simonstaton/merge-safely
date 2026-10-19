@@ -115,6 +115,8 @@ export interface GateSetup {
   connections: Connection[];
   paths: HomePaths;
   slackWebhook?: string;
+  /** Seats run in parallel (GateDeps.concurrency). Unset: the CLI default (2). */
+  concurrency?: number;
   logger: Logger;
 }
 

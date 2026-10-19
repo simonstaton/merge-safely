@@ -72,7 +72,7 @@ merge-safely connections path
 
 ```
 merge-safely run --repo <owner/name> --pr <n> [--policy <path>] [--report github|status|stdout|json]
-                 [--store fs|sqlite|checkrun] [--head <sha>] [--slack-webhook <url>] [--dry-run]
+                 [--store fs|sqlite|checkrun] [--head <sha>] [--slack-webhook <url>] [--dry-run] [--concurrency <n>]
 ```
 
 ```bash
@@ -95,11 +95,12 @@ merge-safely run --repo my-org/my-repo --pr 1234 --report json > verdict.json
 - **Workspace:** a disposable clone of the PR head under `$MERGE_SAFELY_HOME/repos`.
 - **Escalation:** `--slack-webhook <url>` or `MERGE_SAFELY_SLACK_WEBHOOK` sends escalations to Slack.
 - `--dry-run` runs the review but writes nothing to GitHub or the store.
+- `--concurrency <n>` seats run in parallel (default 2, gentler on provider rate limits than the core's 4).
 
 ### `run --local`
 
 ```
-merge-safely run --local [--base <ref>] [--policy <path>] [--json]
+merge-safely run --local [--base <ref>] [--policy <path>] [--json] [--concurrency <n>]
 ```
 
 Reviews your working tree against a base: committed, staged, unstaged and untracked (not ignored) changes,
@@ -145,6 +146,22 @@ merge-safely policy lint      # schema errors (exit 1), plus warnings for connec
 `lint` reports every schema error, including unknown keys inside a section (a typo such as `tiers.criticalPath`),
 and warns about `models.*` entries that name a connection missing from your connections file and about unknown
 lenses.
+
+### `eval`
+
+```bash
+merge-safely eval --suite packages/evals/suites/starter --dry          # tiering and triage only, no model calls
+merge-safely eval --suite incidents/ --format markdown --out report.json
+merge-safely eval --suite incidents/ --compare baseline.json           # exit 1 when a case regressed
+merge-safely eval init incidents/ --case unbatched-backfill --kind incident --title "Backfill without batching"
+```
+
+Everything after `eval` goes to `@merge-safely/evals` (see its README for the suite format and every flag,
+including `--policy`, `--ids`, `--kinds` and `--concurrency`). Full runs use the real gate over your connections;
+`--dry` needs none. With a GitHub token available, GitHub-sourced cases are fetched with it. Exit codes are passed
+through: 0 every gate holds, 1 a gate failed (a case failed, recall or false-block thresholds, or a regression
+against `--compare`), 2 usage or suite validation error. Global options (`--home`, `--connections`, `--verbose`)
+go before `eval`.
 
 ### `version`
 

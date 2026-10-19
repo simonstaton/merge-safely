@@ -116,7 +116,7 @@ function groupModels(models: ModelInfo[]): string[] {
 export function renderTierCosts(costs: TierCost[], policy: LoadedPolicy, lines = TYPICAL_PR_LINES): string {
   const rows = costs.map((c) => [
     `tier ${c.tier}`,
-    `${c.hunters} hunter${c.hunters === 1 ? "" : "s"} + ${c.judges} judge run${c.judges === 1 ? "" : "s"}`,
+    `${c.hunters} hunter${c.hunters === 1 ? "" : "s"} + ${c.judges} judge${c.judges === 1 ? "" : "s"}`,
     c.hunterModel?.name ?? "-",
     c.judgeModel?.name ?? "-",
     `${formatUsd(c.usd)}${c.pessimistic ? " (pessimistic rate)" : ""}`,
@@ -129,7 +129,7 @@ export function renderTierCosts(costs: TierCost[], policy: LoadedPolicy, lines =
     ` (${policy.source === "defaults" ? "policy defaults" : policy.source}).`,
   ].join("");
   return [
-    `Estimated cost per review of a typical ${lines}-line PR (no prompt caching assumed):`,
+    `Estimated cost per review of a typical ${lines}-line PR (same heuristic the budget ceilings use):`,
     table(["tier", "seats", "hunters", "judges", "est. per PR"], rows),
     ceiling,
   ].join("\n");

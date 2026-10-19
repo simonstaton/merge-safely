@@ -121,6 +121,7 @@ export interface RunOptions extends PrOptions {
   store?: string;
   slackWebhook?: string;
   dryRun?: boolean;
+  concurrency?: string;
 }
 
 function prTarget(rt: Runtime, c: PrContext, opts: RunOptions): PrTarget {
@@ -142,14 +143,24 @@ function prTarget(rt: Runtime, c: PrContext, opts: RunOptions): PrTarget {
   };
 }
 
+export function parseConcurrency(v: string | undefined): number | undefined {
+  if (v === undefined) return undefined;
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 1 || n > 32) {
+    throw new CliError("USAGE", `--concurrency must be an integer from 1 to 32 (got "${v}")`);
+  }
+  return n;
+}
+
 async function makeGate(
   rt: Runtime,
   target: GateSetup["target"],
   policy: LoadedPolicy,
-  slack?: string,
+  extra: { slackWebhook?: string; concurrency?: string } = {},
 ): Promise<CliGate> {
+  const concurrency = parseConcurrency(extra.concurrency);
   const connections = await rt.loadConnections({ required: true });
-  const webhook = slack ?? rt.ctx.env.MERGE_SAFELY_SLACK_WEBHOOK;
+  const webhook = extra.slackWebhook ?? rt.ctx.env.MERGE_SAFELY_SLACK_WEBHOOK;
   if (webhook) rt.secrets.add(webhook);
   return rt.ctx.gateFactory({
     target,
@@ -158,6 +169,7 @@ async function makeGate(
     paths: rt.paths,
     logger: rt.logger,
     ...(webhook ? { slackWebhook: webhook } : {}),
+    ...(concurrency !== undefined ? { concurrency } : {}),
   });
 }
 
@@ -200,13 +212,13 @@ export async function runCommand(rt: Runtime, opts: RunOptions): Promise<number>
         `Reviewing ${lc.change.stats.files} files (+${lc.change.stats.additions}/-${lc.change.stats.deletions}) against ${lc.change.baseRef}${lc.dirty ? " including uncommitted changes" : ""} …`,
       );
     }
-    const gate = await makeGate(rt, { mode: "local", root: lc.root }, policy);
+    const gate = await makeGate(rt, { mode: "local", root: lc.root }, policy, opts);
     const input: LocalReviewInput = { change: lc.change, diff: lc.diff, untrusted: lc.untrusted };
     return printResult(rt, await gate.reviewChange(input), rt.json);
   }
   const c = await prContext(rt, opts);
   const target = prTarget(rt, c, opts);
-  const gate = await makeGate(rt, target, c.policy, opts.slackWebhook);
+  const gate = await makeGate(rt, target, c.policy, opts);
   const result = await gate.review(c.ref, { headSha: c.headSha });
   if (target.report === "json") return printResult(rt, result, true);
   return printResult(rt, result, rt.json);

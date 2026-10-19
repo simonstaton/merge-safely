@@ -15,6 +15,7 @@ export function defaultContext(): CliContext {
     gateFactory: realGateFactory(defaultProviderRegistry),
     registry: defaultProviderRegistry,
     github: (token) => githubApi(octokitFromToken(token)),
+    octokit: (token) => octokitFromToken(token),
     now: () => new Date(),
   };
 }

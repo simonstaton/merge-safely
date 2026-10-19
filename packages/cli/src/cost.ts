@@ -2,19 +2,69 @@
  * "What will this cost?" before anything runs (design 7.4): for a connection's reachable models, the models each
  * tier would seat and the estimated dollars for a typical PR, priced from the registry.
  *
- * The token model is a deliberately rough, pessimistic heuristic (no prompt caching assumed): an agentic seat
- * re-sends its growing context every turn, so input dominates. Real spend is streamed into the ledger and
- * enforced by the budget ceilings; this is only for setting expectations.
+ * Tokens per seat come from the core's `estimateSeatUsage`, the same heuristic `estimate` and the budget ceilings
+ * use, so the number `connect` shows matches what admission will check. Real spend is streamed into the ledger.
  */
-import { DEFAULT_POLICY, type ModelInfo, type Policy, sortByTier, type TokenUsage } from "@merge-safely/core";
+import {
+  type Change,
+  DEFAULT_POLICY,
+  estimateSeatUsage,
+  type ModelInfo,
+  type Policy,
+  type Seat,
+  seatBudgetFromPolicy,
+  sortByTier,
+  type TokenUsage,
+} from "@merge-safely/core";
 import { priceUsage, withPricing } from "@merge-safely/registry";
 
 export const TYPICAL_PR_LINES = 300;
 
-/** Estimated tokens for one seat reviewing a diff of `lines` changed lines. */
-export function seatTokens(role: "hunter" | "judge", lines: number): TokenUsage {
+/** Files a typical PR touches, for the diff-size estimate. */
+const TYPICAL_FILES = 8;
+
+function typicalChange(lines: number): Change {
+  const half = Math.round(lines / 2);
+  return {
+    repo: { host: "github.com", owner: "example", name: "example" },
+    number: 0,
+    headSha: "",
+    baseSha: "",
+    baseRef: "main",
+    headRef: "feature",
+    title: "",
+    body: "",
+    author: { kind: "human", login: "example" },
+    files: [],
+    stats: { additions: half, deletions: lines - half, files: TYPICAL_FILES },
+    labels: [],
+    draft: false,
+    ciStatus: "unknown",
+  };
+}
+
+/** Estimated tokens for one seat reviewing a diff of `lines` changed lines (core `estimateSeatUsage`). */
+export function seatTokens(
+  role: "hunter" | "judge",
+  lines: number,
+  policy: Policy = DEFAULT_POLICY,
+  secondJudgeRound = false,
+  contextTokens?: number,
+): TokenUsage {
   const l = Math.max(0, lines);
-  return role === "hunter" ? { in: 150_000 + l * 100, out: 6_000 } : { in: 60_000 + l * 40, out: 3_000 };
+  const seat: Seat = {
+    id: `${role}:typical`,
+    lens: role === "judge" ? "judge" : "correctness",
+    role,
+    model: { connectionId: "", provider: "", name: "" },
+    budget: seatBudgetFromPolicy(policy, role),
+  };
+  return estimateSeatUsage(seat, {
+    diffChars: l * 60 + TYPICAL_FILES * 150,
+    change: typicalChange(l),
+    secondJudgeRound,
+    ...(contextTokens ? { contextTokens } : {}),
+  });
 }
 
 export interface TierCost {
@@ -54,9 +104,9 @@ export function tierCosts(models: ModelInfo[], policy: Policy = DEFAULT_POLICY, 
   return ([1, 2, 3] as const).map((tier) => {
     const p = policy.panel[`t${tier}`];
     const hunters = p.hunters.length;
-    const judges = p.judges * (p.secondJudgeRound && p.judges > 0 ? 2 : 1);
-    const h = seatUsd(hunter, seatTokens("hunter", lines));
-    const j = seatUsd(judge, seatTokens("judge", lines));
+    const judges = p.judges;
+    const h = seatUsd(hunter, seatTokens("hunter", lines, policy, false, hunter?.contextTokens));
+    const j = seatUsd(judge, seatTokens("judge", lines, policy, p.secondJudgeRound, judge?.contextTokens));
     return {
       tier,
       hunters,
