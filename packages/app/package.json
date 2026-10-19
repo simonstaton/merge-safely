@@ -13,13 +13,18 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "Dockerfile",
+    "docker-compose.yml",
+    ".env.example",
+    "README.md"
   ],
   "engines": {
     "node": ">=20"
   },
   "scripts": {
-    "build": "tsc -b"
+    "build": "tsc -b",
+    "start": "node dist/main.js"
   },
   "dependencies": {
     "@merge-safely/core": "0.1.0",
@@ -35,6 +40,14 @@
     "@merge-safely/github": "0.1.0",
     "@merge-safely/store-sqlite": "0.1.0",
     "@merge-safely/escalation-slack": "0.1.0",
-    "yaml": "^2.6.0"
+    "yaml": "^2.6.0",
+    "zod": "^3.23.8",
+    "better-sqlite3": "^11.5.0"
+  },
+  "bin": {
+    "merge-safely-app": "./dist/main.js"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11"
   }
 }
